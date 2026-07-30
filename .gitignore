@@ -1,0 +1,63 @@
+# Local Streaming Token — keep secrets and personal data out of the repo.
+
+# Settings hold API keys and provider credentials — never publish them.
+# Use settings/* (not settings/) so the example file can be re-included: git
+# cannot un-ignore a file whose parent directory itself is ignored.
+settings/*
+!settings/settings.example.json
+# The encryption keyfile (password-wrapped data key + Flask secret) — never publish it.
+# (Already covered by settings/* above; listed explicitly for clarity.)
+settings/app_key.enc
+
+# Any encrypted artifact, wherever it lives. This is a safety net: the keyfile and
+# the database credential vault are already covered by settings/* above, but this
+# rule survives someone editing those lines without understanding the un-ignore idiom.
+*.enc
+
+# User data: chats (can be large + personal), presets, libraries, personas, RAG store.
+# Created on first run by app/core.py; a fresh clone has no data/ at all.
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Test / type-checker / linter caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# DuckDB vector + staging stores and their write-ahead logs. Belt-and-braces: these
+# live under data/ (ignored above), but the rule keeps them out if one is ever
+# written elsewhere.
+*.duckdb
+*.duckdb.wal
+*.wal
+
+# Persona per-persona binary stores, under the active data profile. Definitions live
+# in persona.xml (exported explicitly); knowledge/memory vectors are a derived cache
+# and originals are re-ingested and re-embedded on import.
+data/profiles/*/personas/*/knowledge/
+data/profiles/*/personas/*/memories/
+data/profiles/*/personas/*/sources/
+
+# Phase checkpoints (used when git history isn't the chosen rollback mechanism).
+backups/
+
+# Logs and packaging output
+*.log
+dist/
+build/
+
+# Local AI-assistant context. Useful on this machine, not part of the public repo.
+CLAUDE.md
+.claude/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

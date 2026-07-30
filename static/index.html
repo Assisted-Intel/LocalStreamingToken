@@ -1,0 +1,886 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Local Streaming Token</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <!-- ============================ Header ============================ -->
+  <header id="app-header">
+    <div class="brand">
+      <span class="brand-name" id="brand-name">Local Streaming Token</span>
+      <span class="brand-author" id="brand-author">by Assisted Intel</span>
+    </div>
+    <nav class="tabs">
+      <button class="tab active" data-tab="chat">💬 Chat</button>
+      <button class="tab" data-tab="evals">🧪 Evaluate</button>
+      <button class="tab" data-tab="database">🗄 Database</button>
+      <button class="tab" data-tab="resources">📚 Resources</button>
+      <button class="tab" data-tab="personas">🎭 Personas</button>
+      <button class="tab" data-tab="settings">⚙ Settings</button>
+    </nav>
+  </header>
+
+  <!-- Profile bar: two independent selectors (data + settings) spanning all tabs -->
+  <div id="profile-bar">
+    <div class="pf-group">
+      <span class="pf-label">🗂 Profile</span>
+      <select id="data-profile-select" title="Switch data profile (chats, prompts, resources, evals, database)"></select>
+      <button id="btn-data-profile-new" class="small" title="New data profile">＋ New</button>
+      <button id="btn-data-profile-rename" class="small" title="Rename this profile">✎</button>
+      <button id="btn-data-profile-delete" class="small" title="Delete a profile">🗑</button>
+      <span id="incognito-badge" class="badge hidden">🕶 private — not saved</span>
+      <button id="btn-incognito-save" class="small hidden">Save session…</button>
+    </div>
+    <div class="pf-group">
+      <span class="pf-label">⚙ Settings</span>
+      <select id="settings-profile-select" title="Switch settings profile (providers, API keys, defaults)"></select>
+      <button id="btn-settings-profile-new" class="small" title="New settings profile">＋ New</button>
+      <button id="btn-settings-profile-rename" class="small" title="Rename this settings profile">✎</button>
+      <button id="btn-settings-profile-delete" class="small" title="Delete a settings profile">🗑</button>
+    </div>
+  </div>
+
+  <!-- ============================ CHAT TAB ============================ -->
+  <div id="tab-chat" class="tab-page active">
+    <!-- Sidebar -->
+    <aside id="sidebar">
+      <button id="btn-new-chat" class="primary">＋ New Chat</button>
+      <button id="btn-new-private" class="ghost">New Private Chat</button>
+      <div class="sidebar-label">Chats</div>
+      <div id="chat-tabs" class="chat-tabs"></div>
+      <div id="chat-list" class="chat-list"></div>
+      <div class="chat-io">
+        <button id="btn-import-chats" class="ghost small" title="Import chats from a JSON file">⬇ Import</button>
+        <button id="btn-export-chats" class="ghost small" title="Export all chats to a JSON file">⬆ Export All</button>
+      </div>
+      <button id="btn-manage-servers" class="ghost bottom">⚙ Manage Servers</button>
+    </aside>
+
+    <!-- Main content -->
+    <main id="chat-main">
+      <!-- Top bar: server / model / library -->
+      <div id="topbar">
+        <label>Server:
+          <select id="server-select"></select>
+        </label>
+        <label>Model:
+          <select id="model-select"></select>
+          <input type="text" id="model-manual" class="hidden" placeholder="type model name…" />
+        </label>
+        <button id="btn-refresh-models" class="small" title="Refresh models">↻</button>
+        <button id="btn-library" class="small">Library: none</button>
+        <label class="chk"><input type="checkbox" id="chk-strict" /> Strict</label>
+      </div>
+
+      <!-- Chat header -->
+      <div id="chat-header">
+        <span id="chat-title">New Chat</span>
+        <button id="btn-rename" class="icon" title="Rename">✎</button>
+        <button id="btn-clear" class="icon" title="Clear messages">🧹</button>
+        <button id="btn-delete-chat" class="icon" title="Delete chat">🗑</button>
+        <button id="btn-save-private" class="small hidden">Save Chat</button>
+        <span id="private-badge" class="badge hidden">private</span>
+      </div>
+
+      <!-- Messages -->
+      <div id="messages" class="messages"></div>
+      <!-- Parallel processing lanes (one column per server; shown during a parallel run) -->
+      <div id="parallel-lanes" class="parallel-lanes hidden"></div>
+
+      <!-- Drag handle to resize the chat thread -->
+      <div id="messages-resizer" class="messages-resizer"
+           title="Drag to resize the chat thread (double-click to reset)"></div>
+
+      <!-- System prompt -->
+      <div class="prompt-field">
+        <div class="control-row prompt-field-head">
+          <label class="chk"><input type="checkbox" id="system-on" /> <strong>System prompt</strong></label>
+          <span class="prompt-field-hint">sent as a system message</span>
+          <span class="spacer"></span>
+          <button id="btn-system-browse" class="small">Browse library…</button>
+          <button id="btn-system-save" class="small">Save to library…</button>
+        </div>
+        <textarea id="system-prompt" class="pre-prompt" rows="2"
+                  placeholder="Optional system prompt for this chat…"></textarea>
+      </div>
+
+      <!-- Pre-prompt -->
+      <div class="prompt-field">
+        <div class="control-row prompt-field-head">
+          <label class="chk"><input type="checkbox" id="pre-on" /> <strong>Pre-prompt</strong></label>
+          <span class="prompt-field-hint">prepended to your message</span>
+          <span class="spacer"></span>
+          <button id="btn-pre-browse" class="small">Browse library…</button>
+          <button id="btn-pre-save" class="small">Save to library…</button>
+        </div>
+        <textarea id="pre-prompt" class="pre-prompt" rows="2"
+                  placeholder="Optional pre-prompt prepended to your message…"></textarea>
+      </div>
+
+      <!-- Settings row -->
+      <div id="settings-row" class="control-row">
+        <label>Context (num_ctx):
+          <select id="ctx-select"></select>
+        </label>
+        <label class="chk"><input type="checkbox" id="chk-isolate" /> Isolate prompts (no history)</label>
+        <label class="chk"><input type="checkbox" id="chk-hide-thinking" /> Hide thinking</label>
+        <label class="chk"><input type="checkbox" id="chk-multipass" /> 🔁 Multi-Pass</label>
+        <label class="chk"><input type="checkbox" id="chk-websearch" /> 🌐 Web search</label>
+        <label class="chk" title="Retrieve only the most relevant chunks of your selected libraries and attached data instead of sending them in full (uses the embedding server in Settings)"><input type="checkbox" id="chk-rag" /> 📚 RAG</label>
+        <label class="chk" title="Automatically turn RAG on when a message (question + attached data) reaches the word threshold — ideal for prompts carrying large pasted data"><input type="checkbox" id="chk-rag-auto" /> Auto-RAG</label>
+        <label>≥ <input type="number" id="rag-threshold" min="1" value="400" style="width:5em" /> words</label>
+        <label class="chk" title="Global: run the queue and batch files across your selected servers at once (Settings → Multi-Server Processing)"><input type="checkbox" id="chk-parallel" /> ⚡ Enable Parallel Processing</label>
+        <label class="chk" title="Answer through a persona's chain-of-thought pipeline (knowledge, memories, speaking style)"><input type="checkbox" id="chk-persona" /> 🎭 Use Persona</label>
+        <select id="persona-select" class="hidden" title="Active persona"></select>
+        <select id="persona-variant" class="hidden" title="Speaking-style variant"></select>
+        <span id="tools-status" class="tools-status"></span>
+        <label>Pages to crawl:
+          <input type="number" id="crawl-pages" min="1" max="20" value="7" />
+        </label>
+      </div>
+
+      <!-- Multi-Pass subpanel -->
+      <div id="multipass-panel" class="websearch-panel hidden">
+        <div class="mp-row">
+          <label>Refinement passes:
+            <input type="number" id="mp-passes" min="1" max="20" value="2" />
+          </label>
+          <label class="chk"><input type="checkbox" id="chk-mp-system" /> Include system prompt in passes</label>
+        </div>
+        <label class="mp-label">Evaluation prompt (uses <code>[input prompt]</code> and <code>[Response]</code>):</label>
+        <textarea id="mp-eval-prompt" rows="5"
+                  placeholder="Evaluation prompt template…"></textarea>
+      </div>
+
+      <!-- Web search subpanel -->
+      <div id="websearch-panel" class="websearch-panel hidden">
+        <textarea id="search-query" rows="2"
+                  placeholder="Optional: type a web search query to crawl before this message…"></textarea>
+        <div class="domains">
+          <div class="domains-add">
+            <input type="text" id="domain-input" placeholder="add approved domain (e.g. example.com)" />
+            <button id="btn-add-domain" class="small">Add</button>
+            <label class="chk"><input type="checkbox" id="chk-restrict" /> Only use approved domains</label>
+          </div>
+          <select id="domain-list" size="4" multiple></select>
+          <div class="domains-btns">
+            <button id="btn-remove-domain" class="small">Remove selected</button>
+            <button id="btn-clear-domains" class="small">Clear list</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Input -->
+      <div id="data-chips" class="data-chips hidden"></div>
+      <div id="data-entry-row" class="hidden">
+        <input id="data-label" placeholder="Data type (e.g. Reviews)" />
+        <button id="btn-add-data" class="primary">＋ Add Data</button>
+      </div>
+      <div id="input-row">
+        <textarea id="input-box" rows="3" placeholder="Type a message…  (Enter to send, Shift+Enter for newline)"></textarea>
+        <div class="input-btns">
+          <button id="btn-send" class="primary">Send</button>
+          <button id="btn-rewrite" class="ghost" title="Rewrite your message into a clearer, more effective prompt">✨ Rewrite</button>
+          <button id="btn-rewrite-undo" class="ghost hidden" title="Undo rewrite — restore your original message">↶ Undo</button>
+          <button id="btn-data-mode" class="ghost" title="Classify content into labeled data blocks">🏷 Data</button>
+          <button id="btn-queue-add" class="ghost" title="Add this prompt to the queue (each queued prompt becomes its own chat)">＋ Queue</button>
+          <button id="btn-queue-run" class="primary hidden" title="Process every queued prompt">▶ Run Queue (0)</button>
+          <button id="btn-queue-clear" class="ghost hidden" title="Empty the queue">Clear Queue</button>
+          <button id="btn-batch" class="ghost" title="Batch process a folder of .txt/.md prompts">📂 Batch</button>
+          <button id="btn-stop" class="stop hidden">Stop</button>
+        </div>
+      </div>
+      <!-- Live context-usage meter: one thin bar per active chat/server -->
+      <div id="context-bar-area" class="context-bar-area">
+        <div id="context-bars" class="context-bars"></div>
+        <button id="btn-context-history" class="ghost small context-history-btn"
+                title="View this chat's context-usage history">📊 Context History</button>
+      </div>
+      <div id="status-line" class="status-line"></div>
+    </main>
+  </div>
+
+  <!-- ============================ EVALUATE TAB ============================ -->
+  <div id="tab-evals" class="tab-page">
+    <main id="eval-main">
+      <h2 class="settings-title">Prompt Validation &amp; Evaluation</h2>
+
+      <!-- Project bar -->
+      <section class="settings-card eval-projectbar">
+        <label>Project:
+          <select id="eval-project-select"></select>
+        </label>
+        <input type="text" id="eval-name" placeholder="Evaluation name" />
+        <button id="btn-eval-new" class="small">＋ New</button>
+        <button id="btn-eval-save" class="primary">💾 Save</button>
+        <button id="btn-eval-delete" class="small">🗑 Delete</button>
+      </section>
+
+      <!-- 1. Data grid -->
+      <section class="settings-card">
+        <h3>1. Data</h3>
+        <p class="muted">Each row is one test case. Enter data by hand, or import a file. Import from a
+          <b>CSV</b> (header row → columns) or a <b>text file</b> split into cells (blank lines by default,
+          or your own delimiter) that fill a column you choose.</p>
+        <div class="eval-grid-actions">
+          <button id="btn-eval-addrow" class="small">＋ Row</button>
+          <button id="btn-eval-addcol" class="small">＋ Column</button>
+          <button id="btn-eval-import-csv" class="small">📂 Import CSV…</button>
+          <button id="btn-eval-import-txt" class="small">📂 Import TXT…</button>
+        </div>
+        <div class="eval-grid-wrap">
+          <table id="eval-grid"></table>
+        </div>
+
+        <details id="eval-gen-block" class="eval-gen-block">
+          <summary>✨ Generate test data with the LLM</summary>
+          <p class="muted">Describe how to fill each column and the model (from step 2) invents dummy rows to
+            test against. The response column is left blank so an evaluation run fills it. Turn on ⚡ Parallel
+            Processing (Settings) to fan rows across your servers.</p>
+          <div class="eval-grid-wrap">
+            <table id="eval-gen-instr"></table>
+          </div>
+          <div class="eval-run-row">
+            <label>Rows to generate:
+              <input type="number" id="eval-gen-rows" min="1" max="500" value="10" style="width:5em" />
+            </label>
+            <button id="btn-eval-gen-run" class="primary">✨ Generate Data</button>
+            <button id="btn-eval-gen-stop" class="stop hidden">Stop</button>
+            <span id="eval-gen-progress" class="status-line"></span>
+          </div>
+        </details>
+      </section>
+
+      <!-- 2. Prompt -->
+      <section class="settings-card">
+        <h3>2. Prompt</h3>
+        <div class="control-row">
+          <label>Server:
+            <select id="eval-gen-server"></select>
+          </label>
+          <label>Model:
+            <select id="eval-gen-model"></select>
+          </label>
+          <label>Write response to column:
+            <select id="eval-output-col"></select>
+          </label>
+        </div>
+        <p class="muted">Click a column to insert its <code>{placeholder}</code>. Every column except the
+          response column is available as input.</p>
+        <div id="eval-col-chips" class="eval-col-chips"></div>
+        <textarea id="eval-prompt" rows="4"
+                  placeholder="e.g. Write a friendly one-line greeting for {Name} who lives in {City}."></textarea>
+      </section>
+
+      <!-- 3. Grading -->
+      <section class="settings-card">
+        <h3>3. Grading criteria</h3>
+        <p class="muted">Define how an LLM grader scores each response. Each label returns either a numeric
+          <b>score</b> (within a range) or written <b>reasoning</b>. The grader replies as JSON that the app
+          parses and aggregates.</p>
+        <div id="eval-criteria"></div>
+        <button id="btn-eval-addcrit" class="small">＋ Add criterion</button>
+        <div class="control-row eval-grader-row">
+          <label>Grader server:
+            <select id="eval-grader-server"></select>
+          </label>
+          <label>Grader model:
+            <select id="eval-grader-model"></select>
+          </label>
+          <span class="muted">The grader stays fixed across batch models so scores stay comparable.</span>
+        </div>
+      </section>
+
+      <!-- 4. Batch models -->
+      <section class="settings-card">
+        <h3>4. Batch model testing <span class="muted">(optional)</span></h3>
+        <p class="muted">Add models to compare. The same prompt + grader run against each; results show a
+          per-model score and a breakdown of how each criterion did per model. Turn on ⚡ Parallel Processing
+          (Settings) to fan rows across your servers.</p>
+        <div id="eval-batch-models"></div>
+        <button id="btn-eval-addmodel" class="small">＋ Add model</button>
+      </section>
+
+      <!-- 5. Run & results -->
+      <section class="settings-card">
+        <h3>5. Run &amp; results</h3>
+        <div class="eval-run-row">
+          <button id="btn-eval-run" class="primary">▶ Run evaluation</button>
+          <button id="btn-eval-run-batch" class="ghost">▶ Run batch (all models)</button>
+          <button id="btn-eval-stop" class="stop hidden">Stop</button>
+          <span id="eval-progress" class="status-line"></span>
+        </div>
+        <div id="eval-results" class="eval-results"></div>
+      </section>
+    </main>
+  </div>
+
+  <!-- ============================ RESOURCES TAB ============================ -->
+  <div id="tab-resources" class="tab-page">
+    <aside id="lib-sidebar">
+      <div class="sidebar-label">Libraries</div>
+      <select id="lib-list" size="12"></select>
+      <button id="btn-lib-new" class="primary">＋ New Library</button>
+      <button id="btn-lib-load" class="ghost">📂 Load XML…</button>
+      <button id="btn-lib-remove" class="ghost">🗑 Remove Library</button>
+    </aside>
+    <main id="lib-main">
+      <div class="lib-header">
+        <input type="text" id="lib-name" placeholder="Library name" />
+        <button id="btn-lib-save-xml" class="small">💾 Save as XML…</button>
+      </div>
+      <div id="lib-items" class="lib-items"></div>
+      <div id="lib-url-panel" class="lib-inline-panel hidden">
+        <input type="text" id="lib-url-input" placeholder="https://example.com/article" />
+        <button id="btn-lib-url-fetch" class="small primary">Fetch</button>
+        <button id="btn-lib-url-cancel" class="small ghost">Cancel</button>
+      </div>
+      <div id="lib-search-panel" class="lib-inline-panel hidden">
+        <div class="lib-search-fields">
+          <input type="text" id="lib-search-query" placeholder="Search term…" />
+          <input type="text" id="lib-search-sites" placeholder="Limit to sites (comma-separated, optional)" />
+          <label class="lib-search-max">Max pages
+            <input type="number" id="lib-search-max" value="5" min="1" max="20" />
+          </label>
+          <button id="btn-lib-search-go" class="small primary">Search &amp; crawl</button>
+          <button id="btn-lib-search-cancel" class="small ghost">Cancel</button>
+        </div>
+        <div id="lib-search-progress" class="compile-progress hidden"></div>
+      </div>
+      <div class="lib-actions">
+        <button id="btn-lib-add-write" class="small">➕ Add write-in section</button>
+        <button id="btn-lib-add-files" class="small">📎 Add text file(s)</button>
+        <button id="btn-lib-add-url" class="small">🔗 Add by URL</button>
+        <button id="btn-lib-add-search" class="small">🔍 Brave search</button>
+        <span class="spacer"></span>
+        <span id="lib-compile-badge" class="compile-badge-slot"></span>
+        <label class="chk" title="Re-embed every item, ignoring the incremental cache"><input type="checkbox" id="lib-compile-force" /> Full rebuild</label>
+        <button id="btn-lib-compile" class="small primary" title="Build the reusable vector index (semantic chunking + contextualization)">⚙ Compile Data</button>
+      </div>
+      <div id="lib-compile-progress" class="compile-progress hidden"></div>
+    </main>
+  </div>
+
+  <!-- ============================ PERSONAS TAB ============================ -->
+  <div id="tab-personas" class="tab-page">
+    <aside id="persona-sidebar">
+      <div class="side-head">
+        <span>Personas</span>
+        <button id="btn-persona-new" class="small primary" title="Create persona">＋ New</button>
+      </div>
+      <div id="persona-list" class="side-list"></div>
+      <div class="side-head" style="margin-top:8px"><span>Import</span></div>
+      <button id="btn-persona-import" class="small">Import (XML / .zip)…</button>
+    </aside>
+    <main id="persona-main">
+      <div id="persona-health" class="warn-banner hidden"></div>
+      <div id="persona-empty" class="muted">Select or create a persona.</div>
+      <div id="persona-editor" class="hidden">
+        <div class="persona-editor-head">
+          <input type="text" id="pe-name" class="pe-name" placeholder="Persona name" />
+          <span class="spacer"></span>
+          <button id="btn-persona-export-xml" class="small">Export XML</button>
+          <button id="btn-persona-export-bundle" class="small">Export bundle</button>
+          <button id="btn-persona-duplicate" class="small">Duplicate</button>
+          <button id="btn-persona-delete" class="small danger">Delete</button>
+          <button id="btn-persona-save" class="small primary">Save</button>
+        </div>
+        <div class="pe-tabs">
+          <button class="pe-tab active" data-petab="profile">Profile</button>
+          <button class="pe-tab" data-petab="knowledge">Knowledge</button>
+          <button class="pe-tab" data-petab="memories">Memories</button>
+          <button class="pe-tab" data-petab="speaking">Speaking</button>
+          <button class="pe-tab" data-petab="pipeline">Pipeline</button>
+          <button class="pe-tab" data-petab="testrun">Test run</button>
+        </div>
+
+        <section class="pe-page active" id="pe-profile">
+          <label class="setting-row">Role <input type="text" id="pe-role" /></label>
+          <label class="setting-row">Bio <textarea id="pe-bio" rows="4"></textarea></label>
+          <label class="setting-row">Chat model <input type="text" id="pe-chat-model" placeholder="(defaults to the chat's model)" /></label>
+          <label class="setting-row">Embedding model <input type="text" id="pe-embed-model" placeholder="nomic-embed-text" /></label>
+          <label class="setting-row">Temperature <input type="number" id="pe-temp" step="0.1" min="0" max="2" /></label>
+        </section>
+
+        <section class="pe-page" id="pe-knowledge">
+          <div class="row-controls">
+            <label>Retrieval mode
+              <select id="pe-retrieval">
+                <option value="hybrid">Hybrid</option><option value="vector">Vector</option><option value="keyword">Keyword</option>
+              </select>
+            </label>
+            <label class="chk"><input type="checkbox" id="pe-reword" /> Query rewrite</label>
+            <button id="btn-pe-kb-add" class="small primary">Add documents…</button>
+            <span class="spacer"></span>
+            <span id="pe-compile-badge" class="compile-badge-slot"></span>
+            <label class="chk" title="Re-embed every source + memory, ignoring the incremental cache"><input type="checkbox" id="pe-compile-force" /> Full rebuild</label>
+            <button id="btn-pe-compile" class="small primary" title="Build the reusable vector index for this persona's knowledge + memories">⚙ Compile Data</button>
+          </div>
+          <div id="pe-embed-banner" class="warn-banner hidden"></div>
+          <div id="pe-compile-progress" class="compile-progress hidden"></div>
+          <div id="pe-kb-list" class="side-list"></div>
+        </section>
+
+        <section class="pe-page" id="pe-memories">
+          <div class="row-controls">
+            <button id="btn-pe-mem-add" class="small primary">Add memory</button>
+          </div>
+          <div id="pe-mem-list" class="side-list"></div>
+        </section>
+
+        <section class="pe-page" id="pe-speaking">
+          <label class="setting-row">Tone <input type="text" id="pe-tone" /></label>
+          <label class="setting-row">Formality <input type="text" id="pe-formality" /></label>
+          <label class="setting-row">Vocabulary <input type="text" id="pe-vocab" /></label>
+          <label class="setting-row">Quirks / catchphrases <input type="text" id="pe-quirks" /></label>
+          <h4>Style variants <button id="btn-pe-variant-add" class="small">＋</button></h4>
+          <div id="pe-variants"></div>
+          <h4>Few-shot examples <button id="btn-pe-example-add" class="small">＋</button></h4>
+          <div id="pe-examples"></div>
+        </section>
+
+        <section class="pe-page" id="pe-pipeline">
+          <div class="row-controls">
+            <button id="btn-pe-step-add" class="small">＋ Add step</button>
+            <button id="btn-pe-pipeline-default" class="small">Restore default pipeline</button>
+          </div>
+          <div id="pe-steps"></div>
+        </section>
+
+        <section class="pe-page" id="pe-testrun">
+          <textarea id="pe-test-msg" rows="3" placeholder="Type a sample message to run through the pipeline…"></textarea>
+          <button id="btn-pe-test" class="small primary">Run test</button>
+          <div id="pe-test-output" class="persona-run"></div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <!-- ============================ SETTINGS TAB ============================ -->
+  <div id="tab-settings" class="tab-page">
+    <main id="settings-main">
+      <h2 class="settings-title">Settings</h2>
+
+      <section class="settings-card">
+        <h3>Web Search API Keys</h3>
+        <p class="muted">Used by the 🌐 Web search feature (Brave discovery + Bright Data page crawling). Stored in <code>settings/settings.json</code> (gitignored) — never committed.</p>
+        <label class="setting-row">Brave Search token
+          <input type="password" id="set-brave" placeholder="leave blank to keep current" autocomplete="off" />
+          <span id="brave-state" class="saved-badge"></span>
+        </label>
+        <label class="setting-row">Bright Data token
+          <input type="password" id="set-brightdata" placeholder="leave blank to keep current" autocomplete="off" />
+          <span id="brightdata-state" class="saved-badge"></span>
+        </label>
+        <label class="setting-row">Bright Data zone
+          <input type="text" id="set-bd-zone" placeholder="web_unlocker1" />
+        </label>
+        <button id="btn-save-keys" class="primary">Save keys</button>
+      </section>
+
+      <section class="settings-card">
+        <h3>AI Providers &amp; Servers</h3>
+        <p class="muted">Add Ollama servers or cloud AI providers (Claude, OpenAI, Grok, Gemini, DeepSeek, and other OpenAI-compatible services). Each cloud provider needs an API key. The built-in <b>Local</b> Ollama is always available.</p>
+        <div id="settings-server-rows"></div>
+        <div class="settings-actions">
+          <button id="btn-add-server-row" class="small">＋ Add provider / server</button>
+          <button id="btn-save-servers" class="primary">Save servers</button>
+        </div>
+      </section>
+
+      <section class="settings-card">
+        <h3>Multi-Server Processing</h3>
+        <p class="muted">Choose which servers run in parallel for the <b>queue</b> and <b>batch files</b>, and which model each uses. Each server can run a different model, or click <b>Use common model</b> to set them all to a model installed on every selected server. Turn it on with the ⚡ <b>Enable Parallel Processing</b> toggle in the chat.</p>
+        <div id="parallel-server-rows" class="parallel-server-rows"></div>
+        <div class="mp-row parallel-mode-row">
+          <span class="muted">Distribution:</span>
+          <label class="chk"><input type="radio" name="pmode" id="pmode-balanced" value="balanced" checked /> Load-balanced (max throughput — any free server takes the next item)</label>
+          <label class="chk"><input type="radio" name="pmode" id="pmode-isolation" value="isolation" /> Isolation (1 prompt : 1 server — all run at once)</label>
+        </div>
+        <div class="settings-actions">
+          <button id="btn-parallel-common" class="small">Use common model</button>
+          <button id="btn-save-parallel" class="primary">Save multi-server config</button>
+        </div>
+      </section>
+
+      <section class="settings-card">
+        <h3>Scan for Ollama Servers</h3>
+        <p class="muted">Scan an IP range on your network and pick which discovered Ollama servers to add.</p>
+        <div class="scan-row">
+          <input type="text" id="scan-range" placeholder="192.168.1.0/24  or  192.168.1.10-50" />
+          <label>Port <input type="number" id="scan-port" value="11434" min="1" max="65535" /></label>
+          <button id="btn-scan" class="primary">Scan</button>
+        </div>
+        <div id="scan-status" class="muted"></div>
+        <div id="scan-results" class="scan-results"></div>
+        <button id="btn-add-scanned" class="small hidden">Add selected</button>
+      </section>
+
+      <section class="settings-card">
+        <h3>General</h3>
+        <label class="setting-row">Default context length (num_ctx)
+          <select id="set-default-ctx"></select>
+        </label>
+        <label class="setting-row">Max output tokens (cloud providers)
+          <input type="number" id="set-max-output" min="256" max="200000" />
+        </label>
+        <label class="setting-row" title="Context-window size used as the usage-bar denominator for OpenAI-compatible providers (they have no num_ctx like Ollama)">OpenAI context window (usage bar)
+          <input type="number" id="set-ctx-openai" min="1024" max="2000000" step="1024" />
+        </label>
+        <label class="setting-row" title="Context-window size used as the usage-bar denominator for Anthropic (Claude) models">Anthropic context window (usage bar)
+          <input type="number" id="set-ctx-anthropic" min="1024" max="2000000" step="1024" />
+        </label>
+        <label class="chk"><input type="checkbox" id="set-auto-reason" /> Auto-detect reasoning models</label>
+        <h3 style="margin-top:1em">RAG (Retrieval Augmented Generation)</h3>
+        <label class="setting-row">Embedding server URL
+          <input type="text" id="set-rag-embed-url" placeholder="http://127.0.0.1:11434" />
+        </label>
+        <label class="setting-row">Embedding model
+          <input type="text" id="set-rag-embed-model" placeholder="nomic-embed-text" />
+        </label>
+        <label class="setting-row">Chunks retrieved (top-k)
+          <input type="number" id="set-rag-topk" min="1" max="50" />
+        </label>
+        <label class="setting-row">Retrieval mode
+          <select id="set-rag-mode">
+            <option value="hybrid">Hybrid (vector + keyword)</option>
+            <option value="vector">Vector (semantic similarity)</option>
+            <option value="keyword">Keyword (BM25, no embeddings)</option>
+          </select>
+        </label>
+        <label class="setting-row">Contextual chunking
+          <input type="checkbox" id="set-rag-context" />
+        </label>
+        <label class="setting-row">Contextual-chunking model
+          <input type="text" id="set-rag-context-model" placeholder="(defaults to the chat model)" />
+        </label>
+        <label class="setting-row">Query rewrite (better retrieval)
+          <input type="checkbox" id="set-rag-qrewrite" />
+        </label>
+        <label class="setting-row">Rewrite model (query rewrite + Rewrite button)
+          <input type="text" id="set-rewrite-model" placeholder="(defaults to the chat model)" />
+        </label>
+        <label class="setting-row">Memory weight influence (0–1)
+          <input type="number" id="set-mem-influence" step="0.05" min="0" max="1" />
+        </label>
+        <label class="setting-row">Pipeline JSON retries
+          <input type="number" id="set-pipeline-retries" min="1" max="6" />
+        </label>
+        <div><button id="btn-save-general" class="primary">Save general</button></div>
+      </section>
+    </main>
+  </div>
+
+  <!-- ============================ DATABASE TAB ============================ -->
+  <div id="tab-database" class="tab-page">
+    <main id="db-main">
+      <h2 class="settings-title">Database Processing</h2>
+      <p class="muted db-intro">Import rows from a real database into an isolated local staging copy, edit &amp; AI-enrich them, preview the exact write statements, then safely write back. The source is never touched until you approve.</p>
+
+      <!-- Vault gate -->
+      <section class="settings-card" id="db-vault-card">
+        <h3>🔒 Connection Vault</h3>
+        <p class="muted">Connection settings &amp; credentials are encrypted at rest (AES-GCM, key derived from your master password via scrypt). The password itself is never stored.</p>
+        <div id="db-vault-locked">
+          <label class="setting-row"><span id="db-vault-pw-label">Master password</span>
+            <input type="password" id="db-vault-pw" autocomplete="off" placeholder="master password" />
+          </label>
+          <button id="db-vault-unlock" class="primary">Unlock</button>
+          <span id="db-vault-hint" class="muted"></span>
+        </div>
+        <div id="db-vault-unlocked" class="hidden">
+          <span class="saved-badge">Unlocked ✓</span>
+          <button id="db-vault-lock" class="small">Lock</button>
+        </div>
+      </section>
+
+      <!-- Connections -->
+      <section class="settings-card hidden" id="db-conn-card">
+        <h3>Connections</h3>
+        <div id="db-profile-list" class="db-profile-list"></div>
+        <div class="settings-actions">
+          <button id="db-add-profile" class="small">＋ Add connection</button>
+        </div>
+        <div id="db-profile-form" class="db-profile-form hidden">
+          <input type="hidden" id="dbf-id" />
+          <label class="setting-row">Name <input type="text" id="dbf-name" placeholder="My database" /></label>
+          <label class="setting-row">Engine
+            <select id="dbf-engine">
+              <option value="sqlite">SQLite (file)</option>
+              <option value="postgresql">PostgreSQL</option>
+              <option value="mysql">MySQL / MariaDB</option>
+              <option value="mssql">SQL Server</option>
+              <option value="oracle">Oracle</option>
+              <option value="mongodb">MongoDB</option>
+            </select>
+          </label>
+          <label class="setting-row">Connection URL <input type="text" id="dbf-url" placeholder="optional — full connection string (overrides fields below)" /></label>
+          <div class="db-fields-discrete">
+            <label class="setting-row" id="dbf-host-row">Host <input type="text" id="dbf-host" placeholder="localhost" /></label>
+            <label class="setting-row" id="dbf-port-row">Port <input type="number" id="dbf-port" /></label>
+            <label class="setting-row" id="dbf-db-row"><span id="dbf-db-label">Database</span> <input type="text" id="dbf-database" placeholder="db name (or file path for SQLite)" /></label>
+            <label class="setting-row" id="dbf-user-row">Username <input type="text" id="dbf-username" /></label>
+            <label class="setting-row" id="dbf-pass-row">Password <input type="password" id="dbf-password" autocomplete="off" placeholder="leave blank to keep current" /></label>
+          </div>
+          <label class="chk"><input type="checkbox" id="dbf-ssl" /> Use SSL/TLS</label>
+          <div id="dbf-ssl-fields" class="hidden">
+            <label class="setting-row">CA cert path <input type="text" id="dbf-ssl-ca" /></label>
+            <label class="setting-row">Client cert path <input type="text" id="dbf-ssl-cert" /></label>
+            <label class="setting-row">Client key path <input type="text" id="dbf-ssl-key" placeholder="leave blank to keep current" /></label>
+          </div>
+          <div class="settings-actions">
+            <button id="dbf-test" class="small">Test connection</button>
+            <button id="dbf-save" class="primary">Save connection</button>
+            <button id="dbf-cancel" class="ghost">Cancel</button>
+            <span id="dbf-status" class="muted"></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Import sessions -->
+      <section class="settings-card hidden" id="db-sessions-card">
+        <h3>Import Sessions</h3>
+        <p class="muted">Import rows into an isolated local staging copy, then edit, AI-enrich, and write back.</p>
+        <div class="settings-actions">
+          <button id="db-new-import" class="small">＋ New import</button>
+        </div>
+
+        <div id="db-import-form" class="db-profile-form hidden">
+          <label class="setting-row">Connection <select id="dbi-profile"></select></label>
+          <div class="settings-actions">
+            <button id="dbi-load-tables" class="small">Load tables</button>
+            <span id="dbi-tables-status" class="muted"></span>
+          </div>
+          <label class="setting-row">Table <select id="dbi-table"></select></label>
+          <label class="setting-row">Rows
+            <select id="dbi-mode">
+              <option value="first_n">First N</option>
+              <option value="random_n">Random sample of N</option>
+              <option value="full">Full table</option>
+              <option value="custom">Custom WHERE</option>
+            </select>
+          </label>
+          <label class="setting-row" id="dbi-n-row">N <input type="number" id="dbi-n" value="100" min="1" /></label>
+          <label class="setting-row hidden" id="dbi-where-row">WHERE <input type="text" id="dbi-where" placeholder="e.g. status = 'active'" /></label>
+          <label class="setting-row">Order by <input type="text" id="dbi-order" placeholder="optional column(s)" /></label>
+          <label class="setting-row">Name <input type="text" id="dbi-name" placeholder="import name" /></label>
+          <div class="settings-actions">
+            <button id="dbi-import" class="primary">Import</button>
+            <button id="dbi-cancel" class="ghost">Cancel</button>
+            <span id="dbi-progress" class="muted"></span>
+          </div>
+        </div>
+
+        <div id="db-session-list" class="db-session-list"></div>
+
+        <!-- Staging grid -->
+        <div id="db-grid-wrap" class="hidden">
+          <div class="db-grid-header">
+            <strong id="db-grid-title"></strong>
+            <span id="db-grid-dirty" class="muted"></span>
+            <span class="db-grid-spacer"></span>
+            <button id="db-grid-process" class="small">🤖 AI process</button>
+            <button id="db-grid-writeback" class="small">⬆ Write back</button>
+            <button id="db-grid-add-col" class="small">＋ Add column</button>
+            <button id="db-grid-close" class="ghost">Close</button>
+          </div>
+
+          <div id="db-writeback-panel" class="db-process-panel hidden">
+            <div class="control-row">
+              <button id="dbw-dryrun" class="small">🔍 Preview (dry-run)</button>
+              <label>rows <input type="number" id="dbw-maxrows" value="50" min="1" style="width:70px" /></label>
+              <label>cols <input type="number" id="dbw-maxcols" value="20" min="1" style="width:70px" /></label>
+              <button id="dbw-conflicts" class="small">⚠ Check conflicts</button>
+            </div>
+            <pre id="dbw-preview" class="db-preview"></pre>
+            <div class="control-row">
+              <label>Mode
+                <select id="dbw-mode"><option value="bulk">Bulk (fast)</option><option value="row">Row-by-row</option></select>
+              </label>
+              <label>On conflict
+                <select id="dbw-conflict"><option value="abort">Abort</option><option value="skip">Skip conflicted</option><option value="overwrite">Overwrite</option></select>
+              </label>
+              <label class="chk"><input type="checkbox" id="dbw-approve" /> I approve writing to the source</label>
+            </div>
+            <div class="settings-actions">
+              <button id="dbw-run" class="primary">Write back to source</button>
+              <button id="dbw-audit" class="small">📜 View audit</button>
+              <button id="dbw-close" class="ghost">Close</button>
+              <span id="dbw-progress" class="muted"></span>
+            </div>
+          </div>
+
+          <div id="db-process-panel" class="db-process-panel hidden">
+            <div class="control-row">
+              <label>Server <select id="dbp-server"></select></label>
+              <label>Model <input type="text" id="dbp-model" placeholder="model name (e.g. qwen3.5…)" /></label>
+            </div>
+            <div class="muted" style="margin:4px 0;">AI columns to fill (run in order; a prompt can reference an earlier column with <code>{Column}</code>):</div>
+            <div id="dbp-cols"></div>
+            <div class="settings-actions">
+              <button id="dbp-add" class="small">＋ Add AI column</button>
+              <button id="dbp-run" class="primary">Run processing</button>
+              <button id="dbp-close" class="ghost">Close</button>
+              <span id="dbp-progress" class="muted"></span>
+            </div>
+          </div>
+
+          <div id="db-grid" class="db-grid"></div>
+          <div class="db-grid-pager">
+            <button id="db-grid-prev" class="small">‹ Prev</button>
+            <span id="db-grid-pageinfo" class="muted"></span>
+            <button id="db-grid-next" class="small">Next ›</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- ============================ Modals ============================ -->
+  <div id="modal-backdrop" class="modal-backdrop hidden">
+    <!-- Context-usage history (per chat) -->
+    <div id="modal-context-history" class="modal modal-wide hidden">
+      <h3>📊 Context History</h3>
+      <p class="modal-hint">Every LLM call for this chat — token breakdown per call, newest first.</p>
+      <div id="context-history-list" class="context-history-list"></div>
+      <div class="modal-btns">
+        <button id="btn-context-history-clear" class="ghost danger">Clear history</button>
+        <button class="ghost modal-close">Close</button>
+      </div>
+    </div>
+    <!-- Library selector -->
+    <div id="modal-libselect" class="modal hidden">
+      <h3>Select Reference Libraries</h3>
+      <p class="muted" style="margin:0 0 6px">A library must be <b>compiled</b> before chat can use it for retrieval.</p>
+      <div id="libselect-list" class="libselect-list"></div>
+      <div id="libselect-compile-progress" class="compile-progress hidden"></div>
+      <div class="modal-btns">
+        <button id="btn-libselect-save" class="primary">OK</button>
+        <button class="ghost modal-close">Cancel</button>
+      </div>
+    </div>
+    <!-- New data profile: name + blank/clone seed -->
+    <div id="modal-newdata" class="modal hidden">
+      <h3>New Profile</h3>
+      <input type="text" id="newdata-name" placeholder="Profile name (e.g. Finance)" />
+      <div class="radio-col">
+        <label><input type="radio" name="newdata-seed" value="blank" checked /> Start blank</label>
+        <label><input type="radio" name="newdata-seed" value="clone" /> Clone current profile's prompts, resources &amp; presets</label>
+      </div>
+      <div class="modal-btns">
+        <button id="btn-newdata-ok" class="primary">Create &amp; switch</button>
+        <button class="ghost modal-close">Cancel</button>
+      </div>
+    </div>
+    <!-- Start incognito: blank/clone seed -->
+    <div id="modal-incognito" class="modal hidden">
+      <h3>🕶 Start Incognito Session</h3>
+      <p class="modal-hint">Nothing is written to disk during an incognito session. You can save it as a
+        profile afterwards if you decide to keep it.</p>
+      <div class="radio-col">
+        <label><input type="radio" name="incognito-seed" value="blank" checked /> Start blank</label>
+        <label><input type="radio" name="incognito-seed" value="clone" /> Start from current profile's prompts, resources &amp; presets</label>
+      </div>
+      <div class="modal-btns">
+        <button id="btn-incognito-ok" class="primary">Start</button>
+        <button class="ghost modal-close">Cancel</button>
+      </div>
+    </div>
+    <!-- Save an incognito session: new profile or merge into existing -->
+    <div id="modal-incognito-save" class="modal hidden">
+      <h3>Save Incognito Session</h3>
+      <div class="radio-col">
+        <label><input type="radio" name="incosave-mode" value="new" checked /> Save as a new profile</label>
+        <label><input type="radio" name="incosave-mode" value="merge" /> Merge into an existing profile</label>
+      </div>
+      <div id="incosave-new-row">
+        <input type="text" id="incosave-name" placeholder="New profile name" />
+      </div>
+      <div id="incosave-merge-row" class="hidden">
+        <select id="incosave-target"></select>
+        <p class="modal-hint">Chats, resources and prompts are added without overwriting anything.
+          Incognito database sessions are not merged.</p>
+      </div>
+      <div class="modal-btns">
+        <button id="btn-incosave-ok" class="primary">Save</button>
+        <button class="ghost modal-close">Cancel</button>
+      </div>
+    </div>
+    <!-- Delete a profile (choose which) -->
+    <div id="modal-delprofile" class="modal hidden">
+      <h3 id="delprofile-title">Delete Profile</h3>
+      <select id="delprofile-select"></select>
+      <p class="modal-hint">This permanently deletes the profile and all its data. The active profile can't be deleted.</p>
+      <div class="modal-btns">
+        <button id="btn-delprofile-ok" class="danger">Delete</button>
+        <button class="ghost modal-close">Cancel</button>
+      </div>
+    </div>
+    <!-- Save-as-memory modal -->
+    <div id="modal-memory" class="modal hidden">
+      <h3>Save as Memory</h3>
+      <label class="setting-row">Title <input type="text" id="mem-title" /></label>
+      <label class="setting-row">Description
+        <textarea id="mem-desc" rows="4"></textarea>
+      </label>
+      <label class="setting-row">Emotional weight (1–10)
+        <input type="number" id="mem-weight" min="1" max="10" value="5" />
+      </label>
+      <label class="setting-row">Tags (comma-separated) <input type="text" id="mem-tags" /></label>
+      <div class="modal-btns">
+        <button id="btn-mem-save" class="primary">Save memory</button>
+        <button class="ghost modal-close">Cancel</button>
+      </div>
+    </div>
+    <!-- Simple prompt modal (rename / preset name) -->
+    <div id="modal-prompt" class="modal hidden">
+      <h3 id="prompt-title">Enter value</h3>
+      <input type="text" id="prompt-input" />
+      <div class="modal-btns">
+        <button id="btn-prompt-ok" class="primary">OK</button>
+        <button class="ghost modal-close">Cancel</button>
+      </div>
+    </div>
+    <!-- 3-column prompt library browser (reused for System and Pre-prompt trees) -->
+    <div id="modal-prompt-browser" class="modal modal-wide hidden">
+      <div class="pb-head">
+        <h3 id="pb-title">Prompt Library</h3>
+        <span class="spacer"></span>
+        <button id="btn-pb-import" class="small">Import XML…</button>
+      </div>
+      <div class="prompt-browser">
+        <div class="pbcol">
+          <div class="pbcol-head"><span>Groups</span><button id="btn-pb-new-group" class="small" title="New group">＋</button></div>
+          <div id="pb-groups" class="pbcol-list"></div>
+        </div>
+        <div class="pbcol">
+          <div class="pbcol-head"><span>Categories</span><button id="btn-pb-new-cat" class="small" title="New category">＋</button></div>
+          <div id="pb-cats" class="pbcol-list"></div>
+        </div>
+        <div class="pbcol">
+          <div class="pbcol-head"><span>Prompts</span><button id="btn-pb-new-prompt" class="small" title="New prompt">＋</button></div>
+          <div id="pb-prompts" class="pbcol-list"></div>
+        </div>
+      </div>
+      <div class="pb-edit">
+        <input type="text" id="pb-edit-name" class="pb-edit-name" placeholder="Prompt name" disabled />
+        <textarea id="pb-edit-text" class="pb-edit-text" rows="6" placeholder="Select or create a prompt…" disabled></textarea>
+      </div>
+      <div class="modal-btns pb-btns">
+        <button id="btn-pb-use" class="primary" disabled>Use in chat</button>
+        <button id="btn-pb-save" class="small" disabled>Save changes</button>
+        <span class="spacer"></span>
+        <button class="ghost modal-close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast-container"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

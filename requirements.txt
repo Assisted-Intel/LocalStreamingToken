@@ -1,0 +1,60 @@
+flask>=3.0.0
+requests>=2.31.0
+anthropic>=0.40.0
+openai>=1.50.0
+cryptography>=42          # AES-256-GCM at-rest encryption of all app data + the login keyfile (scrypt-derived keys)
+
+# tkinter is used for the native folder/file dialogs. It ships with the standard
+# CPython installer on Windows/macOS; on Linux install the OS package
+# (e.g. `sudo apt install python3-tk`).
+
+# --------------------------------------------------------------------------
+# Document ingestion for RAG Libraries + Persona knowledge (PDF/EPUB/DOCX).
+# Imported lazily in app/ingest.py — plain text/markdown works without these.
+# --------------------------------------------------------------------------
+pypdf>=4.0                # PDF text extraction
+ebooklib>=0.18            # EPUB reading
+beautifulsoup4>=4.12      # EPUB HTML → text; also web-crawl boilerplate pre-clean
+python-docx>=1.1          # DOCX reading
+
+# Readable article extraction for the Resources tab's URL / Brave-search crawls (and chat
+# web-search): isolates the main article text and drops nav menus, headers/footers, sidebars,
+# related rails, infoboxes, and tables. Imported lazily in app/core.py (_extract_page_text) —
+# falls back to a BeautifulSoup/regex extractor if absent. Pulls lxml (small, has wheels).
+trafilatura>=2.0          # main-content / boilerplate-free HTML → text
+
+# --------------------------------------------------------------------------
+# Token-accurate, structure-aware chunking for the "Compile Data" step
+# (RecursiveChunker: paragraphs → sentences → tokens). Imported lazily in
+# app/rag.py — if missing, chunking falls back to word-window chunk_text().
+# --------------------------------------------------------------------------
+chonkie>=0.4              # semantic/recursive RAG chunking
+
+# --------------------------------------------------------------------------
+# Local browser crawl fallback for the Resources tab's "Add by URL" / "Brave
+# search" sources. Bright Data (if a token is set) is tried first, then this
+# local headless Chromium, then a plain requests GET — so scraping still works
+# without Playwright. Imported lazily in app/core.py (_playwright_fetch).
+# After `pip install playwright`, download the browser once with:
+#     playwright install chromium
+# --------------------------------------------------------------------------
+playwright>=1.40          # optional: JS-rendering local crawl fallback
+
+# --------------------------------------------------------------------------
+# Database Processing tab (import → isolated DuckDB staging → safe write-back).
+# Everything here runs fully locally/offline once installed. For an air-gapped
+# install, vendor wheels with:  pip download -r requirements.txt -d wheelhouse
+# then on the target:            pip install --no-index --find-links wheelhouse -r requirements.txt
+# --------------------------------------------------------------------------
+SQLAlchemy>=2.0            # all relational engines (Postgres/MySQL/SQLite/…) 2.x API
+duckdb>=1.4               # isolated local staging engine + native AES database encryption (ATTACH … ENCRYPTION_KEY)
+psycopg[binary]>=3.1      # PostgreSQL driver (binary wheel — no local libpq needed)
+PyMySQL>=1.1             # MySQL / MariaDB driver (pure-python, no build step)
+
+# Phase 9+ (added when those engines are enabled):
+# pymongo>=4.6            # MongoDB
+# pyodbc>=5.0            # SQL Server            (needs an ODBC driver on the OS)
+# oracledb>=2.0          # Oracle                (thin mode — no Oracle client needed)
+# sshtunnel>=0.4         # SSH tunnels to a DB behind a bastion
+# paramiko>=3.4          # (sshtunnel dependency)
+# azure-identity>=1.15   # Azure AD / IAM token auth

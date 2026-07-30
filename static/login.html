@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sign in — Local Streaming Token</title>
+  <style>
+    :root {
+      --accent: rgb(28, 80, 150);
+      --accent2: rgb(28, 110, 120);
+      --bg: rgb(252, 252, 253);
+      --panel: rgb(238, 238, 240);
+      --border: rgb(210, 210, 216);
+      --err: rgb(200, 70, 70);
+      --ok: rgb(30, 130, 60);
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      height: 100%; margin: 0;
+      font-family: "Segoe UI", system-ui, Arial, sans-serif; font-size: 14px;
+      color: #1b1b1b;
+      background: linear-gradient(135deg, rgb(28,80,150), rgb(28,110,120));
+    }
+    body { display: flex; align-items: center; justify-content: center; }
+    .card {
+      width: 360px; max-width: calc(100vw - 32px);
+      background: var(--bg); border-radius: 12px; padding: 28px 26px;
+      box-shadow: 0 18px 50px rgba(0,0,0,.35);
+    }
+    .brand { text-align: center; margin-bottom: 6px; }
+    .brand-name { font-size: 20px; font-weight: 700; color: var(--accent); letter-spacing:.3px; }
+    .brand-sub { font-size: 12px; color: #777; margin-top: 2px; }
+    h1 { font-size: 15px; font-weight: 600; margin: 18px 0 14px; color: #333; }
+    label { display: block; font-size: 12px; font-weight: 600; color: #555; margin: 12px 0 4px; }
+    input[type=text], input[type=password] {
+      width: 100%; padding: 9px 10px; border: 1px solid var(--border);
+      border-radius: 7px; font-size: 14px; background: #fff; color: #1b1b1b;
+    }
+    input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(28,80,150,.15); }
+    button.primary {
+      width: 100%; margin-top: 18px; padding: 10px; border: none; border-radius: 7px;
+      background: var(--accent); color: #fff; font-size: 15px; font-weight: 600; cursor: pointer;
+    }
+    button.primary:hover { background: rgb(24, 68, 128); }
+    button.primary:disabled { opacity: .6; cursor: default; }
+    .msg { min-height: 18px; margin-top: 12px; font-size: 13px; }
+    .msg.error { color: var(--err); }
+    .msg.ok { color: var(--ok); }
+    .hint { margin-top: 16px; font-size: 11.5px; color: #888; text-align: center; line-height: 1.5; }
+    /* modal */
+    .overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,.45);
+      display: none; align-items: center; justify-content: center; padding: 16px;
+    }
+    .overlay.show { display: flex; }
+    .modal { width: 380px; max-width: 100%; background: var(--bg); border-radius: 12px; padding: 24px; }
+    .modal h2 { font-size: 16px; margin: 0 0 6px; color: var(--accent); }
+    .modal p { font-size: 13px; color: #555; margin: 0 0 8px; line-height: 1.5; }
+    .row { display: flex; gap: 10px; margin-top: 16px; }
+    .row button { flex: 1; padding: 9px; border-radius: 7px; font-size: 14px; cursor: pointer; border: 1px solid var(--border); }
+    .row button.save { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
+    .checkbox { display: flex; align-items: center; gap: 8px; margin-top: 14px; font-size: 12.5px; color: #666; }
+    .checkbox input { width: auto; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand">
+      <div class="brand-name">Local Streaming Token</div>
+      <div class="brand-sub">by Assisted Intel</div>
+    </div>
+    <h1>Sign in to continue</h1>
+    <form id="login-form" autocomplete="off">
+      <label for="username">Username</label>
+      <input id="username" type="text" value="admin" autocomplete="username" />
+      <label for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" autofocus />
+      <button class="primary" type="submit" id="login-btn">Sign in</button>
+      <div class="msg" id="login-msg"></div>
+    </form>
+    <div class="hint">Your data is encrypted at rest. The default login is
+      <strong>admin</strong> / <strong>admin</strong> — you'll be prompted to change it.</div>
+  </div>
+
+  <!-- Change-defaults nag -->
+  <div class="overlay" id="nag">
+    <div class="modal">
+      <h2>You're using the default login</h2>
+      <p>You're signed in with the default <strong>admin&nbsp;/&nbsp;admin</strong>.
+         Anyone who can run this app could open your encrypted data with those defaults.
+         Set your own to make the encryption meaningful.</p>
+      <form id="change-form" autocomplete="off">
+        <label for="new-username">New username</label>
+        <input id="new-username" type="text" value="admin" autocomplete="username" />
+        <label for="new-password">New password</label>
+        <input id="new-password" type="password" autocomplete="new-password" />
+        <label for="confirm-password">Confirm password</label>
+        <input id="confirm-password" type="password" autocomplete="new-password" />
+        <div class="msg" id="change-msg"></div>
+        <div class="row">
+          <button type="button" id="skip-btn">Not now</button>
+          <button type="submit" class="save" id="save-btn">Save &amp; continue</button>
+        </div>
+        <div class="checkbox">
+          <input type="checkbox" id="dont-show" />
+          <label for="dont-show" style="margin:0;font-weight:400;">Don't show this again</label>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    async function postJSON(url, body) {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body || {}),
+      });
+      let data = {};
+      try { data = await r.json(); } catch (e) {}
+      return { ok: r.ok, status: r.status, data };
+    }
+
+    function goHome() { window.location.href = "/"; }
+
+    // ---- login ----
+    $("login-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const msg = $("login-msg");
+      msg.textContent = ""; msg.className = "msg";
+      $("login-btn").disabled = true;
+      const res = await postJSON("/api/login", {
+        username: $("username").value,
+        password: $("password").value,
+      });
+      $("login-btn").disabled = false;
+      if (!res.ok) {
+        msg.textContent = (res.data && res.data.error) || "Sign in failed.";
+        msg.className = "msg error";
+        return;
+      }
+      const auth = res.data.auth || {};
+      if (auth.using_default_creds && !auth.warning_dismissed) {
+        $("nag").classList.add("show");
+        $("new-password").focus();
+      } else {
+        goHome();
+      }
+    });
+
+    // ---- change-defaults modal ----
+    $("skip-btn").addEventListener("click", async () => {
+      // Honor "Don't show again" even when skipping, then continue to the app.
+      if ($("dont-show").checked) { await postJSON("/api/auth/dismiss-warning", {}); }
+      goHome();
+    });
+
+    $("change-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const msg = $("change-msg");
+      msg.textContent = ""; msg.className = "msg";
+      const np = $("new-password").value, cp = $("confirm-password").value;
+      if (np.length < 1) { msg.textContent = "Enter a new password."; msg.className = "msg error"; return; }
+      if (np !== cp) { msg.textContent = "Passwords don't match."; msg.className = "msg error"; return; }
+      $("save-btn").disabled = true;
+      if ($("dont-show").checked) {
+        await postJSON("/api/auth/dismiss-warning", {});
+      }
+      const res = await postJSON("/api/auth/change", {
+        current_password: $("password").value,   // the password we just logged in with
+        new_username: $("new-username").value,
+        new_password: np,
+      });
+      $("save-btn").disabled = false;
+      if (!res.ok) {
+        msg.textContent = (res.data && res.data.error) || "Couldn't update your login.";
+        msg.className = "msg error";
+        return;
+      }
+      msg.textContent = "Saved."; msg.className = "msg ok";
+      setTimeout(goHome, 400);
+    });
+  </script>
+</body>
+</html>

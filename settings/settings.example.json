@@ -1,0 +1,35 @@
+{
+  "_comment": "Copy this file to settings.json and fill in your own values. settings.json is gitignored so your keys are never committed. You can also add servers/providers and keys from the app's Settings tab.",
+  "servers": [
+    {
+      "name": "My Remote Ollama",
+      "type": "ollama",
+      "base_url": "http://192.168.1.50:11434",
+      "api_key": ""
+    },
+    {
+      "name": "Claude",
+      "type": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "api_key": "sk-ant-..."
+    },
+    {
+      "name": "OpenAI",
+      "type": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "sk-..."
+    }
+  ],
+  "default_num_ctx": 4096,
+  "last_server_url": "http://127.0.0.1:11434",
+  "auto_detect_reasoning": false,
+  "approved_domains": [],
+  "restrict_to_approved": false,
+  "brave_token": "",
+  "brightdata_token": "",
+  "brightdata_zone": "web_unlocker1",
+  "max_output_tokens": 16000,
+  "rag_embed_server_url": "http://127.0.0.1:11434",
+  "rag_embed_model": "nomic-embed-text",
+  "rag_top_k": 6
+}
