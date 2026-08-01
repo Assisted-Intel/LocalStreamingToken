@@ -118,7 +118,9 @@ send it, with **↶ Undo**. Uses your chat model, or a dedicated rewrite model.
   ```bash
   ollama pull nomic-embed-text
   ```
-  (Not needed if you use `keyword` retrieval mode.)
+  (Not needed if you use `keyword` retrieval mode.) See
+  [rag-deps.md](rag-deps.md) for the full list of RAG models, alternatives with their
+  dimensions, and which host each one has to be pulled onto.
 - **tkinter** — bundled with the standard CPython installer on Windows and macOS.
   On Debian/Ubuntu: `sudo apt install python3-tk`
 - *Optional:* `playwright install chromium` for JavaScript-heavy web-search pages
@@ -233,6 +235,15 @@ source documents + memories). Importing a bundle re-ingests and re-embeds locall
   in `settings/app_key.enc`. Logging in *is* unwrapping the key — there's no separate
   password hash — and the unwrapped key exists only in memory. DuckDB stores use
   DuckDB's own native encryption.
+- **One deliberate exception: the LanceDB vector store.** RAG can use either of two
+  vector stores (*Settings → RAG → Vector store*). **LanceDB is the default and is not
+  encrypted** — the chunk text and embeddings of everything you compile sit in plain
+  files under your data profile, readable without your login password. It is chosen as
+  the default because it is dramatically faster: measured at 50k chunks, writes are
+  ~155x quicker and keyword search ~174x quicker, because it can use durable on-disk
+  vector and full-text indexes that cannot operate on ciphertext. If you would rather
+  have the encryption, switch to the **DuckDB** store — it stays fully supported, keeps
+  its data, and you can switch back at any time. Both stores are gitignored.
 - **Nothing is uploaded.** The server is the only thing that touches your filesystem,
   it's bound to localhost, and file dialogs pass paths rather than contents.
 - **Exports are deliberately plaintext**, so a persona or library you export is a normal
@@ -252,6 +263,7 @@ by design. Don't expose it to a network you don't control.
 main.py                     Launcher: pick a port, start the server, open the browser
 requirements.txt            Python dependencies (annotated, air-gap friendly)
 OLLAMA_REQUIREMENTS.md      Ollama install + model/hardware guidance
+rag-deps.md                 Which Ollama models RAG needs, and on which host
 ARCHITECTURE.md             How it works inside — start here to contribute
 
 app/

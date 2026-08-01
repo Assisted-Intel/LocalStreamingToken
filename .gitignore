@@ -37,6 +37,18 @@ venv/
 *.duckdb.wal
 *.wal
 
+# LanceDB vector store. The store is a DIRECTORY (holding _versions/, _indices/,
+# _transactions/) but its data fragments are individual `*.lance` FILES, so both forms
+# are matched — a bare `*.lance/` would let a loose fragment through, and a fragment
+# holds raw chunk text and embeddings.
+#
+# This matters more than the DuckDB rule above: a Lance store is PLAINTEXT. The RAG
+# corpus is private and unique to each user, so it must never reach a public repo.
+# It lives under data/ (ignored above); this is the belt-and-braces net for a store
+# written anywhere else.
+*.lance
+*.lance/
+
 # Persona per-persona binary stores, under the active data profile. Definitions live
 # in persona.xml (exported explicitly); knowledge/memory vectors are a derived cache
 # and originals are re-ingested and re-embedded on import.

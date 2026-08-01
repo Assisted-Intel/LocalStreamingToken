@@ -17,6 +17,7 @@ import requests
 import json
 import os
 import re
+import sys
 import threading
 import uuid
 import html as html_lib
@@ -27,6 +28,80 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
 from . import crypto
+
+
+# --------------------------- Broken optional dependencies ---------------------------
+
+class _BrokenModuleBlocker:
+    """A ``sys.meta_path`` finder that fails a known-broken module instantly.
+
+    Sits at the front of the meta path and raises ``ModuleNotFoundError`` for the named
+    packages (and their submodules) before any filesystem search happens.
+    """
+
+    def __init__(self, names):
+        self.names = set(names)
+
+    def find_spec(self, fullname, path=None, target=None):
+        root = fullname.split(".")[0]
+        if root in self.names:
+            raise ModuleNotFoundError(
+                f"{root} is installed but unimportable and has been disabled by "
+                f"{APP_NAME}; reinstall it to use features that need it.",
+                name=fullname)
+        return None     # everything else: fall through to the normal finders
+
+
+def _neutralize_broken_optional_imports():
+    """Stop libraries paying for an optional dependency that is installed but unimportable.
+
+    DuckDB (and LanceDB, pyarrow, and friends) probe for pandas/numpy/pyarrow while
+    converting values. When such a package is INSTALLED BUT BROKEN — classically a
+    numpy/pandas ABI mismatch ("numpy.dtype size changed"), or a bad DLL directory —
+    the import raises something other than ImportError, and CPython does not cache
+    failed imports. So every probe rescans sys.path and re-executes part of the package.
+
+    Measured here on a conda base env with a mismatched pandas: DuckDB attempted 5,280
+    pandas imports for a 40-row insert, and a 720-row insert took 301 SECONDS. Blocking
+    the import took the same workload from ~3 rows/s to ~800 rows/s.
+
+    We block via a meta-path finder rather than the more obvious
+    ``sys.modules[name] = None``. That idiom does make ``import name`` fail, but it also
+    makes the widely-used polars-style lazy-import shim believe the module is *loaded*::
+
+        if module_name in sys.modules:
+            return sys.modules[module_name], True    # -> (None, "available")
+
+    LanceDB uses exactly that shim, and would then dereference ``None.__version__``.
+    Raising ModuleNotFoundError from ``find_spec`` instead leaves ``sys.modules`` clean,
+    so such probes correctly conclude the module is unavailable — and it is still
+    instant, because no path search runs.
+
+    A genuinely absent package is left alone: CPython already caches that cheaply.
+    Returns ``[(name, error)]`` so startup can warn about what it disabled.
+    """
+    broken = []
+    for mod in ("pandas", "numpy", "pyarrow"):
+        if mod in sys.modules:
+            continue
+        try:
+            __import__(mod)
+        except ImportError:
+            pass            # not installed — nothing to do, and the failure is cached
+        except Exception as e:
+            broken.append((mod, f"{type(e).__name__}: {e}"))
+    if broken:
+        # Drop any partially-initialised submodules the failed import left behind,
+        # or the blocker will be bypassed for those names.
+        roots = {name for name, _ in broken}
+        for key in [k for k in sys.modules
+                    if k.split(".")[0] in roots]:
+            del sys.modules[key]
+        sys.meta_path.insert(0, _BrokenModuleBlocker(roots))
+    return broken
+
+
+BROKEN_OPTIONAL_IMPORTS = _neutralize_broken_optional_imports()
 
 # --------------------------- Branding ---------------------------
 APP_NAME = "Local Streaming Token"
@@ -97,6 +172,11 @@ LIBRARIES_FILE = DATA_DIR / "libraries.json"
 EVALS_FILE = DATA_DIR / "evals.json"           # Prompt Validation & Evaluation projects
 CONTEXT_HISTORY_FILE = DATA_DIR / "context_history.json"  # per-chat LLM-call token-usage history {chat_id: [entry, ...]}
 RAG_DB_FILE = DATA_DIR / "rag.duckdb"          # persistent RAG vector store (library chunk embeddings)
+# LanceDB alternative to RAG_DB_FILE — a *directory*, and PLAINTEXT (chunk text and
+# embeddings are not encrypted). Both stores can exist side by side; Settings → RAG
+# chooses which one is live. Named *.lance so the .gitignore rule catches it wherever
+# it ends up.
+RAG_LANCE_DIR = DATA_DIR / "rag.lance"
 COMPILED_FILE = DATA_DIR / "compiled.json"     # "Compile Data" manifests (rebuildable cache): {"library:<id>"/"persona:<id>": {...}}
 PERSONAS_DIR = DATA_DIR / "personas"           # one <persona_id>/ folder each (persona.xml + sources/ + memories/)
 
@@ -114,7 +194,8 @@ def set_active_data_profile(profile_dir):
     """Point every per-data-profile path at ``profile_dir`` and ensure its subdirs
     exist. Reassigns module globals in place (callers read core.<CONST> at call time)."""
     global CHATS_FILE, CHAT_GROUPS_FILE, PRESETS_FILE, PROMPTS_FILE, LIBRARIES_FILE
-    global EVALS_FILE, CONTEXT_HISTORY_FILE, DB_PROJECTS_FILE, RAG_DB_FILE, COMPILED_FILE, PERSONAS_DIR
+    global EVALS_FILE, CONTEXT_HISTORY_FILE, DB_PROJECTS_FILE, RAG_DB_FILE, RAG_LANCE_DIR
+    global COMPILED_FILE, PERSONAS_DIR
     global DB_DIR, DB_STAGING_DIR, DB_AUDIT_DIR, VAULT_FILE
     d = Path(profile_dir)
     d.mkdir(parents=True, exist_ok=True)
@@ -127,6 +208,7 @@ def set_active_data_profile(profile_dir):
     CONTEXT_HISTORY_FILE = d / "context_history.json"
     DB_PROJECTS_FILE = d / "db_projects.json"
     RAG_DB_FILE = d / "rag.duckdb"
+    RAG_LANCE_DIR = d / "rag.lance"
     COMPILED_FILE = d / "compiled.json"
     PERSONAS_DIR = d / "personas"
     DB_DIR = d / "db"
@@ -1197,12 +1279,16 @@ class OllamaClient:
         inputs = [t if isinstance(t, str) else str(t) for t in inputs]
         if not inputs:
             return []
+        # Scale the timeout with the batch: a 64-chunk request on a CPU-only host can
+        # take minutes, and a spurious timeout costs the whole batch (it gets retried
+        # on another server, or degrades to empty vectors).
+        timeout = min(600, 60 + 2 * len(inputs))
         # Newer batch endpoint.
         try:
             resp = requests.post(
                 f"{self.base_url}/api/embed",
                 json={"model": model, "input": inputs},
-                timeout=120,
+                timeout=timeout,
             )
             if resp.status_code != 404:
                 resp.raise_for_status()
@@ -1219,7 +1305,7 @@ class OllamaClient:
                 r = requests.post(
                     f"{self.base_url}/api/embeddings",
                     json={"model": model, "prompt": text},
-                    timeout=120,
+                    timeout=min(600, 60 + 2 * len(inputs)),
                 )
                 r.raise_for_status()
                 vec = (r.json() or {}).get("embedding")

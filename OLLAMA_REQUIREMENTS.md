@@ -48,7 +48,7 @@ address in the app under **Settings → RAG → Embed server URL**.
 ### Models the app references
 
 - **Embedding (required):** `nomic-embed-text` — the default in
-  **Settings → RAG → Embed model**.
+  **Settings → RAG → Embedding model**.
 - **Optional embedding alternatives** (change in the same setting):
   - `all-minilm` — smallest/fastest, best for CPU-only machines, lower quality.
   - `snowflake-arctic-embed2` or `mxbai-embed-large` — higher retrieval quality,
@@ -57,6 +57,12 @@ address in the app under **Settings → RAG → Embed server URL**.
     from different models are not comparable, and the app will mark libraries/
     personas stale until recompiled.
 - **Chat (optional):** any local model you select in the chat UI.
+
+📖 **[rag-deps.md](rag-deps.md)** covers the RAG models in full: the complete list of
+embedding models with dimensions, which *host* each auxiliary model must be pulled onto
+(contextual chunking runs on the embedding server, not the chat server), how to run RAG
+with no models at all, and probe commands for checking a model's dimensions and context
+window.
 
 ---
 
@@ -70,14 +76,44 @@ environment variables let that parallelism actually land:
 | `OLLAMA_NUM_PARALLEL` | `4` | Number of requests Ollama serves at once. Let the app's concurrent embed batches run in parallel instead of queueing. On **CPU-only**, leave low (`1`–`2`). |
 | `OLLAMA_KEEP_ALIVE` | `30m` | Keeps the embed model loaded in memory between compiles, avoiding a reload each run. |
 
-Matching app setting (**Settings → RAG**):
+Matching app settings (**Settings → RAG**):
 
-- `rag_embed_concurrency` = **3** on a GPU (keep it **≤ `OLLAMA_NUM_PARALLEL`**),
-  or **1** on a CPU-only machine.
-- `rag_embed_batch_size` = **64** (chunks per request; fine on all hardware).
+- **Embed requests per server** (`rag_embed_concurrency`) = **3** on a GPU (keep it
+  **≤ `OLLAMA_NUM_PARALLEL`**), or **1** on a CPU-only machine. This is now per
+  server, not per compile.
+- **Embed batch size** (`rag_embed_batch_size`) = **64** (chunks per request; fine on
+  all hardware).
+
+### Using several machines at once
+
+Tick **"Use multiple servers to build RAG"** and add each Ollama host under
+*Settings → RAG*. During a compile, batches are handed to whichever server is free, so
+a faster box simply does more; **Check servers** verifies each one is reachable and
+actually has the embedding model pulled.
+
+Every server in the pool uses the single **Embedding model** setting. There is no
+per-server model on purpose: vectors from different embedding models occupy different
+spaces and are not comparable, so mixing them would corrupt the index. Run
+`ollama pull nomic-embed-text` (or whichever model you chose) on every machine.
+
+If a server dies mid-compile its batches are retried on another one; if some chunks
+still can't be embedded, those documents are reported and left out of the manifest so
+they recompile next time rather than being recorded as done.
 
 Also: keep **Contextual chunking OFF** unless you specifically want it — it runs a
 full LLM call per chunk and is by far the biggest compile cost when enabled.
+
+### If compiles are inexplicably slow
+
+DuckDB probes for `pandas`/`numpy` while converting values. If one of those is
+**installed but broken** (typically a numpy/pandas ABI mismatch — *"numpy.dtype size
+changed"*), Python retries the failing import for every value, and indexing slows by
+roughly two orders of magnitude. The app detects this at startup, disables the broken
+package for its own use, and prints a warning naming it. Fix the environment with:
+
+```
+pip install -U --force-reinstall numpy pandas
+```
 
 ---
 

@@ -272,12 +272,34 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .compile-bar { height: 6px; background: var(--border); border-radius: 4px; overflow: hidden; margin-bottom: 8px; }
 .compile-bar-fill { height: 100%; width: 0%; background: var(--accent, #5b8def); transition: width 0.2s ease; }
 .compile-log { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 11px; line-height: 1.5; max-height: 180px; overflow-y: auto; white-space: pre-wrap; }
+/* Phase / counts / ETA row above the log. */
+.compile-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 11px; margin-bottom: 6px; }
+.compile-phase { font-weight: 600; }
+.compile-counts { color: #666; }
+.compile-eta { margin-left: auto; font-variant-numeric: tabular-nums; color: #666; }
+.compile-cancel { padding: 1px 8px; }
+.compile-lanes { display: flex; gap: 8px; flex-wrap: wrap; font-size: 11px; margin-bottom: 6px; }
+.compile-lane { background: #eef2f8; border: 1px solid #d7e0ee; border-radius: 10px; padding: 1px 8px; color: #44536b; }
+.compile-lane.down { background: #fbe9e9; border-color: #e8bcbc; color: #8a3232; }
+/* Embedding-server list in Settings → RAG. */
+.rag-server-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 12px; }
+.rag-server-row .url { font-family: ui-monospace, Consolas, monospace; }
+.rag-server-row .health { margin-left: auto; font-size: 11px; }
+.rag-server-row .health.ok { color: #226b34; }
+.rag-server-row .health.bad { color: #8a3232; }
+.rag-server-row .health.warn { color: #8a5a00; }
 .libselect-row { display: flex; align-items: center; gap: 6px; }
 @media (prefers-color-scheme: dark) {
   .cbadge.ok { background: #1e3a25; color: #9fdcae; border-color: #2f6b3f; }
   .cbadge.stale { background: #3a2f17; color: #e6c46a; border-color: #6b5320; }
   .cbadge.none { background: #2a2a2a; color: #aaa; border-color: #3a3a3a; }
   .cbadge.working { background: #1c2c47; color: #a9c6f4; border-color: #33507f; }
+  .compile-counts, .compile-eta { color: #9aa4b2; }
+  .compile-lane { background: #222934; border-color: #38424f; color: #b7c3d4; }
+  .compile-lane.down { background: #3a2020; border-color: #6b3232; color: #e8a6a6; }
+  .rag-server-row .health.ok { color: #9fdcae; }
+  .rag-server-row .health.bad { color: #e8a6a6; }
+  .rag-server-row .health.warn { color: #e6c46a; }
 }
 
 /* ---------------- Modals ---------------- */

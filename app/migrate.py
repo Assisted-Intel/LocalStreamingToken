@@ -16,11 +16,19 @@ Carve-outs (must stay readable BEFORE login, or are already encrypted / are temp
   * ``settings/app_key.enc`` and any ``*.enc`` (e.g. the DB connection vault) — already
     encrypted with their own scheme.
   * ``settings/settings.example.json`` — a plaintext template that ships in the repo.
+  * **Anything inside a ``*.lance`` directory** — the LanceDB vector store. It is a
+    deliberately plaintext store owned by a third-party engine (see
+    ``app/vectorstore/lance_backend.py``), made of many internal files: data fragments,
+    manifests, transaction logs and index segments. Encrypting them in place makes the
+    store unopenable — Lance reports ``LanceError(IO): file size is too small`` because
+    every file has grown by the 36-byte header/nonce/tag. This carve-out is load-bearing:
+    without it the sweep destroys the vector store on the very next login.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 from . import core, crypto
@@ -28,6 +36,14 @@ from . import core, crypto
 # Files that must NOT be encrypted (see module docstring).
 _SKIP_NAMES = {"profiles.json", "app_key.enc", "settings.example.json"}
 _SKIP_SUFFIXES = {".enc", ".tmp", ".encmig"}
+# Directory suffix marking a third-party store we must not touch the insides of.
+_OPAQUE_STORE_SUFFIX = ".lance"
+
+
+def _in_opaque_store(path: Path) -> bool:
+    """True for anything at or beneath a ``*.lance`` directory. Checked against every
+    path component, since the store nests its own ``*.lance`` data fragments."""
+    return any(part.lower().endswith(_OPAQUE_STORE_SUFFIX) for part in path.parts)
 
 
 def _encrypt_file_in_place(path: Path) -> bool:
@@ -71,7 +87,9 @@ def _migrate_duckdb(path: Path) -> bool:
 
 
 def _should_skip(path: Path) -> bool:
-    return path.name in _SKIP_NAMES or path.suffix.lower() in _SKIP_SUFFIXES
+    return (path.name in _SKIP_NAMES
+            or path.suffix.lower() in _SKIP_SUFFIXES
+            or _in_opaque_store(path))
 
 
 def run() -> dict:
@@ -105,11 +123,28 @@ def wipe_encrypted() -> int:
     Data Encryption Key can never be recovered, so the encrypted data is unreadable
     garbage — this clears it for a clean start. Plaintext registries/templates and the
     separately-encrypted ``*.enc`` files (incl. the DB connection vault) are left alone;
-    the keyfile itself is removed by the caller. Returns the number of files removed."""
+    the keyfile itself is removed by the caller. Returns the number of files removed.
+
+    LanceDB stores are removed **wholesale**, and that is the point: they are plaintext,
+    so unlike the encrypted files they would remain perfectly readable after a "wipe my
+    data" reset. Leaving them would silently break the promise this command makes. They
+    are also a rebuildable cache, so nothing unique is lost."""
     removed = 0
     for base in (core.DATA_DIR, core.SETTINGS_DIR):
         if not base.exists():
             continue
+        # Plaintext vector stores go first, as whole directories — _should_skip()
+        # deliberately protects their insides from the per-file sweep below.
+        for store in list(base.rglob(f"*{_OPAQUE_STORE_SUFFIX}")):
+            if not store.is_dir():
+                continue
+            try:
+                n = sum(1 for p in store.rglob("*") if p.is_file())
+                shutil.rmtree(store, ignore_errors=True)
+                if not store.exists():
+                    removed += n
+            except OSError:
+                pass
         for path in base.rglob("*"):
             if not path.is_file() or _should_skip(path):
                 continue

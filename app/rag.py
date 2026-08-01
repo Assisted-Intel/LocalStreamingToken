@@ -2,53 +2,67 @@
 """
 Local Streaming Token — RAG vector store.
 
-A DuckDB-backed store for Retrieval Augmented Generation. Library documents are
-chunked, embedded (via a caller-supplied ``embed_fn``) and persisted in
-``data/rag.duckdb``; at query time the top-k chunks most similar to the user's
-question are retrieved and injected into the prompt in place of the full text.
+Retrieval Augmented Generation: chunk → embed → store → retrieve. Library documents
+are chunked, embedded (via ``EmbedPool``) and persisted; at query time the top-k chunks
+most relevant to the user's question are retrieved and injected into the prompt in
+place of the full text.
+
+This module owns everything **storage-independent**. The store itself lives behind
+``app/vectorstore``, which offers two backends — encrypted DuckDB and plaintext
+LanceDB — selectable in Settings → RAG. Nothing here should know which is active.
 
 Design notes
-- Persistent corpus = the user's selected **Libraries**. Re-embedding is skipped
-  when an item's chunk set is unchanged (content-hash compared), so indexing is
-  idempotent and cheap to call on every send.
-- Transient corpus = the inline ``<Data>`` block staged for one message. These are
-  embedded on the fly and scored in memory — never written to the store.
-- Similarity is cosine. DuckDB's built-in ``list_cosine_similarity`` is used when
-  available, with a pure-Python fallback so the feature works on any DuckDB build
-  and needs no VSS extension download (an HNSW/VSS index can be added later purely
-  as a scale-up).
-
-The DuckDB connection is cached process-wide with a reentrant lock, mirroring
-``app/database/staging.py``.
+- Persistent corpus = the user's selected **Libraries** (and persona knowledge and
+  memories, namespaced by ``source_type``). Re-embedding is skipped when an item's
+  content is unchanged, and vectors are reused for identical text even when it moves,
+  so editing one paragraph of a long book re-embeds only what actually changed.
+- Transient corpus = the inline ``<Data>`` block staged for one message. Embedded on
+  the fly and scored in memory — never written to the store.
+- Retrieval accepts multiple query variants and fuses the ranked lists with RRF, which
+  merges by *rank* and so works across backends whose raw scores are not comparable.
+- Writes stream in bounded waves so a shelf of ebooks never has to be held in memory
+  at once.
 """
 
 import hashlib
 import json
-import math
-import re
+import queue as _queue
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from . import core
+from . import vectorstore
+from .vectorstore import scoring
 
-# Process-wide (connection, lock). Lazy — only opened when RAG is first used.
-_CONN = None
-_REG_LOCK = threading.Lock()
+
+def _backend():
+    """The active vector-store backend (see ``app/vectorstore``)."""
+    return vectorstore.get_backend()
 
 
 def reset_connection():
-    """Close and drop the cached DuckDB connection so the next use reopens against
-    the current ``core.RAG_DB_FILE``. Called when the active data profile changes —
-    otherwise RAG would keep reading/writing the previous profile's vector store."""
-    global _CONN
-    with _REG_LOCK:
-        if _CONN is not None:
-            try:
-                _CONN.close()
-            except Exception:
-                pass
-            _CONN = None
+    """Drop the cached store handle so the next use reopens against the current data
+    profile. Called when the active profile changes — otherwise RAG would keep
+    reading/writing the previous profile's vector store."""
+    vectorstore.reset()
+
+
+def set_backend(name) -> str:
+    """Settings hook: choose the vector-store backend ('lance' or 'duckdb')."""
+    return vectorstore.set_backend(name)
+
+
+def backend_name() -> str:
+    return vectorstore.active_name()
+
+
+def backend_status() -> dict:
+    try:
+        return _backend().status()
+    except Exception as e:
+        return {"backend": vectorstore.active_name(), "error": str(e)}
 
 
 # --------------------------- Chunking ---------------------------
@@ -174,183 +188,17 @@ def item_hashes(content: str) -> list:
 def stored_hashes(source_type: str, source_id: str, item_id: str, model: str) -> list:
     """Ordered content-hashes currently stored for an item under ``model`` (empty if
     none). Compared against ``item_hashes`` to decide whether re-embedding is needed."""
-    conn = _conn()
-    with _REG_LOCK:
-        rows = conn.execute(
-            "SELECT content_hash FROM rag_chunks WHERE source_type = ? AND source_id = ? "
-            "AND item_id = ? AND model = ? ORDER BY chunk_index",
-            [source_type, source_id, item_id, model]).fetchall()
-    return [r[0] for r in rows]
+    return _backend().hashes(source_type, source_id, item_id, model)
 
 
 def prune_items(source_type: str, source_id: str, keep_item_ids: list) -> int:
     """Delete stored chunks for items no longer present. Returns rows deleted."""
-    conn = _conn()
-    keep = [i for i in (keep_item_ids or []) if i]
-    with _REG_LOCK:
-        before = conn.execute(
-            "SELECT COUNT(*) FROM rag_chunks WHERE source_type = ? AND source_id = ?",
-            [source_type, source_id]).fetchone()[0]
-        if keep:
-            placeholders = ", ".join("?" for _ in keep)
-            conn.execute(
-                f"DELETE FROM rag_chunks WHERE source_type = ? AND source_id = ? "
-                f"AND item_id NOT IN ({placeholders})",
-                [source_type, source_id, *keep])
-        else:
-            conn.execute(
-                "DELETE FROM rag_chunks WHERE source_type = ? AND source_id = ?",
-                [source_type, source_id])
-        after = conn.execute(
-            "SELECT COUNT(*) FROM rag_chunks WHERE source_type = ? AND source_id = ?",
-            [source_type, source_id]).fetchone()[0]
-    return int(before - after)
+    return _backend().prune(source_type, source_id, keep_item_ids)
 
 
 def count_chunks(source_type: str, source_id: str) -> int:
     """Total stored chunks for a scope (across all its items)."""
-    conn = _conn()
-    with _REG_LOCK:
-        return int(conn.execute(
-            "SELECT COUNT(*) FROM rag_chunks WHERE source_type = ? AND source_id = ?",
-            [source_type, source_id]).fetchone()[0])
-
-
-# --------------------------- Connection / schema ---------------------------
-
-def _conn():
-    """Return the cached DuckDB connection, creating the schema on first use."""
-    global _CONN
-    with _REG_LOCK:
-        if _CONN is None:
-            conn = core.duckdb_connect(core.RAG_DB_FILE)
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS rag_chunks (
-                    id VARCHAR,
-                    source_type VARCHAR,
-                    source_id VARCHAR,
-                    item_id VARCHAR,
-                    chunk_index INTEGER,
-                    content VARCHAR,
-                    content_hash VARCHAR,
-                    embedding FLOAT[],
-                    model VARCHAR,
-                    updated VARCHAR,
-                    context VARCHAR,
-                    meta VARCHAR
-                )
-                """
-            )
-            _migrate_schema(conn)
-            _CONN = conn
-        return _CONN
-
-
-def _migrate_schema(conn):
-    """In-place upgrades for stores created by older versions. Adds any column that
-    the current schema expects but an existing ``rag.duckdb`` predates."""
-    cols = {r[1] for r in conn.execute("PRAGMA table_info('rag_chunks')").fetchall()}
-    if "context" not in cols:
-        # Situating context from contextual chunking (Phase 2). Empty for old rows.
-        conn.execute("ALTER TABLE rag_chunks ADD COLUMN context VARCHAR")
-    if "meta" not in cols:
-        # Per-chunk JSON metadata (Phase 5): memory weight/narrative_time, etc.
-        conn.execute("ALTER TABLE rag_chunks ADD COLUMN meta VARCHAR")
-
-
-# --------------------------- Similarity ---------------------------
-
-def _cosine(a, b) -> float:
-    """Standard cosine similarity between two equal-length float lists."""
-    if not a or not b or len(a) != len(b):
-        return -1.0
-    dot = 0.0
-    na = 0.0
-    nb = 0.0
-    for x, y in zip(a, b):
-        dot += x * y
-        na += x * x
-        nb += y * y
-    if na == 0.0 or nb == 0.0:
-        return -1.0
-    return dot / (math.sqrt(na) * math.sqrt(nb))
-
-
-# --------------------------- Keyword (BM25) scoring ---------------------------
-
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
-
-
-def _tokenize(text: str) -> list:
-    return _TOKEN_RE.findall((text or "").lower())
-
-
-def _bm25_search(rows: list, query: str, top_k: int, k1: float = 1.5, b: float = 0.75) -> list:
-    """Rank ``rows`` (dicts with 'content' and optional 'context') against ``query``
-    using Okapi BM25 over the in-scope candidate set. Pure Python — needs no DuckDB
-    extension, so keyword/hybrid retrieval works offline and with no embedding model.
-    Returns rows (copied, with a 'score') sorted by descending BM25 score; only rows
-    with score > 0 are returned."""
-    q_terms = [t for t in set(_tokenize(query)) if t]
-    if not rows or not q_terms:
-        return []
-    docs = [_tokenize((r.get("context") or "") + " " + (r.get("content") or "")) for r in rows]
-    n = len(docs)
-    avgdl = (sum(len(d) for d in docs) / n) or 1.0
-    df = {}
-    for d in docs:
-        for term in set(d):
-            df[term] = df.get(term, 0) + 1
-    scored = []
-    for r, d in zip(rows, docs):
-        if not d:
-            continue
-        dl = len(d)
-        tf = {}
-        for term in d:
-            tf[term] = tf.get(term, 0) + 1
-        score = 0.0
-        for term in q_terms:
-            f = tf.get(term)
-            if not f:
-                continue
-            ni = df.get(term, 0)
-            idf = math.log(1 + (n - ni + 0.5) / (ni + 0.5))
-            score += idf * (f * (k1 + 1)) / (f + k1 * (1 - b + b * dl / avgdl))
-        if score > 0:
-            rr = dict(r)
-            rr["score"] = score
-            scored.append(rr)
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    return scored[:int(top_k)]
-
-
-def _result_key(r: dict):
-    """Stable identity for a retrieved chunk, used to dedupe across queries/modes."""
-    return r.get("id") or (r.get("source_id"), r.get("item_id"), r.get("content"))
-
-
-def _rrf_merge(result_lists: list, top_k: int, k: int = 60) -> list:
-    """Reciprocal-rank-fusion merge of several ranked result lists (each already
-    sorted best-first). The fused score replaces the per-list score; ties broken by
-    insertion order. Used to combine multiple query variants and to combine the
-    vector and keyword result sets in hybrid mode."""
-    fused = {}
-    keep = {}
-    for lst in result_lists:
-        for rank, r in enumerate(lst):
-            kk = _result_key(r)
-            fused[kk] = fused.get(kk, 0.0) + 1.0 / (k + rank + 1)
-            if kk not in keep:
-                keep[kk] = r
-    merged = []
-    for kk, s in fused.items():
-        rr = dict(keep[kk])
-        rr["score"] = s
-        merged.append(rr)
-    merged.sort(key=lambda x: x["score"], reverse=True)
-    return merged[:int(top_k)]
+    return _backend().count(source_type, source_id)
 
 
 def _as_vec_list(query_vecs) -> list:
@@ -380,78 +228,216 @@ def _item_label(it: dict) -> str:
             or ("Write-in" if it.get("type") == "write" else "File"))
 
 
-def _embed_chunks(embed_fn, chunks: list) -> list:
-    """Embed ``chunks`` with ``embed_fn`` (list[str] -> list[list[float]]). When no
-    embedder is supplied (keyword-only mode) or embedding fails (e.g. no embed server
-    reachable), return empty vectors so the chunks are still stored and available to
-    keyword/BM25 retrieval — vector retrieval simply won't match them until re-indexed."""
-    if not chunks:
-        return []
-    if embed_fn is None:
-        return [[] for _ in chunks]
-    try:
-        return embed_fn(chunks)
-    except Exception:
-        return [[] for _ in chunks]
+class _Lane:
+    """One embedding endpoint in the pool. Tracks throughput so the UI can show which
+    box is doing the work, and health so a dead host stops being handed batches."""
+
+    def __init__(self, call, name: str, base_url: str = ""):
+        self._call = call
+        self.name = name
+        self.base_url = base_url
+        self.batches = 0
+        self.inputs = 0
+        self.seconds = 0.0
+        self.failures = 0
+        self.down = False
+
+    def embed(self, batch: list) -> list:
+        t0 = time.time()
+        vecs = self._call(batch)
+        if not vecs or len(vecs) != len(batch):
+            raise RuntimeError(f"embedder returned {len(vecs) if vecs else 0} vectors "
+                               f"for {len(batch)} inputs")
+        out = [[float(x) for x in v] for v in vecs]
+        self.seconds += time.time() - t0
+        self.batches += 1
+        self.inputs += len(batch)
+        return out
+
+    def stats(self) -> dict:
+        rate = (self.inputs / self.seconds) if self.seconds > 0 else 0.0
+        return {"name": self.name, "base_url": self.base_url, "chunks": self.inputs,
+                "rate": round(rate, 2), "failures": self.failures, "down": self.down}
 
 
-def _embed_batched(embed_fn, inputs: list, batch_size: int = 64, max_workers: int = 1) -> list:
-    """Embed ``inputs`` (list[str]) -> one vector per input **in the same order**.
+class EmbedPool:
+    """Embeds text across one or more Ollama hosts at once.
 
-    Splits the work into batches of ``batch_size`` (each batch is one ``embed_fn``
-    call, so a huge document can't build a single 5000-input request) and, when
-    ``max_workers > 1``, runs up to that many batches concurrently. This is the hot
-    path for compile: it is **lock-free** (pure network/CPU) and MUST be called
-    outside ``_REG_LOCK`` so the network wait never blocks the shared DuckDB
-    connection. A failed batch degrades to empty vectors for its inputs (mirroring
-    ``_embed_chunks``) so the chunks still persist for keyword/BM25 retrieval.
+    Batches are dispatched from a shared queue to ``per_server_concurrency`` worker
+    threads **per lane**, so a faster machine simply pulls more work ("balanced" mode
+    in ``app/parallel.py`` terms). One embedding MODEL is used for the whole pool by
+    design: vectors from different models live in different spaces and are not
+    comparable, so mixing them would silently corrupt the index.
 
-    Concurrency is a backend-sensitive knob: a win on any GPU (CUDA/Metal/ROCm/
-    Intel), neutral-to-harmful on CPU-only. Callers pass ``max_workers=1`` there.
+    This is the hot path for compile. It is lock-free (pure network) and MUST be
+    called outside the store's write lock so a network wait never blocks readers.
+
+    A batch that fails is retried on a *different* lane before being given up on; the
+    lane that failed is marked down after ``max_retries`` failures so it stops
+    receiving work. Unrecoverable inputs get empty vectors — the chunk still persists
+    for keyword/BM25 retrieval — and are COUNTED and returned, so the caller can
+    refuse to record a half-embedded corpus as cleanly compiled.
     """
-    if not inputs:
-        return []
-    if embed_fn is None:
-        return [[] for _ in inputs]
-    try:
-        batch_size = max(1, int(batch_size))
-    except Exception:
-        batch_size = 64
-    try:
-        max_workers = max(1, int(max_workers))
-    except Exception:
-        max_workers = 1
-    batches = [inputs[i:i + batch_size] for i in range(0, len(inputs), batch_size)]
 
-    def _run(batch):
-        try:
-            vecs = embed_fn(batch)
-            if vecs and len(vecs) == len(batch):
-                return [[float(x) for x in v] for v in vecs]
-        except Exception:
-            pass
-        return [[] for _ in batch]
+    def __init__(self, lanes=None, model: str = "", embed_fn=None,
+                 per_server_concurrency: int = 3, batch_size: int = 64,
+                 max_retries: int = 2):
+        self.model = model
+        self.batch_size = max(1, _int_or(batch_size, 64))
+        self.per_server_concurrency = max(1, _int_or(per_server_concurrency, 3))
+        self.max_retries = max(1, _int_or(max_retries, 2))
+        self.lanes = []
+        for spec in (lanes or []):
+            url = (spec.get("base_url") or "").strip().rstrip("/")
+            if not url:
+                continue
+            client = core.OllamaClient(url)
+            self.lanes.append(_Lane(
+                (lambda c: lambda batch: c.embed(model, batch))(client),
+                spec.get("name") or url, url))
+        if not self.lanes and embed_fn is not None:
+            # Single-callable mode: the existing embed_fn callers (persona ingest,
+            # memory save) keep working unchanged.
+            self.lanes.append(_Lane(embed_fn, "embedder", ""))
+        # No lanes AND no callable means the caller deliberately asked for keyword-only
+        # indexing. That is not a failure — chunks are stored with empty vectors and
+        # BM25 retrieval works — so it must not be reported as one.
+        self.keyword_only = not self.lanes
 
-    if max_workers > 1 and len(batches) > 1:
+    @property
+    def active(self) -> bool:
+        return bool(self.lanes)
+
+    def lane_stats(self) -> list:
+        return [l.stats() for l in self.lanes]
+
+    def embed_many(self, inputs: list, on_progress=None, stop_event=None):
+        """Embed ``inputs`` -> ``(vectors_in_input_order, n_failed_inputs)``.
+
+        ``on_progress(done, total)`` is called as batches land (from worker threads —
+        it must be thread-safe and cheap). ``stop_event`` aborts between batches.
+        """
+        if not inputs:
+            return [], 0
+        if not self.lanes:
+            # Keyword-only indexing — empty vectors are the intended outcome.
+            return [[] for _ in inputs], 0
+
+        bs = self.batch_size
+        batches = [(i, inputs[s:s + bs])
+                   for i, s in enumerate(range(0, len(inputs), bs))]
         results = [None] * len(batches)
-        with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as ex:
-            futures = {ex.submit(_run, b): i for i, b in enumerate(batches)}
-            for fut, i in futures.items():
-                results[i] = fut.result()
-    else:
-        results = [_run(b) for b in batches]
+        total = len(inputs)
 
-    out = []
-    for r in results:
-        out.extend(r)
-    return out
+        pending = _queue.Queue()
+        for idx, batch in batches:
+            pending.put((idx, batch, 0))          # (batch index, texts, attempts)
+
+        state_lock = threading.Lock()
+        done = [0]
+        failed = [0]
+
+        def tick(n):
+            with state_lock:
+                done[0] += n
+                cur = done[0]
+            if on_progress is not None:
+                try:
+                    on_progress(cur, total)
+                except Exception:
+                    pass
+
+        def worker(lane):
+            while True:
+                # A down lane must stop pulling work entirely. Letting it keep grabbing
+                # batches just to reject them would burn each batch's retry budget and
+                # fail work a healthy lane could have done.
+                if lane.down:
+                    return
+                if stop_event is not None and stop_event.is_set():
+                    return
+                try:
+                    idx, batch, attempts = pending.get_nowait()
+                except _queue.Empty:
+                    return
+                try:
+                    results[idx] = lane.embed(batch)
+                    tick(len(batch))
+                except Exception:
+                    lane.failures += 1
+                    if lane.failures >= self.max_retries and len(self.lanes) > 1:
+                        lane.down = True
+                    alive = [l for l in self.lanes if not l.down]
+                    if attempts + 1 < self.max_retries and alive:
+                        # Hand it back to the queue — another lane will pick it up.
+                        pending.put((idx, batch, attempts + 1))
+                    else:
+                        results[idx] = [[] for _ in batch]
+                        with state_lock:
+                            failed[0] += len(batch)
+                        tick(len(batch))
+                finally:
+                    pending.task_done()
+
+        threads = []
+        for lane in self.lanes:
+            for _ in range(self.per_server_concurrency):
+                t = threading.Thread(target=worker, args=(lane,), daemon=True)
+                t.start()
+                threads.append(t)
+        for t in threads:
+            t.join()
+
+        # Every lane died (or we were stopped) with work still queued — account for it
+        # rather than silently returning empty vectors.
+        while True:
+            try:
+                idx, batch, _a = pending.get_nowait()
+            except _queue.Empty:
+                break
+            if results[idx] is None:
+                results[idx] = [[] for _ in batch]
+                if stop_event is None or not stop_event.is_set():
+                    failed[0] += len(batch)
+
+        out = []
+        for i, (_idx, batch) in enumerate(batches):
+            r = results[i]
+            out.extend(r if r is not None else [[] for _ in batch])
+        # A stop can leave trailing batches unprocessed; pad so the caller's
+        # chunk<->vector zip stays aligned.
+        if len(out) < total:
+            out.extend([[] for _ in range(total - len(out))])
+        return out[:total], failed[0]
 
 
-def _contextualize_all(prepared: list, contextualize, max_workers: int = 1) -> None:
+def _int_or(value, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _as_pool(embed, model: str, batch_size: int = 64, max_workers: int = 1) -> EmbedPool:
+    """Accept either an ``EmbedPool`` or a bare ``embed_fn`` callable (or None) and
+    return a pool. Lets every existing ``embed_fn`` caller keep working while the
+    compile path passes a real multi-server pool."""
+    if isinstance(embed, EmbedPool):
+        return embed
+    return EmbedPool(model=model, embed_fn=embed, batch_size=batch_size,
+                     per_server_concurrency=max_workers)
+
+
+def _contextualize_all(prepared: list, contextualize, max_workers: int = 1,
+                       on_progress=None) -> None:
     """Fill each prepared item's ``contexts`` list with LLM-written situating sentences,
     running the per-chunk ``contextualize(chunk, doc_summary)`` calls concurrently (up to
     ``max_workers``). Mutates ``prepared`` in place; a failed call degrades to '' so the
-    raw chunk is still embedded. Lock-free — call outside ``_REG_LOCK``."""
+    raw chunk is still embedded. Lock-free — call outside the store's write lock.
+
+    This is ONE LLM call per chunk and is by far the most expensive thing a compile can
+    do — on an ebook-sized corpus it dominates everything else, which is why it reports
+    its own progress phase rather than hiding inside the embed step."""
     tasks = []  # (item_index, chunk_index, chunk_text, doc_summary)
     for pi, p in enumerate(prepared):
         if not p["chunks"]:
@@ -469,15 +455,29 @@ def _contextualize_all(prepared: list, contextualize, max_workers: int = 1) -> N
         except Exception:
             return pi, ci, ""
 
+    done = 0
+    total = len(tasks)
+
+    def note():
+        if on_progress is not None:
+            try:
+                on_progress(done, total)
+            except Exception:
+                pass
+
     workers = max(1, int(max_workers))
     if workers > 1 and len(tasks) > 1:
         with ThreadPoolExecutor(max_workers=min(workers, len(tasks))) as ex:
             for pi, ci, ctx in ex.map(_run, tasks):
                 prepared[pi]["contexts"][ci] = ctx
+                done += 1
+                note()
     else:
         for t in tasks:
             pi, ci, ctx = _run(t)
             prepared[pi]["contexts"][ci] = ctx
+            done += 1
+            note()
 
 
 def _doc_summary(content: str, max_words: int = 120) -> str:
@@ -486,92 +486,6 @@ def _doc_summary(content: str, max_words: int = 120) -> str:
     call per document."""
     words = (content or "").split()
     return " ".join(words[:max_words])
-
-
-def index_libraries(libraries: list, lib_ids: list, embed_fn, model: str,
-                    contextualize=None) -> dict:
-    """Ensure the selected libraries' items are chunked + embedded in the store.
-
-    Only items whose chunk set changed are re-embedded; items removed from a
-    library are pruned. ``embed_fn(list[str]) -> list[list[float]]`` supplies the
-    vectors (pass ``None`` for keyword-only indexing).
-
-    ``contextualize(chunk, doc_summary) -> str`` (optional): when supplied, each chunk
-    is passed through it to obtain 1-2 sentences of situating context, which is stored
-    in the ``context`` column and prepended to the chunk for embedding + keyword
-    indexing (markedly improves retrieval of out-of-context chunks). One LLM call per
-    chunk, so it's opt-in; failures fall back to indexing the raw chunk.
-
-    Returns {"embedded": n_chunks_embedded, "items": n_items_indexed}.
-    """
-    ids = [i for i in (lib_ids or []) if i]
-    if not ids:
-        return {"embedded": 0, "items": 0}
-    libs = [l for l in (libraries or []) if l.get("id") in ids]
-    conn = _conn()
-    embedded = 0
-    items = 0
-    now = datetime.utcnow().isoformat()
-    with _REG_LOCK:
-        for lib in libs:
-            lib_id = lib.get("id")
-            present_item_ids = []
-            for idx, it in enumerate(lib.get("items", [])):
-                content = (it.get("content") or "").strip()
-                if not content:
-                    continue
-                # Items may not carry their own id; fall back to a stable index key.
-                item_id = it.get("id") or f"{lib_id}:{idx}"
-                present_item_ids.append(item_id)
-                items += 1
-                chunks = chunk_text_semantic(content)
-                hashes = [_hash(c) for c in chunks]
-                existing = [r[0] for r in conn.execute(
-                    "SELECT content_hash FROM rag_chunks WHERE source_id = ? AND item_id = ? "
-                    "AND model = ? ORDER BY chunk_index",
-                    [lib_id, item_id, model],
-                ).fetchall()]
-                if existing == hashes:
-                    continue  # unchanged — skip re-embedding
-                # Changed (or new): replace this item's chunks wholesale.
-                conn.execute(
-                    "DELETE FROM rag_chunks WHERE source_id = ? AND item_id = ?",
-                    [lib_id, item_id],
-                )
-                if not chunks:
-                    continue
-                # Contextual chunking (optional): 1-2 sentences situating each chunk.
-                if contextualize is not None:
-                    summary = _doc_summary(content)
-                    contexts = []
-                    for ch in chunks:
-                        try:
-                            contexts.append((contextualize(ch, summary) or "").strip())
-                        except Exception:
-                            contexts.append("")  # degrade to raw chunk on any failure
-                else:
-                    contexts = ["" for _ in chunks]
-                # Embed (and later BM25-index) context + chunk together when present.
-                embed_inputs = [((contexts[i] + "\n" + ch).strip() if contexts[i] else ch)
-                                for i, ch in enumerate(chunks)]
-                vectors = _embed_chunks(embed_fn, embed_inputs)
-                for ci, (chunk, vec, h, ctx) in enumerate(zip(chunks, vectors, hashes, contexts)):
-                    conn.execute(
-                        "INSERT INTO rag_chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        [f"{item_id}:{ci}", "library", lib_id, item_id, ci,
-                         chunk, h, [float(x) for x in vec], model, now, ctx, ""],
-                    )
-                    embedded += 1
-            # Prune chunks for items that no longer exist in this library.
-            if present_item_ids:
-                placeholders = ", ".join("?" for _ in present_item_ids)
-                conn.execute(
-                    f"DELETE FROM rag_chunks WHERE source_id = ? AND item_id NOT IN ({placeholders})",
-                    [lib_id, *present_item_ids],
-                )
-            else:
-                conn.execute("DELETE FROM rag_chunks WHERE source_id = ?", [lib_id])
-    return {"embedded": embedded, "items": items}
 
 
 # --------------------------- Retrieval ---------------------------
@@ -583,50 +497,6 @@ def index_libraries(libraries: list, lib_ids: list, embed_fn, model: str,
 # and accepts MULTIPLE query variants (from Prompt Reword, Phase 3). Each variant is
 # retrieved independently and the ranked lists are RRF-merged, so one poor rewording
 # can't sink retrieval.
-
-
-def _vector_rows(conn, source_type: str, ids: list, model: str, qv: list, top_k: int) -> list:
-    """One vector query over chunks of ``source_type`` in ``ids``. DuckDB
-    ``list_cosine_similarity`` with a pure-Python fallback."""
-    placeholders = ", ".join("?" for _ in ids)
-    qv = [float(x) for x in qv]
-    try:
-        rows = conn.execute(
-            f"""
-            SELECT content, source_id, item_id, id, meta,
-                   list_cosine_similarity(embedding, CAST(? AS FLOAT[])) AS score
-            FROM rag_chunks
-            WHERE source_type = ? AND model = ? AND source_id IN ({placeholders})
-              AND len(embedding) > 0
-            ORDER BY score DESC NULLS LAST
-            LIMIT ?
-            """,
-            [qv, source_type, model, *ids, int(top_k)],
-        ).fetchall()
-        return [{"content": r[0], "source_id": r[1], "item_id": r[2], "id": r[3],
-                 "meta": r[4], "score": float(r[5]) if r[5] is not None else -1.0} for r in rows]
-    except Exception:
-        rows = conn.execute(
-            f"SELECT content, source_id, item_id, id, meta, embedding FROM rag_chunks "
-            f"WHERE source_type = ? AND model = ? AND source_id IN ({placeholders})",
-            [source_type, model, *ids],
-        ).fetchall()
-    scored = [{"content": r[0], "source_id": r[1], "item_id": r[2], "id": r[3],
-               "meta": r[4], "score": _cosine(qv, r[5])} for r in rows]
-    scored.sort(key=lambda d: d["score"], reverse=True)
-    return scored[:int(top_k)]
-
-
-def _keyword_candidates(conn, source_type: str, ids: list) -> list:
-    """All in-scope chunks (text only, no model filter) for BM25 scoring."""
-    placeholders = ", ".join("?" for _ in ids)
-    rows = conn.execute(
-        f"SELECT content, source_id, item_id, id, context, meta FROM rag_chunks "
-        f"WHERE source_type = ? AND source_id IN ({placeholders})",
-        [source_type, *ids],
-    ).fetchall()
-    return [{"content": r[0], "source_id": r[1], "item_id": r[2], "id": r[3],
-             "context": r[4], "meta": r[5]} for r in rows]
 
 
 def retrieve(source_type: str, ids: list, query_vecs, model: str, top_k: int,
@@ -643,20 +513,23 @@ def retrieve(source_type: str, ids: list, query_vecs, model: str, top_k: int,
     mode = (mode or "hybrid").lower()
     vecs = _as_vec_list(query_vecs)
     qstrs = _as_query_list(queries)
-    conn = _conn()
-    with _REG_LOCK:
-        vec_lists = ([_vector_rows(conn, source_type, ids, model, v, top_k) for v in vecs]
-                     if mode in ("vector", "hybrid") else [])
-        kw_lists = []
-        if mode in ("keyword", "hybrid") and qstrs:
-            cands = _keyword_candidates(conn, source_type, ids)
-            kw_lists = [_bm25_search(cands, q, top_k) for q in qstrs]
+    be = _backend()
+
+    # Each query variant is retrieved independently; RRF fuses them by RANK, so the
+    # backends' non-comparable score scales (cosine vs Lance distance, Python BM25 vs
+    # tantivy) merge cleanly without normalisation.
+    vec_lists = ([be.search_vector(source_type, ids, model, v, top_k) for v in vecs]
+                 if mode in ("vector", "hybrid") else [])
+    kw_lists = ([be.search_keyword(source_type, ids, q, top_k) for q in qstrs]
+                if mode in ("keyword", "hybrid") and qstrs else [])
 
     if mode == "vector":
-        return _rrf_merge(vec_lists, top_k) if len(vec_lists) != 1 else vec_lists[0][:int(top_k)]
+        return (scoring.rrf_merge(vec_lists, top_k) if len(vec_lists) != 1
+                else vec_lists[0][:int(top_k)])
     if mode == "keyword":
-        return _rrf_merge(kw_lists, top_k) if len(kw_lists) != 1 else (kw_lists[0][:int(top_k)] if kw_lists else [])
-    return _rrf_merge(vec_lists + kw_lists, top_k)
+        return (scoring.rrf_merge(kw_lists, top_k) if len(kw_lists) != 1
+                else (kw_lists[0][:int(top_k)] if kw_lists else []))
+    return scoring.rrf_merge(vec_lists + kw_lists, top_k)
 
 
 def retrieve_libraries(query_vecs, lib_ids: list, model: str, top_k: int,
@@ -687,7 +560,7 @@ def retrieve_inline(query_vecs, data_text: str, embed_fn, top_k: int,
             for qv in vecs:
                 qv = [float(x) for x in qv]
                 scored = [{"content": c, "source_id": "inline", "item_id": label,
-                           "id": f"inline:{label}:{i}", "score": _cosine(qv, v)}
+                           "id": f"inline:{label}:{i}", "score": scoring.cosine(qv, v)}
                           for i, (c, v) in enumerate(zip(chunks, cvecs))]
                 scored.sort(key=lambda d: d["score"], reverse=True)
                 vec_lists.append(scored[:int(top_k)])
@@ -696,85 +569,214 @@ def retrieve_inline(query_vecs, data_text: str, embed_fn, top_k: int,
     if mode in ("keyword", "hybrid") and qstrs:
         cands = [{"content": c, "source_id": "inline", "item_id": label,
                   "id": f"inline:{label}:{i}"} for i, c in enumerate(chunks)]
-        kw_lists = [_bm25_search(cands, q, top_k) for q in qstrs]
+        kw_lists = [scoring.bm25_search(cands, q, top_k) for q in qstrs]
 
     if mode == "vector":
-        return _rrf_merge(vec_lists, top_k) if len(vec_lists) != 1 else (vec_lists[0][:int(top_k)] if vec_lists else [])
+        return scoring.rrf_merge(vec_lists, top_k) if len(vec_lists) != 1 else (vec_lists[0][:int(top_k)] if vec_lists else [])
     if mode == "keyword":
-        return _rrf_merge(kw_lists, top_k) if len(kw_lists) != 1 else (kw_lists[0][:int(top_k)] if kw_lists else [])
-    return _rrf_merge(vec_lists + kw_lists, top_k)
+        return scoring.rrf_merge(kw_lists, top_k) if len(kw_lists) != 1 else (kw_lists[0][:int(top_k)] if kw_lists else [])
+    return scoring.rrf_merge(vec_lists + kw_lists, top_k)
 
 
 # --------------------------- Generic per-item upsert (persona knowledge & memory) ---------------------------
 
-def upsert_items(source_type: str, source_id: str, items: list, embed_fn, model: str,
-                 contextualize=None, batch_size: int = 64, max_workers: int = 1) -> dict:
-    """Chunk + (optionally contextualize) + embed MANY items of one source in bulk and
-    replace their chunks in the store. ``items`` is ``[(item_id, content, meta_dict)]``.
+def _chunk_all(items: list, max_workers: int = 1, on_progress=None) -> list:
+    """Chunk every item into ``prepared`` dicts, preserving order. Runs across a thread
+    pool because chonkie's chunker is backed by Rust tokenizers that release the GIL,
+    so this actually scales (unlike PDF parsing, which needs processes)."""
+    items = list(items)
+    prepared = [None] * len(items)
+    done = [0]
+    lock = threading.Lock()
 
-    The point of the bulk path (vs. calling ``upsert_item`` in a loop) is throughput:
-    chunks from every changed item are pooled into ONE flat list and embedded with a
-    few large, optionally concurrent ``/api/embed`` calls **outside ``_REG_LOCK``** —
-    the network wait no longer holds the shared DuckDB connection. Only the per-item
-    DELETE and a single ``executemany`` INSERT run under the lock.
-
-    Returns ``{item_id: chunk_count}``. Embedding failures degrade to empty vectors so
-    the chunks still persist (keyword/BM25 retrieval keeps working)."""
-    conn = _conn()  # acquires+releases _REG_LOCK internally — must be before our lock
-    now = datetime.utcnow().isoformat()
-
-    # 1. Chunk every item (cheap CPU) — no lock, no network yet.
-    prepared = []
-    for item_id, content, imeta in items:
+    def one(i):
+        item_id, content, imeta = items[i]
         content = (content or "").strip()
         chunks = chunk_text_semantic(content) if content else []
-        prepared.append({
+        prepared[i] = {
             "item_id": item_id,
             "meta_json": json.dumps(imeta or {}),
             "content": content,
             "chunks": chunks,
             "contexts": ["" for _ in chunks],
-        })
+        }
+        if on_progress is not None:
+            with lock:
+                done[0] += 1
+                cur = done[0]
+            try:
+                on_progress(cur, len(items))
+            except Exception:
+                pass
 
-    # 2. Optional contextual chunking (LLM per chunk) — concurrent, no lock.
+    workers = max(1, int(max_workers or 1))
+    if workers > 1 and len(items) > 1:
+        with ThreadPoolExecutor(max_workers=min(workers, len(items))) as ex:
+            list(ex.map(one, range(len(items))))
+    else:
+        for i in range(len(items)):
+            one(i)
+    return prepared
+
+
+def upsert_items(source_type: str, source_id: str, items: list, embed_fn, model: str,
+                 contextualize=None, batch_size: int = 64, max_workers: int = 1,
+                 on_progress=None, stop_event=None, wave_size: int = 2000) -> dict:
+    """Chunk + (optionally contextualize) + embed MANY items of one source and replace
+    their chunks in the store. ``items`` is ``[(item_id, content, meta_dict)]``.
+    ``embed_fn`` may be a plain ``list[str] -> list[list[float]]`` callable or an
+    :class:`EmbedPool` fanning batches out across several hosts.
+
+    Embedding and writing run in **bounded waves** of ~``wave_size`` chunks rather than
+    pooling the whole corpus: several ebooks would otherwise hold every vector in
+    memory as Python floats (a 768-float list is ~6 KB, so 50k chunks ≈ 300 MB before
+    overhead, and measurably ~1.7 GB in practice) before a single row was written.
+    Waves also bound how long the store's write lock is held, and give the UI something
+    to move a progress bar with.
+
+    Vectors already computed for identical text under the same model are reused from
+    the store rather than re-embedded (``backend.cached_vectors``).
+
+    Lock discipline (load-bearing): chunking, contextualization and embedding all happen
+    OUTSIDE any store lock — only the backend's delete+insert is serialised, because on
+    DuckDB that lock guards the single shared connection every reader uses. Never hold
+    it across a network wait.
+
+    ``on_progress(phase, done, total, **extra)`` reports "chunk"/"context"/"embed"
+    progress; ``stop_event`` aborts between waves, leaving written items intact.
+
+    Returns ``{item_id: chunk_count}`` plus a ``__meta__`` entry carrying
+    ``{"failed", "cached", "stopped", "lanes"}``."""
+    be = _backend()
+    now = datetime.utcnow().isoformat()
+    pool = _as_pool(embed_fn, model, batch_size, max_workers)
+
+    def report(phase, done, total, **extra):
+        if on_progress is not None:
+            try:
+                on_progress(phase, done, total, **extra)
+            except Exception:
+                pass
+
+    # 1. Chunk every item (cheap CPU, parallel) — no lock, no network yet. Doing this
+    #    up front is what makes a chunk-denominated progress bar possible at all.
+    prepared = _chunk_all(items, max_workers, lambda d, t: report("chunk", d, t))
+
+    # 2. Optional contextual chunking (one LLM call per chunk) — concurrent, no lock.
     if contextualize is not None:
-        _contextualize_all(prepared, contextualize, max_workers)
+        _contextualize_all(prepared, contextualize, max_workers,
+                           lambda d, t: report("context", d, t))
 
-    # 3. Build one flat embed-input list across all items (context + chunk).
-    flat_inputs = []
-    ranges = []
-    for p in prepared:
-        start = len(flat_inputs)
-        for ci, ch in enumerate(p["chunks"]):
-            ctx = p["contexts"][ci]
-            flat_inputs.append((ctx + "\n" + ch).strip() if ctx else ch)
-        ranges.append((start, len(flat_inputs)))
-
-    # 4. Embed everything OUTSIDE the lock (batched + optionally concurrent).
-    vectors = _embed_batched(embed_fn, flat_inputs, batch_size, max_workers)
-
-    # 5. Assemble rows, then delete-and-bulk-insert under the lock.
-    rows = []
+    # 3. Flatten to (item index, chunk index, embed input) work units.
+    units = []
     counts = {}
-    for p, (start, end) in zip(prepared, ranges):
-        item_id = p["item_id"]
-        item_vecs = vectors[start:end]
+    for pi, p in enumerate(prepared):
+        counts[p["item_id"]] = len(p["chunks"])
         for ci, ch in enumerate(p["chunks"]):
-            vec = item_vecs[ci] if ci < len(item_vecs) else []
             ctx = p["contexts"][ci]
-            rows.append([f"{source_type}:{source_id}:{item_id}:{ci}", source_type,
-                         source_id, item_id, ci, ch, _hash(ch),
-                         [float(x) for x in vec], model, now, ctx, p["meta_json"]])
-        counts[item_id] = len(p["chunks"])
+            units.append((pi, ci, (ctx + "\n" + ch).strip() if ctx else ch))
+    total_chunks = len(units)
+    report("embed", 0, total_chunks)
 
-    with _REG_LOCK:
-        for p in prepared:
-            conn.execute(
-                "DELETE FROM rag_chunks WHERE source_type = ? AND source_id = ? AND item_id = ?",
-                [source_type, source_id, p["item_id"]])
-        if rows:
-            conn.executemany(
-                "INSERT INTO rag_chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+    if not units:
+        # Nothing to embed, but the items may still have stale rows to clear.
+        be.delete_items(source_type, source_id, [p["item_id"] for p in prepared])
+        counts["__meta__"] = {"failed": 0, "cached": 0, "stopped": False, "lanes": [],
+                              "complete": {p["item_id"] for p in prepared}}
+        return counts
+
+    # 4. Reuse anything already embedded under this model (one query for the corpus).
+    embed_hashes = [_hash(text) for _pi, _ci, text in units]
+    cache = be.cached_vectors(model, embed_hashes)
+
+    # 5. Embed + write in bounded waves. An item's DELETE is issued with the first wave
+    #    carrying its chunks, so a reader never observes it half-replaced.
+    deleted = set()
+    embedded_done = 0
+    failed_total = 0
+    cached_total = 0
+    stopped = False
+    wave = max(1, int(wave_size or 2000))
+    # Per-item bookkeeping so the caller can tell which items are FULLY and cleanly
+    # written. A stopped run or a dead embed server must not let compile record a
+    # half-embedded document as cleanly compiled.
+    written = {}
+    tainted = set()
+
+    for start in range(0, len(units), wave):
+        if stop_event is not None and stop_event.is_set():
+            stopped = True
+            break
+        part = units[start:start + wave]
+        part_hashes = embed_hashes[start:start + wave]
+
+        miss_idx = [i for i, h in enumerate(part_hashes) if h not in cache]
+        cached_total += len(part) - len(miss_idx)
+        base = embedded_done + (len(part) - len(miss_idx))
+
+        vecs = [cache.get(h, []) for h in part_hashes]
+        if miss_idx:
+            fresh, failed = pool.embed_many(
+                [part[i][2] for i in miss_idx],
+                on_progress=lambda d, _t, _b=base: report(
+                    "embed", _b + d, total_chunks,
+                    cached=cached_total, failed=failed_total),
+                stop_event=stop_event)
+            for slot, v in zip(miss_idx, fresh):
+                vecs[slot] = v
+                if v:
+                    cache[part_hashes[slot]] = v
+            failed_total += failed
+        embedded_done += len(part)
+        report("embed", embedded_done, total_chunks,
+               cached=cached_total, failed=failed_total)
+
+        rows = []
+        for (pi, ci, _text), vec, ehash in zip(part, vecs, part_hashes):
+            p = prepared[pi]
+            ch = p["chunks"][ci]
+            written[p["item_id"]] = written.get(p["item_id"], 0) + 1
+            if not vec and not pool.keyword_only:
+                tainted.add(p["item_id"])   # embedding failed for this chunk
+            rows.append({
+                "id": f"{source_type}:{source_id}:{p['item_id']}:{ci}",
+                "source_type": source_type, "source_id": source_id,
+                "item_id": p["item_id"], "chunk_index": ci,
+                "content": ch, "content_hash": _hash(ch), "vector": vec,
+                "model": model, "updated": now, "context": p["contexts"][ci],
+                "meta": p["meta_json"], "embed_hash": ehash,
+            })
+
+        # Delete each touched item's old chunks with the FIRST wave that carries it,
+        # in the same locked operation as the insert, so a reader never observes an
+        # item half-replaced.
+        touched = sorted({pi for pi, _ci, _t in part} - deleted)
+        be.replace_wave(source_type, source_id,
+                        [prepared[pi]["item_id"] for pi in touched], rows)
+        deleted.update(touched)
+
+    # Items that chunked to nothing never appear in ``units`` — clear their old rows.
+    empty = [p["item_id"] for pi, p in enumerate(prepared)
+             if not p["chunks"] and pi not in deleted]
+    if empty:
+        be.delete_items(source_type, source_id, empty)
+
+    # Build/refresh the store's indexes once per run rather than per wave — index
+    # maintenance is the expensive part, and mid-compile the index would only be
+    # rebuilt again by the next wave. No-op on backends without durable indexes.
+    try:
+        optimize = getattr(be, "optimize", None)
+        if optimize is not None and not stopped:
+            optimize()
+    except Exception:
+        pass
+
+    complete = {p["item_id"] for p in prepared
+                if written.get(p["item_id"], 0) == len(p["chunks"])
+                and p["item_id"] not in tainted}
+    counts["__meta__"] = {"failed": failed_total, "cached": cached_total,
+                          "stopped": stopped, "lanes": pool.lane_stats(),
+                          "complete": complete}
     return counts
 
 
@@ -795,25 +797,33 @@ def upsert_item(source_type: str, source_id: str, item_id: str, content: str,
 
 
 def delete_item(source_type: str, source_id: str, item_id: str) -> None:
-    conn = _conn()
-    with _REG_LOCK:
-        conn.execute(
-            "DELETE FROM rag_chunks WHERE source_type = ? AND source_id = ? AND item_id = ?",
-            [source_type, source_id, item_id])
+    _backend().delete_items(source_type, source_id, [item_id])
 
 
 def delete_source(source_id: str) -> None:
     """Remove every chunk for a source id across all source types (persona deletion)."""
-    conn = _conn()
-    with _REG_LOCK:
-        conn.execute("DELETE FROM rag_chunks WHERE source_id = ?", [source_id])
+    _backend().delete_source(source_id)
 
 
 def list_items(source_type: str, source_id: str) -> list:
     """Distinct item ids currently stored for a scope, with chunk counts."""
-    conn = _conn()
-    with _REG_LOCK:
-        rows = conn.execute(
-            "SELECT item_id, COUNT(*) FROM rag_chunks WHERE source_type = ? AND source_id = ? "
-            "GROUP BY item_id", [source_type, source_id]).fetchall()
-    return [{"item_id": r[0], "chunks": r[1]} for r in rows]
+    return _backend().list_items(source_type, source_id)
+
+
+def set_ann_enabled(enabled: bool) -> None:
+    """Settings hook for the DuckDB backend's in-memory HNSW sidecar. A no-op on
+    LanceDB, whose vector index is durable and always on."""
+    be = _backend()
+    fn = getattr(be, "set_ann_enabled", None)
+    if fn is None:
+        # Import the module directly so the setting still applies to the DuckDB
+        # backend when Lance happens to be the active one.
+        from .vectorstore import duckdb_backend
+        duckdb_backend.set_ann_enabled(enabled)
+    else:
+        fn(enabled)
+
+
+def ann_status() -> dict:
+    """Vector-index state for diagnostics (shape differs per backend)."""
+    return backend_status()

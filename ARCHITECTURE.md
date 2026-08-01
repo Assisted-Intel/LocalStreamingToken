@@ -55,9 +55,10 @@ result. Business logic does not live in `server.py`.
 
 | File | Responsibility |
 |---|---|
-| [app/rag.py](app/rag.py) | DuckDB vector store. Chunk → embed → retrieve, with vector / BM25 / hybrid-RRF modes. Skips re-embedding when an item's content hash is unchanged, so indexing on every send is cheap. |
+| [app/rag.py](app/rag.py) | Storage-independent RAG core: chunking, `EmbedPool` (embedding fanned across several Ollama hosts), bounded-wave writes that reuse any vector already computed for identical text, and vector / keyword / hybrid-RRF retrieval. The store itself lives behind `app/vectorstore/`. |
+| [app/vectorstore/](app/vectorstore/) | Two interchangeable vector stores behind one interface, chosen in Settings → RAG. `lance_backend.py` — LanceDB, with a durable ANN index and a native full-text (tantivy) index; much faster, but **plaintext on disk**. `duckdb_backend.py` — the original AES-encrypted store, with an in-memory HNSW sidecar and Python BM25. `migrate.py` copies DuckDB → Lance without re-embedding; `scoring.py` holds the shared cosine/BM25/RRF helpers. |
 | [app/ingest.py](app/ingest.py) | Text extraction from PDF, EPUB, DOCX, TXT, MD. |
-| [app/compile.py](app/compile.py) | The explicit "Compile Data" pass — batched, optionally concurrent embedding of changed chunks. |
+| [app/compile.py](app/compile.py) | The explicit "Compile Data" pass — embeds changed chunks across the server pool, streams phase/progress frames that drive the progress bar and ETA, supports cancellation, and leaves incompletely-embedded items out of the manifest so they recompile. |
 | [app/rewrite.py](app/rewrite.py) | Query rewriting (one message → 2–3 retrieval queries) and the ✨ Rewrite button. |
 
 ### Personas

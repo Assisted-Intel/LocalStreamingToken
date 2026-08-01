@@ -536,11 +536,36 @@
         </label>
         <label class="chk"><input type="checkbox" id="set-auto-reason" /> Auto-detect reasoning models</label>
         <h3 style="margin-top:1em">RAG (Retrieval Augmented Generation)</h3>
+        <label class="setting-row" title="Which vector store holds your compiled data. The two stores are separate files, so switching never destroys the other's data.">Vector store
+          <select id="set-rag-backend">
+            <option value="lance">LanceDB — faster, NOT encrypted</option>
+            <option value="duckdb">DuckDB — encrypted at rest, slower</option>
+          </select>
+        </label>
+        <div id="rag-backend-note" class="muted" style="font-size:12px; margin:-2px 0 8px 0"></div>
+        <div id="rag-migrate-progress" class="compile-progress hidden"></div>
         <label class="setting-row">Embedding server URL
           <input type="text" id="set-rag-embed-url" placeholder="http://127.0.0.1:11434" />
         </label>
         <label class="setting-row">Embedding model
           <input type="text" id="set-rag-embed-model" placeholder="nomic-embed-text" />
+        </label>
+        <label class="chk" title="Spread the embedding work of a Compile across every checked server at once. All servers use the embedding model above — vectors from different models are not comparable."><input type="checkbox" id="set-rag-parallel" /> Use multiple servers to build RAG</label>
+        <div id="rag-servers-box" style="margin:4px 0 8px 0">
+          <div id="rag-servers-list" class="muted" style="font-size:12px">No extra embedding servers.</div>
+          <div style="margin-top:4px; display:flex; gap:6px; flex-wrap:wrap">
+            <button id="btn-rag-add-servers" class="small">+ Add from my servers</button>
+            <button id="btn-rag-check-servers" class="small">Check servers</button>
+          </div>
+        </div>
+        <label class="setting-row" title="Chunks per /api/embed request. Larger = fewer round-trips; too large can time out on a CPU-only host.">Embed batch size
+          <input type="number" id="set-rag-batch" min="1" max="512" />
+        </label>
+        <label class="setting-row" title="Embed requests in flight PER SERVER. Helps on a GPU; set to 1 on CPU-only. Keep at or below the server's OLLAMA_NUM_PARALLEL.">Embed requests per server
+          <input type="number" id="set-rag-concurrency" min="1" max="16" />
+        </label>
+        <label class="setting-row" title="Build an in-memory HNSW index over the vectors so retrieval doesn't scan every chunk. Costs RAM proportional to corpus size; rebuilt automatically.">Fast retrieval index (ANN)
+          <input type="checkbox" id="set-rag-ann" />
         </label>
         <label class="setting-row">Chunks retrieved (top-k)
           <input type="number" id="set-rag-topk" min="1" max="50" />

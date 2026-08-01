@@ -119,6 +119,26 @@ def create_app():
     rag.set_chunk_config(store.config.get("rag_chunker"),
                          store.config.get("rag_chunk_size"),
                          store.config.get("rag_chunk_overlap"))
+
+    def _apply_rag_backend():
+        """Select the vector store, honouring an existing DuckDB corpus.
+
+        The default is LanceDB, but an upgrade must not make an existing install look
+        empty: if the user has never chosen a backend explicitly and a populated
+        ``rag.duckdb`` is present, stay on DuckDB until they migrate. Fresh installs
+        (and anyone who has chosen) get what the setting says."""
+        chosen = store.config.get("rag_backend")
+        if not store.config_has_explicit("rag_backend"):
+            try:
+                legacy = Path(core.RAG_DB_FILE)
+                if legacy.exists() and legacy.stat().st_size > 0:
+                    chosen = "duckdb"
+            except Exception:
+                pass
+        rag.set_backend(chosen)
+        rag.set_ann_enabled(store.config.get("rag_ann_enabled", True))
+
+    _apply_rag_backend()
     vault = Vault(core.VAULT_FILE)   # Database tab: encrypted connection profiles (per data profile)
     # Cache of model -> capability list per server, so we don't re-hit /api/show.
     caps_cache = {}
@@ -139,11 +159,14 @@ def create_app():
         db_staging.close_all()
         vault.set_path(core.VAULT_FILE)   # locks the old vault; re-unlock per profile
         store.reload_data()
+        # The new profile has its own stores, so re-decide which backend to open.
+        _apply_rag_backend()
         caps_cache.clear()
 
     def _switch_settings_runtime():
         core.set_active_settings_profile(pm.active_settings_dir())
         store.reload_settings()
+        _apply_rag_backend()
         caps_cache.clear()
 
     def sse(event, data):
@@ -225,6 +248,7 @@ def create_app():
         rag.set_chunk_config(store.config.get("rag_chunker"),
                              store.config.get("rag_chunk_size"),
                              store.config.get("rag_chunk_overlap"))
+        _apply_rag_backend()
         vault.set_path(core.VAULT_FILE)   # re-point the (separate) DB connection vault
         caps_cache.clear()
 
@@ -543,6 +567,8 @@ def create_app():
                    "rag_query_rewrite", "rewrite_model",
                    "rag_chunker", "rag_chunk_size", "rag_chunk_overlap",
                    "rag_embed_batch_size", "rag_embed_concurrency",
+                   "rag_embed_parallel", "rag_embed_servers", "rag_ann_enabled",
+                   "rag_backend",
                    "memory_weight_influence", "pipeline_max_retries",
                    "provider_context_windows")
         patch = {k: data[k] for k in allowed if k in data}
@@ -561,9 +587,22 @@ def create_app():
         if "rag_retrieval_mode" in patch and patch["rag_retrieval_mode"] not in (
                 "vector", "keyword", "hybrid"):
             patch.pop("rag_retrieval_mode")
-        for boolk in ("rag_contextual_chunking", "rag_query_rewrite"):
+        for boolk in ("rag_contextual_chunking", "rag_query_rewrite",
+                      "rag_embed_parallel", "rag_ann_enabled"):
             if boolk in patch:
                 patch[boolk] = bool(patch[boolk])
+        if "rag_embed_servers" in patch:
+            # [{base_url, enabled}] — no per-server model on purpose: the whole pool
+            # embeds with rag_embed_model, since vectors from different embedding
+            # models are not comparable and mixing them would corrupt the index.
+            clean, seen = [], set()
+            for s in (patch.get("rag_embed_servers") or []):
+                url = (str(s.get("base_url") or "")).strip().rstrip("/")
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                clean.append({"base_url": url, "enabled": bool(s.get("enabled", True))})
+            patch["rag_embed_servers"] = clean
         if "pipeline_max_retries" in patch:
             try:
                 patch["pipeline_max_retries"] = max(1, min(6, int(patch["pipeline_max_retries"])))
@@ -588,6 +627,14 @@ def create_app():
             rag.set_chunk_config(store.config.get("rag_chunker"),
                                  store.config.get("rag_chunk_size"),
                                  store.config.get("rag_chunk_overlap"))
+        if "rag_backend" in patch:
+            # Switching the store takes effect immediately; the other backend's data is
+            # left untouched, so this is reversible.
+            rag.set_backend(store.config.get("rag_backend"))
+        if "rag_ann_enabled" in patch:
+            # Turning the ANN index off drops it immediately so the RAM comes back
+            # without needing a restart.
+            rag.set_ann_enabled(store.config.get("rag_ann_enabled", True))
         return jsonify({"config": store.masked_config()})
 
     # ----------------------------- Prompt rewrite ---------------------------
@@ -800,15 +847,39 @@ def create_app():
 
         return contextualize
 
+    def _embed_lanes(primary_url):
+        """[{base_url, name}] for the embedding pool: the primary endpoint plus any
+        enabled extra servers from ``rag_embed_servers``. Returns just the primary
+        unless fan-out is switched on, so the default single-machine setup is
+        unchanged."""
+        lanes = [{"base_url": primary_url.rstrip("/"),
+                  "name": store.resolve_server(primary_url).get("name") or primary_url}]
+        if not store.config.get("rag_embed_parallel"):
+            return lanes
+        seen = {lanes[0]["base_url"]}
+        for s in (store.config.get("rag_embed_servers") or []):
+            url = (s.get("base_url") or "").strip().rstrip("/")
+            if not url or url in seen or not s.get("enabled", True):
+                continue
+            seen.add(url)
+            lanes.append({"base_url": url,
+                          "name": store.resolve_server(url).get("name") or url})
+        return lanes
+
     def _compile_embedder(persona=None):
-        """Resolve (embed_fn, embed_model, embed_url) for a compile run, mirroring the
-        chat RAG path. Persona compiles honor the persona's embedding_model override."""
+        """Resolve (embed_pool, embed_model, embed_url) for a compile run, mirroring the
+        chat RAG path. Persona compiles honor the persona's embedding_model override.
+
+        The pool fans batches across every enabled embedding server at once; with a
+        single server it behaves exactly as the old single-callable path did."""
         embed_url = store.config.get("rag_embed_server_url") or DEFAULT_LOCAL_URL
         embed_model = store.config.get("rag_embed_model") or "nomic-embed-text"
         if persona:
             embed_model = (persona.get("models", {}).get("embedding_model") or embed_model)
-        embed_client = core.OllamaClient(embed_url)
-        return (lambda texts: embed_client.embed(embed_model, texts)), embed_model, embed_url
+        batch_size, per_server = _compile_tuning()
+        pool = rag.EmbedPool(lanes=_embed_lanes(embed_url), model=embed_model,
+                             per_server_concurrency=per_server, batch_size=batch_size)
+        return pool, embed_model, embed_url
 
     def _compile_contextualizer(embed_url, want_contextual):
         """Build the compile-time contextualizer from the global model setting when the
@@ -1239,15 +1310,22 @@ def create_app():
         return gen()
 
     # ----------------------------- Compile Data (RAG) -----------------------
-    def _compile_sse(work_fn):
+    def _compile_sse(work_fn, run_id=None):
         """Run a Compile Data job in a worker thread and stream its emit(event, data)
-        frames as SSE (mirrors ``_pipeline_sse``). ``work_fn(emit)`` may raise."""
+        frames as SSE (mirrors ``_pipeline_sse``). ``work_fn(emit)`` may raise.
+
+        The job registers with the shared ``runs`` stop registry so ``POST /api/stop``
+        can cancel it — compiling a shelf of ebooks can run for a long time, and
+        previously there was no way to call it off. If the client disconnects we also
+        set the stop event, so an abandoned run doesn't keep embedding forever and fill
+        an unbounded queue."""
         frames = queue.Queue()
         sentinel = object()
+        stop_event = runs.new(run_id) if run_id else None
 
         def work():
             try:
-                work_fn(lambda ev, data: frames.put((ev, data)))
+                work_fn(lambda ev, data: frames.put((ev, data)), stop_event)
             except Exception as e:
                 frames.put(("error", {"message": str(e)}))
             finally:
@@ -1255,14 +1333,21 @@ def create_app():
 
         def gen():
             threading.Thread(target=work, daemon=True).start()
-            yield sse("start", {})
-            while True:
-                frame = frames.get()
-                if frame is sentinel:
-                    break
-                ev, data = frame
-                yield sse(ev, data)
-            yield sse("done", {})
+            try:
+                yield sse("start", {"run_id": run_id})
+                while True:
+                    frame = frames.get()
+                    if frame is sentinel:
+                        break
+                    ev, data = frame
+                    yield sse(ev, data)
+                yield sse("done", {})
+            finally:
+                # GeneratorExit lands here when the browser goes away mid-compile.
+                if stop_event is not None:
+                    stop_event.set()
+                if run_id:
+                    runs.done(run_id)
         return Response(stream_with_context(gen()), mimetype="text/event-stream")
 
     def _rag_embed_model():
@@ -1285,15 +1370,17 @@ def create_app():
         want_ctx = body.get("contextual")
         if want_ctx is None:
             want_ctx = bool(store.config.get("rag_contextual_chunking"))
-        embed_fn, embed_model, embed_url = _compile_embedder()
+        pool, embed_model, embed_url = _compile_embedder()
         contextualize = _compile_contextualizer(embed_url, want_ctx)
         batch_size, max_workers = _compile_tuning()
+        run_id = body.get("run_id") or f"compile-library-{lib_id}"
 
-        def work(emit):
-            compile_mod.compile_library(lib, embed_fn, embed_model,
+        def work(emit, stop_event):
+            compile_mod.compile_library(lib, pool, embed_model,
                                         contextualize=contextualize, force=force, emit=emit,
-                                        batch_size=batch_size, max_workers=max_workers)
-        return _compile_sse(work)
+                                        batch_size=batch_size, max_workers=max_workers,
+                                        stop_event=stop_event)
+        return _compile_sse(work, run_id)
 
     @app.route("/api/personas/<pid>/compile-status", methods=["GET"])
     def api_persona_compile_status(pid):
@@ -1315,15 +1402,86 @@ def create_app():
         want_ctx = body.get("contextual")
         if want_ctx is None:
             want_ctx = bool(store.config.get("rag_contextual_chunking"))
-        embed_fn, embed_model, embed_url = _compile_embedder(persona)
+        pool, embed_model, embed_url = _compile_embedder(persona)
         contextualize = _compile_contextualizer(embed_url, want_ctx)
         batch_size, max_workers = _compile_tuning()
+        run_id = body.get("run_id") or f"compile-persona-{pid}"
 
-        def work(emit):
-            compile_mod.compile_persona(persona, embed_fn, embed_model,
+        def work(emit, stop_event):
+            compile_mod.compile_persona(persona, pool, embed_model,
                                         contextualize=contextualize, force=force, emit=emit,
-                                        batch_size=batch_size, max_workers=max_workers)
-        return _compile_sse(work)
+                                        batch_size=batch_size, max_workers=max_workers,
+                                        stop_event=stop_event)
+        return _compile_sse(work, run_id)
+
+    @app.route("/api/rag/backend", methods=["GET"])
+    def api_rag_backend():
+        """Which vector store is live, what each holds, and whether a migration is
+        worth offering."""
+        from .vectorstore import migrate as vs_migrate
+        duck_rows = 0
+        try:
+            duck_rows = vs_migrate.duckdb_row_count()
+        except Exception:
+            pass
+        return jsonify({
+            "backend": rag.backend_name(),
+            "explicit": store.config_has_explicit("rag_backend"),
+            "status": rag.backend_status(),
+            "duckdb_rows": duck_rows,
+            "lance_dir": str(core.RAG_LANCE_DIR),
+            "duckdb_path": str(core.RAG_DB_FILE),
+        })
+
+    @app.route("/api/rag/migrate", methods=["POST"])
+    def api_rag_migrate():
+        """SSE. Copy the DuckDB vector store into LanceDB. The DuckDB file is left in
+        place, so this is reversible by switching the backend back."""
+        from .vectorstore import migrate as vs_migrate
+
+        def work(emit, stop_event):
+            vs_migrate.migrate_duckdb_to_lance(emit=emit, stop_event=stop_event)
+
+        return _compile_sse(work, "rag-migrate")
+
+    @app.route("/api/rag/embed-health", methods=["GET"])
+    def api_rag_embed_health():
+        """Is each configured embedding server reachable, and does it actually have the
+        embedding model pulled? A server that answers but lacks the model would produce
+        failed batches mid-compile, so the settings UI checks up front.
+
+        Also reports the ANN index state so the user can see what retrieval is using."""
+        embed_model = _rag_embed_model()
+        primary = store.config.get("rag_embed_server_url") or DEFAULT_LOCAL_URL
+        lanes = _embed_lanes(primary)
+        # Include disabled/extra servers too, so the UI can show why one is unchecked.
+        known = {l["base_url"] for l in lanes}
+        for s in (store.config.get("rag_embed_servers") or []):
+            url = (s.get("base_url") or "").strip().rstrip("/")
+            if url and url not in known:
+                known.add(url)
+                lanes.append({"base_url": url, "name": url, "enabled": False})
+
+        def probe(lane):
+            out = {"base_url": lane["base_url"], "name": lane.get("name") or lane["base_url"],
+                   "primary": lane["base_url"] == primary.rstrip("/"),
+                   "reachable": False, "has_model": False, "models": 0, "error": ""}
+            try:
+                models = core.OllamaClient(lane["base_url"]).list_models() or []
+                out["reachable"] = True
+                out["models"] = len(models)
+                base = embed_model.split(":")[0]
+                out["has_model"] = any(m == embed_model or m.split(":")[0] == base
+                                       for m in models)
+            except Exception as e:
+                out["error"] = str(e)[:200]
+            return out
+
+        with ThreadPoolExecutor(max_workers=max(1, len(lanes))) as ex:
+            servers = list(ex.map(probe, lanes))
+        return jsonify({"embed_model": embed_model,
+                        "parallel": bool(store.config.get("rag_embed_parallel")),
+                        "servers": servers, "ann": rag.ann_status()})
 
     @app.route("/api/personas", methods=["GET"])
     def api_personas_list():
@@ -1507,7 +1665,9 @@ def create_app():
 
     @app.route("/api/personas/<pid>/knowledge/add-files", methods=["POST"])
     def api_persona_kb_add(pid):
-        """Native picker → ingest each document into the persona's knowledge base."""
+        """SSE. Native picker → ingest each document into the persona's knowledge base,
+        streaming per-file progress. Each file is parsed AND embedded here, so on large
+        documents this is the slow path the progress bar exists for."""
         try:
             persona = psvc.load(pid)
         except persona_mod.PersonaError as e:
@@ -1522,24 +1682,35 @@ def create_app():
         ctx_model = ((store.config.get("rag_context_model")
                       or persona.get("models", {}).get("chat_model", "")) if want_ctx else "")
         contextualize = _contextualizer_for(ctx_model, embed_url)
-        added, errors = [], []
-        for p in paths:
-            try:
-                r = kbsvc.ingest_file(pid, p, embed_fn if wants_vectors else None,
-                                      embed_model, contextualize=contextualize)
-                added.append(r)
-            except ingest.IngestError as e:
-                errors.append(str(e))
-            except Exception as e:
-                errors.append(str(e))
-        # Record which embedding model produced these vectors (re-index on mismatch).
-        if added and wants_vectors:
-            persona.setdefault("stores", {})["embedding_model_used"] = embed_model
-            try:
-                psvc.save(persona)
-            except Exception:
-                pass
-        return jsonify({"documents": kbsvc.list_documents(pid), "added": added, "errors": errors})
+
+        def work(emit, stop_event):
+            emit("begin", {"total": len(paths), "name": persona.get("profile", {}).get("name", "")})
+            added, errors = [], []
+            for i, p in enumerate(paths):
+                if stop_event is not None and stop_event.is_set():
+                    break
+                name = Path(p).name
+                emit("progress", {"phase": "parse", "done": i, "total": len(paths),
+                                  "unit": "files", "name": name})
+                try:
+                    r = kbsvc.ingest_file(pid, p, embed_fn if wants_vectors else None,
+                                          embed_model, contextualize=contextualize)
+                    added.append(r)
+                except (ingest.IngestError, Exception) as e:
+                    errors.append(f"{name}: {e}")
+                emit("progress", {"phase": "parse", "done": i + 1, "total": len(paths),
+                                  "unit": "files", "name": name})
+            # Record which embedding model produced these vectors (re-index on mismatch).
+            if added and wants_vectors:
+                persona.setdefault("stores", {})["embedding_model_used"] = embed_model
+                try:
+                    psvc.save(persona)
+                except Exception:
+                    pass
+            emit("complete", {"documents": kbsvc.list_documents(pid),
+                              "added": added, "errors": errors})
+
+        return _compile_sse(work, f"addfiles-persona-{pid}")
 
     @app.route("/api/personas/<pid>/knowledge/add-text", methods=["POST"])
     def api_persona_kb_add_text(pid):
@@ -1803,37 +1974,56 @@ def create_app():
 
     @app.route("/api/libraries/<lib_id>/add-text-files", methods=["POST"])
     def api_library_add_text_files(lib_id):
-        """Open a native multi-file picker; read/parse each file server-side and append
-        as library items. Handles plain text plus PDF/EPUB/DOCX via app.ingest.
-        Returns the updated library.
+        """SSE. Open a native multi-file picker, parse the chosen documents in parallel
+        and append them as library items. Handles plain text plus PDF/EPUB/DOCX via
+        app.ingest.
+
+        Streams ``progress`` frames as files land and a final ``complete`` frame with
+        the updated library. Parsing a shelf of ebooks is minutes of CPU, so it runs
+        across a process pool and reports as it goes rather than blocking one request
+        thread in silence.
         """
         lib = store.get_library(lib_id)
         if not lib:
             return jsonify({"error": "not found"}), 404
+        # The native picker must stay on the request thread (tkinter), before the
+        # stream starts.
         paths = native_dialog.pick_files(
             title="Add document(s) to library", filetypes_key="documents")
-        added = []
         errors = []
+        wanted = []
         for p in paths:
             path = Path(p)
             if not ingest.is_supported(path):
                 errors.append(f"{path.name}: unsupported type")
-                continue
-            try:
-                content = ingest.extract_text(path)
-            except ingest.IngestError as e:
-                errors.append(str(e))
-                continue
-            except Exception as e:
-                errors.append(f"{path.name}: {e}")
-                continue
-            item = _new_library_item(item_type="file", label=path.name,
-                                     content=content, filename=path.name)
-            lib.setdefault("items", []).append(item)
-            added.append(path.name)
-        lib["updated"] = datetime.utcnow().isoformat()
-        store.upsert_library(lib)
-        return jsonify({"library": lib, "added": added, "errors": errors})
+            else:
+                wanted.append(str(path))
+
+        def work(emit, stop_event):
+            emit("begin", {"total": len(wanted), "name": lib.get("name", "")})
+            added = []
+            errs = list(errors)
+            if wanted:
+                results = ingest.extract_many(
+                    wanted,
+                    on_progress=lambda d, t, name: emit(
+                        "progress", {"phase": "parse", "done": d, "total": t,
+                                     "unit": "files", "name": name}))
+                for res in results:
+                    name = Path(res.get("path", "")).name
+                    if not res.get("ok"):
+                        errs.append(f"{name}: {res.get('error', 'parse failed')}")
+                        continue
+                    item = _new_library_item(item_type="file", label=name,
+                                             content=res.get("text") or "",
+                                             filename=name)
+                    lib.setdefault("items", []).append(item)
+                    added.append(name)
+            lib["updated"] = datetime.utcnow().isoformat()
+            store.upsert_library(lib)
+            emit("complete", {"library": lib, "added": added, "errors": errs})
+
+        return _compile_sse(work, f"addfiles-library-{lib_id}")
 
     @app.route("/api/libraries/<lib_id>/add-url", methods=["POST"])
     def api_library_add_url(lib_id):

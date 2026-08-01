@@ -14,6 +14,7 @@ this machine — nothing is uploaded.
 
 import argparse
 import getpass
+import multiprocessing
 import os
 import socket
 import sys
@@ -67,9 +68,14 @@ def _forgot_password():
     kf = core.APP_KEYFILE
     print(f"\n  {APP_NAME} — forgotten-password reset\n")
     print("  WARNING: the login password wraps the encryption key. Without it, your")
-    print("  encrypted data (chats, presets, libraries, personas, RAG store, …) CANNOT")
-    print("  be recovered. This will DELETE that data and reset the login to admin/admin.")
-    print("  Anything you already exported is NOT affected.\n")
+    print("  encrypted data (chats, presets, libraries, personas, …) CANNOT be")
+    print("  recovered. This will DELETE that data and reset the login to admin/admin.")
+    print("  Anything you already exported is NOT affected.")
+    print("")
+    print("  NOTE: if RAG is set to the LanceDB vector store, that store is NOT")
+    print("  encrypted — its chunk text and embeddings are readable without the")
+    print("  password, and are not protected by this guarantee. The DuckDB vector")
+    print("  store IS encrypted. See Settings -> RAG -> Vector store.\n")
     if input('  Type "ERASE" to confirm: ').strip() != "ERASE":
         print("\n  Cancelled — nothing was changed.\n")
         return
@@ -121,6 +127,18 @@ def main():
 
     print(f"\n  {APP_NAME} — by {APP_AUTHOR}")
     print(f"  Serving at {url}")
+
+    # An installed-but-unimportable pandas/numpy silently cripples DuckDB (it retries
+    # the failing import for every value it converts). We work around it, but the
+    # environment is still broken for anything else that wants those packages.
+    from app.core import BROKEN_OPTIONAL_IMPORTS
+    if BROKEN_OPTIONAL_IMPORTS:
+        print("\n  ! Broken Python packages detected and disabled for this run:")
+        for name, err in BROKEN_OPTIONAL_IMPORTS:
+            print(f"      {name}: {err}")
+        print("    These are installed but cannot be imported, which makes DuckDB")
+        print("    dramatically slower. Fix with, e.g.:  pip install -U --force-reinstall numpy pandas\n")
+
     print(f"  Opening your default browser… (press Ctrl+C to stop)\n")
 
     # threaded=True so streaming responses don't block other requests (and the
@@ -129,4 +147,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # ingest.extract_many parses documents in a process pool. Under Windows' spawn
+    # start method each worker re-runs this file, so a frozen (PyInstaller) build
+    # would otherwise relaunch the whole app once per worker.
+    multiprocessing.freeze_support()
     main()

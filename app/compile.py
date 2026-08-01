@@ -21,6 +21,7 @@ a silent run.
 
 import json
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -45,9 +46,31 @@ def _save_all(data: dict) -> None:
     core.save_json(Path(core.COMPILED_FILE), data)
 
 
+def _manifest_key(kind: str, obj_id: str) -> str:
+    """Manifest key for ``kind:id`` under the ACTIVE vector-store backend.
+
+    Both backends can hold data at once, so a single key would let the badge claim a
+    library is compiled when only the *other* store actually has its vectors. Keys are
+    therefore namespaced ``library:<id>@lance`` / ``@duckdb``, giving each backend an
+    independent compiled-state.
+
+    Deliberately not folded into ``signature()``: that would mark everything stale on
+    every switch, even when the target backend's vectors are perfectly valid."""
+    return f"{kind}:{obj_id}@{rag.backend_name()}"
+
+
 def _get_manifest(key: str) -> dict:
     with _MANIFEST_LOCK:
-        return _load_all().get(key) or {}
+        data = _load_all()
+        found = data.get(key)
+        if found is not None:
+            return found
+        # Manifests written before backends existed describe the DuckDB store.
+        if key.endswith("@duckdb"):
+            legacy = data.get(key[: -len("@duckdb")])
+            if legacy is not None:
+                return legacy
+        return {}
 
 
 def _put_manifest(key: str, manifest: dict) -> None:
@@ -67,12 +90,12 @@ def _drop_manifest(key: str) -> None:
 
 def forget_library(lib_id: str) -> None:
     """Drop a library's compile manifest (called on library delete)."""
-    _drop_manifest(f"{LIBRARY}:{lib_id}")
+    _drop_manifest(_manifest_key(LIBRARY, lib_id))
 
 
 def forget_persona(persona_id: str) -> None:
     """Drop a persona's compile manifest (called on persona delete)."""
-    _drop_manifest(f"persona:{persona_id}")
+    _drop_manifest(_manifest_key("persona", persona_id))
 
 
 # --------------------------- signature / fingerprints ---------------------------
@@ -108,6 +131,71 @@ def _emit(emit, event, **data):
             emit(event, data)
         except Exception:
             pass
+
+
+# --------------------------- progress / ETA plumbing ---------------------------
+#
+# The bar is denominated in CHUNKS, not items: a library can be three items and
+# 40,000 chunks, and the old item-denominated bar sat frozen at 0% for the entire
+# embed run. Each phase reports its own counters and carries a weight, so the client
+# can turn several differently-measured phases into one honest overall fraction.
+#
+# Deliberately, the server emits raw counters + elapsed and NOT an ETA: the client
+# keeps a smoothed rate and re-renders the countdown every second, so the number ticks
+# down between frames instead of lurching whenever a frame happens to arrive.
+
+# Phase weights, as a rough share of wall time. Contextual chunking is one LLM call
+# per chunk and dwarfs everything else when it's on, so the split changes with it.
+_WEIGHTS_PLAIN = {"chunk": 0.12, "embed": 0.88}
+_WEIGHTS_CONTEXTUAL = {"chunk": 0.04, "context": 0.76, "embed": 0.20}
+_WEIGHTS_PLAIN_PARSE = {"parse": 0.15, "chunk": 0.10, "embed": 0.75}
+_WEIGHTS_CONTEXTUAL_PARSE = {"parse": 0.06, "chunk": 0.03, "context": 0.71, "embed": 0.20}
+_PHASE_LABELS = {"parse": "Reading documents", "chunk": "Chunking",
+                 "context": "Contextualizing", "embed": "Embedding"}
+_PHASE_UNITS = {"parse": "files", "chunk": "items", "context": "chunks",
+                "embed": "chunks"}
+
+
+class Progress:
+    """Turns fine-grained phase callbacks into throttled ``progress`` SSE frames.
+
+    Throttling matters: a 50k-chunk compile would otherwise push tens of thousands of
+    frames through the SSE queue. Transitions and phase completions always emit, so
+    the bar never stalls short of the end of a phase."""
+
+    def __init__(self, emit, contextual: bool = False, with_parse: bool = False,
+                 min_interval: float = 0.25):
+        self.emit = emit
+        self.min_interval = min_interval
+        if with_parse:
+            weights = _WEIGHTS_CONTEXTUAL_PARSE if contextual else _WEIGHTS_PLAIN_PARSE
+        else:
+            weights = _WEIGHTS_CONTEXTUAL if contextual else _WEIGHTS_PLAIN
+        self.phases = [{"id": pid, "label": _PHASE_LABELS.get(pid, pid),
+                        "unit": _PHASE_UNITS.get(pid, ""), "weight": w}
+                       for pid, w in weights.items()]
+        self.started = time.time()
+        self._last_at = 0.0
+        self._last_key = None
+
+    def plan(self, **totals):
+        _emit(self.emit, "plan", phases=self.phases, totals=totals)
+
+    def update(self, phase, done, total, **extra):
+        now = time.time()
+        key = (phase, done >= total)
+        force = (done >= total) or (key != self._last_key)
+        if not force and (now - self._last_at) < self.min_interval:
+            return
+        self._last_at = now
+        self._last_key = key
+        _emit(self.emit, "progress", phase=phase, done=int(done), total=int(total),
+              unit=_PHASE_UNITS.get(phase, ""),
+              elapsed_s=round(now - self.started, 2), **extra)
+
+    def callback(self):
+        """The ``on_progress(phase, done, total, **extra)`` hook rag.upsert_items wants."""
+        return lambda phase, done, total, **extra: self.update(phase, done, total, **extra)
 
 
 # --------------------------- status (cheap, no embedding) ---------------------------
@@ -146,7 +234,7 @@ def _state_from(manifest: dict, sig: dict, current_items: dict, stored_chunks: i
 
 def _library_items(lib: dict) -> list:
     """[(item_id, content, meta)] for a library's non-empty items, deriving a stable-ish
-    id the same way ``rag.index_libraries`` does so retrieval scopes line up."""
+    id, so retrieval scopes line up with what was written."""
     out = []
     lib_id = lib.get("id")
     for idx, it in enumerate(lib.get("items", [])):
@@ -164,7 +252,7 @@ def library_status(lib: dict, embed_model: str) -> dict:
     sig = signature(embed_model)
     current = {iid: _content_fingerprint(content) for iid, content, _ in _library_items(lib)}
     stored_chunks = rag.count_chunks(LIBRARY, lib_id)
-    return _state_from(_get_manifest(f"{LIBRARY}:{lib_id}"), sig, current, stored_chunks)
+    return _state_from(_get_manifest(_manifest_key(LIBRARY, lib_id)), sig, current, stored_chunks)
 
 
 def _persona_source_items(persona_id: str) -> list:
@@ -197,34 +285,39 @@ def persona_status(persona: dict, embed_model: str) -> dict:
     for mem_id, _m, fp in _persona_memory_items(pid):
         current[f"m:{mem_id}"] = fp
     stored_chunks = rag.count_chunks(PERSONA_KNOWLEDGE, pid) + rag.count_chunks(PERSONA_MEMORY, pid)
-    return _state_from(_get_manifest(f"persona:{pid}"), sig, current, stored_chunks)
+    return _state_from(_get_manifest(_manifest_key("persona", pid)), sig, current, stored_chunks)
 
 
 # --------------------------- compile (embeds) ---------------------------
 
 def compile_library(lib: dict, embed_fn, embed_model: str, contextualize=None,
                     force: bool = False, emit=None, batch_size: int = 64,
-                    max_workers: int = 1) -> dict:
+                    max_workers: int = 1, stop_event=None) -> dict:
     """Chunk + embed every item of ``lib`` into the store, skipping unchanged items
     (unless ``force``), prune removed items, and write the manifest. Returns a summary.
 
-    Changed items are embedded in ONE bulk ``rag.upsert_items`` call (chunks pooled
-    across items, embedded in batches of ``batch_size`` with up to ``max_workers``
-    concurrent requests) rather than one blocking HTTP round-trip per item."""
+    Changed items are embedded in ONE bulk ``rag.upsert_items`` call — chunks pooled
+    across items, embedded in bounded waves across every configured embedding server,
+    reusing any vector already computed for identical text.
+
+    Items that did not embed cleanly (a dead embed server, or a run the user cancelled)
+    are deliberately LEFT OUT of the manifest, so the library reads as stale and those
+    items recompile next time instead of being silently recorded as done."""
     lib_id = lib.get("id")
-    key = f"{LIBRARY}:{lib_id}"
+    key = _manifest_key(LIBRARY, lib_id)
     sig = signature(embed_model)
     prev = _get_manifest(key)
     prev_items = prev.get("items") or {}
     same_sig = prev.get("signature") == sig
     items = _library_items(lib)
     total = len(items)
+    prog = Progress(emit, contextual=contextualize is not None)
     _emit(emit, "begin", total=total, kind="library", name=lib.get("name", ""))
 
     new_items = {}
     embedded = skipped = 0
     changed = []          # [(item_id, content, meta)] to embed in bulk
-    changed_pos = {}      # item_id -> (index, label) for progress events
+    changed_pos = {}      # item_id -> (index, label, fingerprint)
     for i, (item_id, content, meta) in enumerate(items):
         fp = _content_fingerprint(content)
         label = meta.get("label") or item_id
@@ -239,21 +332,33 @@ def compile_library(lib: dict, embed_fn, embed_model: str, contextualize=None,
             new_items[item_id] = {"fingerprint": fp, "chunks": n}
         else:
             changed.append((item_id, content, meta))
-            changed_pos[item_id] = (i + 1, label)
-            new_items[item_id] = {"fingerprint": fp, "chunks": 0}
+            changed_pos[item_id] = (i + 1, label, fp)
 
+    meta_out = {}
     if changed:
+        prog.plan(items=total, changed=len(changed))
         counts = rag.upsert_items(LIBRARY, lib_id, changed, embed_fn, embed_model,
                                   contextualize=contextualize, batch_size=batch_size,
-                                  max_workers=max_workers)
+                                  max_workers=max_workers, on_progress=prog.callback(),
+                                  stop_event=stop_event)
+        meta_out = counts.get("__meta__") or {}
+        complete = meta_out.get("complete") or set()
         for item_id, _c, _m in changed:
             n = counts.get(item_id, 0)
-            embedded += 1
-            new_items[item_id]["chunks"] = n
-            idx, label = changed_pos[item_id]
-            _emit(emit, "item_done", index=idx, total=total, name=label, chunks=n, skipped=False)
+            idx, label, fp = changed_pos[item_id]
+            if item_id in complete:
+                embedded += 1
+                new_items[item_id] = {"fingerprint": fp, "chunks": n}
+                _emit(emit, "item_done", index=idx, total=total, name=label,
+                      chunks=n, skipped=False)
+            else:
+                # Left out of the manifest on purpose — see the docstring.
+                _emit(emit, "warn", name=label,
+                      message="not fully embedded — will recompile")
 
     rag.prune_items(LIBRARY, lib_id, list(new_items.keys()))
+    failed = int(meta_out.get("failed") or 0)
+    stopped = bool(meta_out.get("stopped"))
     manifest = {
         "signature": sig,
         "items": new_items,
@@ -261,17 +366,21 @@ def compile_library(lib: dict, embed_fn, embed_model: str, contextualize=None,
         "compiled_at": datetime.utcnow().isoformat(),
     }
     _put_manifest(key, manifest)
-    summary = {"state": "compiled", "items": len(new_items), "embedded": embedded,
+    summary = {"state": "partial" if (failed or stopped) else "compiled",
+               "items": len(new_items), "embedded": embedded,
                "skipped": skipped, "chunks": manifest["chunks"],
                "compiled_at": manifest["compiled_at"],
-               "embedding_model": embed_model, "chunker": sig["chunker"]}
+               "embedding_model": embed_model, "chunker": sig["chunker"],
+               "failed": failed, "stopped": stopped,
+               "cached": int(meta_out.get("cached") or 0),
+               "lanes": meta_out.get("lanes") or []}
     _emit(emit, "compiled", **summary)
     return summary
 
 
 def compile_persona(persona: dict, embed_fn, embed_model: str, contextualize=None,
                     force: bool = False, emit=None, batch_size: int = 64,
-                    max_workers: int = 1) -> dict:
+                    max_workers: int = 1, stop_event=None) -> dict:
     """Chunk + embed a persona's knowledge sources and memories, skip unchanged, prune
     removed, record ``stores.embedding_model_used`` on the persona, and write the
     manifest. Returns a summary.
@@ -280,7 +389,7 @@ def compile_persona(persona: dict, embed_fn, embed_model: str, contextualize=Non
     (chunks pooled + batched/concurrent per ``batch_size``/``max_workers``). Memories
     are few and stay per-item."""
     pid = persona.get("id")
-    key = f"persona:{pid}"
+    key = _manifest_key("persona", pid)
     sig = signature(embed_model)
     prev = _get_manifest(key)
     prev_items = prev.get("items") or {}
@@ -290,14 +399,15 @@ def compile_persona(persona: dict, embed_fn, embed_model: str, contextualize=Non
     sources = _persona_source_items(pid)
     memories = _persona_memory_items(pid)
     total = len(sources) + len(memories)
+    prog = Progress(emit, contextual=contextualize is not None, with_parse=True)
     _emit(emit, "begin", total=total, kind="persona", name=persona.get("profile", {}).get("name", ""))
 
     new_items = {}
     embedded = skipped = 0
     idx = 0
 
-    # --- Knowledge documents (changed ones embedded in bulk) ---
-    changed = []          # [(doc_id, text, meta)]
+    # --- Knowledge documents (changed ones parsed in parallel, embedded in bulk) ---
+    to_parse = []         # [(doc_id, path, fp, index)]
     changed_pos = {}      # doc_id -> (index, fp)
     for doc_id, path, fp in sources:
         idx += 1
@@ -312,30 +422,55 @@ def compile_persona(persona: dict, embed_fn, embed_model: str, contextualize=Non
             _emit(emit, "item_done", index=idx, total=total, name=doc_id, chunks=n, skipped=True)
             new_items[mkey] = {"fingerprint": fp, "chunks": n}
         else:
-            try:
-                # File is already in the persona's sources/ dir (that's what we globbed),
-                # so just extract text — no copy — and defer embedding to the bulk call.
-                text = ingest.extract_text(Path(path))
-                changed.append((doc_id, text, {"name": doc_id, "tags": []}))
-                changed_pos[doc_id] = (idx, fp)
-                new_items[mkey] = {"fingerprint": fp, "chunks": 0}
-            except Exception as e:
-                _emit(emit, "warn", name=doc_id, message=str(e))
-                new_items[mkey] = {"fingerprint": fp, "chunks": 0}
+            to_parse.append((doc_id, path, fp, idx))
+            changed_pos[doc_id] = (idx, fp)
 
+    prog.plan(items=total, changed=len(to_parse))
+
+    # Parsing PDFs/EPUBs is CPU-bound and was the other serial half of a slow compile;
+    # extract_many spreads it over a process pool. Files are already in the persona's
+    # sources/ dir (that's what we globbed), so nothing is copied.
+    changed = []          # [(doc_id, text, meta)]
+    if to_parse:
+        by_path = {str(p): (doc_id, fp) for doc_id, p, fp, _i in to_parse}
+        results = ingest.extract_many(
+            [str(p) for _d, p, _f, _i in to_parse],
+            on_progress=lambda d, t, name: prog.update("parse", d, t))
+        for res in results:
+            doc_id, fp = by_path.get(res.get("path"), (None, ""))
+            if doc_id is None:
+                continue
+            if res.get("ok"):
+                changed.append((doc_id, res.get("text") or "",
+                                {"name": doc_id, "tags": []}))
+            else:
+                _emit(emit, "warn", name=doc_id, message=res.get("error", "parse failed"))
+
+    meta_out = {}
     if changed:
         counts = rag.upsert_items(PERSONA_KNOWLEDGE, pid, changed, embed_fn, embed_model,
                                   contextualize=contextualize, batch_size=batch_size,
-                                  max_workers=max_workers)
+                                  max_workers=max_workers, on_progress=prog.callback(),
+                                  stop_event=stop_event)
+        meta_out = counts.get("__meta__") or {}
+        complete = meta_out.get("complete") or set()
         for doc_id, _t, _m in changed:
             n = counts.get(doc_id, 0)
-            embedded += 1
-            new_items[f"k:{doc_id}"]["chunks"] = n
-            didx, _fp = changed_pos[doc_id]
-            _emit(emit, "item_done", index=didx, total=total, name=doc_id, chunks=n, skipped=False)
+            didx, fp = changed_pos[doc_id]
+            if doc_id in complete:
+                embedded += 1
+                new_items[f"k:{doc_id}"] = {"fingerprint": fp, "chunks": n}
+                _emit(emit, "item_done", index=didx, total=total, name=doc_id,
+                      chunks=n, skipped=False)
+            else:
+                # Left out of the manifest so it recompiles rather than reading clean.
+                _emit(emit, "warn", name=doc_id,
+                      message="not fully embedded — will recompile")
 
     # --- Memories ---
     for mem_id, mem, fp in memories:
+        if stop_event is not None and stop_event.is_set():
+            break
         idx += 1
         mkey = f"m:{mem_id}"
         title = mem.get("title") or mem_id
@@ -365,6 +500,9 @@ def compile_persona(persona: dict, embed_fn, embed_model: str, contextualize=Non
     rag.prune_items(PERSONA_KNOWLEDGE, pid, [d for d, _p, _f in sources])
     rag.prune_items(PERSONA_MEMORY, pid, [m for m, _x, _f in memories])
 
+    failed = int(meta_out.get("failed") or 0)
+    stopped = bool(meta_out.get("stopped")) or bool(
+        stop_event is not None and stop_event.is_set())
     manifest = {
         "signature": sig,
         "items": new_items,
@@ -380,9 +518,13 @@ def compile_persona(persona: dict, embed_fn, embed_model: str, contextualize=Non
     except Exception:
         pass
 
-    summary = {"state": "compiled", "items": len(new_items), "embedded": embedded,
+    summary = {"state": "partial" if (failed or stopped) else "compiled",
+               "items": len(new_items), "embedded": embedded,
                "skipped": skipped, "chunks": manifest["chunks"],
                "compiled_at": manifest["compiled_at"],
-               "embedding_model": embed_model, "chunker": sig["chunker"]}
+               "embedding_model": embed_model, "chunker": sig["chunker"],
+               "failed": failed, "stopped": stopped,
+               "cached": int(meta_out.get("cached") or 0),
+               "lanes": meta_out.get("lanes") or []}
     _emit(emit, "compiled", **summary)
     return summary

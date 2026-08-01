@@ -58,9 +58,26 @@ DEFAULT_SETTINGS = {
     # Compile throughput. During "Compile Data" the changed items' chunks are pooled and
     # embedded in batches (fewer, larger /api/embed calls) and optionally in parallel.
     "rag_embed_batch_size": 64,          # chunks per /api/embed request (backend-agnostic win)
-    "rag_embed_concurrency": 3,          # parallel in-flight embed requests. GPU: helps; CPU-only:
+    "rag_embed_concurrency": 3,          # in-flight embed requests PER SERVER. GPU: helps; CPU-only:
                                          # set to 1 (it just contends for cores). Keep <= the Ollama
                                          # server's OLLAMA_NUM_PARALLEL, else requests just queue.
+    # Multi-server embedding. Deliberately its own list rather than reusing
+    # parallel_servers: a box with chat models often has no embedding model pulled, and
+    # RAG fan-out shouldn't be gated on the chat parallel toggle. There is no per-server
+    # model — vectors from different embedding models are not comparable, so the whole
+    # pool always uses rag_embed_model.
+    "rag_embed_parallel": False,         # fan compile embedding out across rag_embed_servers
+    "rag_embed_servers": [],             # [{base_url, enabled}] — extra embedding endpoints
+    "rag_ann_enabled": True,             # DuckDB backend only: in-memory HNSW sidecar
+    # Which vector store backs RAG.
+    #   "lance"  — LanceDB. Durable vector index + native full-text (tantivy) index.
+    #              Measured at 50k chunks x 768 dims: writes 155x faster, keyword search
+    #              174x faster. NOT ENCRYPTED — chunk text and embeddings are plaintext
+    #              on disk, readable independently of the login password.
+    #   "duckdb" — the original store. AES-256 encrypted at rest via the login password,
+    #              but no durable vector index and keyword search scans the whole scope.
+    # The two stores are independent files, so switching never destroys the other's data.
+    "rag_backend": "lance",
     # Contextual chunking: prepend an LLM-written situating sentence to each chunk before
     # embedding/indexing. Off by default because library indexing here is synchronous on
     # send (one LLM call per new/changed chunk); enable for higher-quality retrieval.
@@ -259,12 +276,22 @@ class Store:
         else:
             legacy = load_json(LEGACY_CONFIG_FILE, {})
             cfg = {**DEFAULT_SETTINGS, **legacy}
+        # Which keys the user's file actually carried, BEFORE defaults are filled in.
+        # Lets a newly-introduced setting distinguish "never chosen" from "chose the
+        # default" — e.g. rag_backend, where an upgrade must not switch an existing
+        # corpus out from under the user (see server._apply_rag_backend).
+        self._explicit_keys = set(cfg.keys())
         for k, v in DEFAULT_SETTINGS.items():
             cfg.setdefault(k, v)
         cfg["servers"] = [_normalize_server(s) for s in cfg.get("servers", [])]
         if not core.SETTINGS_FILE.exists():
             save_json(core.SETTINGS_FILE, cfg)
         return cfg
+
+    def config_has_explicit(self, key: str) -> bool:
+        """True when ``key`` was present in the user's settings file, as opposed to
+        being filled in from DEFAULT_SETTINGS."""
+        return key in getattr(self, "_explicit_keys", set())
 
     # ---------------- low-level saves ----------------
     # Data saves become no-ops in Incognito (kept in memory only); settings persist.

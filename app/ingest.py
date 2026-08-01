@@ -13,8 +13,11 @@ Public API:
     is_supported(path) -> bool
     extract(path) -> {text, title, pages, format, ...}   # metadata dict
     extract_text(path) -> str                            # convenience: just the text
+    extract_many(paths, workers, on_progress) -> [{ok, path, ...}]  # parallel + progress
 """
 
+import os
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Plain-text formats need no external parser.
@@ -172,3 +175,76 @@ def extract_text(path) -> str:
     """Convenience wrapper around extract() for callers that only want the text.
     Raises IngestError on the same conditions."""
     return extract(path)["text"]
+
+
+# --------------------------- Bulk parsing ---------------------------
+
+def _extract_one(path_str: str) -> dict:
+    """Process-pool entry point: must be a module-level function so it pickles under
+    Windows' spawn start method. Returns a result envelope instead of raising, because
+    an exception crossing the pool boundary loses its type."""
+    try:
+        out = extract(path_str)
+        out["path"] = path_str
+        out["ok"] = True
+        return out
+    except Exception as e:
+        return {"ok": False, "path": path_str, "error": str(e)}
+
+
+def extract_many(paths, workers: int = None, on_progress=None) -> list:
+    """Parse many documents at once. Returns ``[{ok, path, ...}]`` in INPUT order.
+
+    Uses a process pool: pypdf/ebooklib text extraction is almost entirely pure-Python,
+    so it is GIL-bound and threads barely help — processes scale it across cores, which
+    is the difference between minutes and seconds on a shelf of ebooks. Falls back to a
+    thread pool when a process pool can't start (frozen builds, restricted sandboxes),
+    which still keeps the UI responsive and progress flowing.
+
+    ``on_progress(done, total, name)`` fires as each file lands, in completion order.
+    A file that fails to parse yields ``{"ok": False, "error": …}`` rather than
+    aborting the batch — one broken PDF must not cost the user the other nine.
+    """
+    paths = [str(p) for p in (paths or [])]
+    if not paths:
+        return []
+    total = len(paths)
+    results = [None] * total
+    index = {p: i for i, p in enumerate(paths)}
+    done = 0
+
+    def land(res):
+        nonlocal done
+        i = index.get(res.get("path"))
+        if i is not None:
+            results[i] = res
+        done += 1
+        if on_progress is not None:
+            try:
+                on_progress(done, total, Path(res.get("path", "")).name)
+            except Exception:
+                pass
+
+    if workers is None:
+        workers = min(os.cpu_count() or 2, total, 8)
+    workers = max(1, int(workers))
+
+    if workers > 1 and total > 1:
+        try:
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                futures = [ex.submit(_extract_one, p) for p in paths]
+                for fut in as_completed(futures):
+                    land(fut.result())
+        except Exception:
+            # Process pool unavailable — redo whatever is still missing on threads.
+            todo = [p for p in paths if results[index[p]] is None]
+            done = total - len(todo)
+            with ThreadPoolExecutor(max_workers=min(workers, len(todo) or 1)) as ex:
+                for res in ex.map(_extract_one, todo):
+                    land(res)
+    else:
+        for p in paths:
+            land(_extract_one(p))
+
+    return [r if r is not None else {"ok": False, "path": p, "error": "not parsed"}
+            for p, r in zip(paths, results)]

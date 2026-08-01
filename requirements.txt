@@ -31,6 +31,26 @@ trafilatura>=2.0          # main-content / boilerplate-free HTML → text
 chonkie>=0.4              # semantic/recursive RAG chunking
 
 # --------------------------------------------------------------------------
+# RAG vector store — LanceDB backend (Settings → RAG → Vector store).
+#
+# Gives RAG a durable on-disk vector index and a native full-text (tantivy) index.
+# Measured here at 50k chunks x 768 dims against the DuckDB backend: writes 155x
+# faster (27,725 vs 179 rows/s) and keyword search 174x faster (11.5 vs 2,005 ms).
+#
+# NOTE: a Lance dataset is NOT encrypted — chunk text and embeddings are plaintext on
+# disk. The DuckDB backend remains available and is encrypted at rest; choose in
+# Settings → RAG. Imported lazily, so the app runs without lancedb if you stay on
+# DuckDB.
+#
+# pyarrow/numpy stop being optional here: the Lance backend builds Arrow batches
+# directly (never pandas, which may be installed-but-broken — see
+# core._neutralize_broken_optional_imports).
+# --------------------------------------------------------------------------
+lancedb>=0.25             # embedded vector store: durable ANN + tantivy full-text index
+pyarrow>=16               # Arrow batches for the Lance backend
+numpy>=1.24               # required by lancedb/pyarrow
+
+# --------------------------------------------------------------------------
 # Local browser crawl fallback for the Resources tab's "Add by URL" / "Brave
 # search" sources. Bright Data (if a token is set) is tried first, then this
 # local headless Chromium, then a plain requests GET — so scraping still works

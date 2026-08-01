@@ -23,6 +23,7 @@ const S = {
   dataItems: [],       // data-classification blocks staged for the next send: {id, label, text}
   dataMode: false,     // data-classification composer mode on/off
   parallel: { enabled: false, mode: "balanced", servers: [] }, // multi-server config
+  ragServers: [],       // extra embedding endpoints for RAG builds: [{base_url, enabled}]
   contextBars: {},      // live context-usage bars, keyed by chat/lane: {used, window, ...}
   personas: [],         // [{id, name, role, variants[]}]
   usePersona: false,    // "Use Persona" toggle
@@ -1628,12 +1629,33 @@ async function renderPersonaKb() {
 }
 async function addPersonaKbFiles() {
   toast("Choose documents in the dialog…");
+  const pid = S.editingPersona.id;
+  const runId = `addfiles-persona-${pid}`;
+  const progressEl = $("pe-compile-progress");
+  let ui = null;
   try {
-    const r = await api(`/api/personas/${S.editingPersona.id}/knowledge/add-files`, { method: "POST", body: {} });
-    if (r.errors && r.errors.length) toast(r.errors.join("; "));
-    else toast(`Added ${(r.added || []).length} document(s).`);
-    renderPersonaKb(); renderEmbedBanner();
-    refreshCompileStatus("persona", S.editingPersona.id, $("pe-compile-badge"));
+    // Each document here is parsed AND embedded, so this is the slow path that most
+    // needs a progress bar.
+    await streamSSE(`/api/personas/${pid}/knowledge/add-files`, {}, {
+      begin: (d) => {
+        if (!d.total) return;
+        ui = makeProgressUI(progressEl, {
+          onCancel: () => api("/api/stop", { method: "POST", body: { run_id: runId } }).catch(() => {}),
+        });
+        ui.plan([{ id: "parse", label: "Ingesting documents", weight: 1 }]);
+        ui.line(`Ingesting ${d.total} document(s)…`);
+      },
+      progress: (d) => { if (ui) ui.update({ ...d, label: "Ingesting documents" }); },
+      complete: (r) => {
+        if (ui) ui.finish();
+        if (r.errors && r.errors.length) toast(r.errors.join("; "));
+        else toast(`Added ${(r.added || []).length} document(s).`);
+        renderPersonaKb(); renderEmbedBanner();
+        refreshCompileStatus("persona", pid, $("pe-compile-badge"));
+      },
+      error: (d) => { if (ui) ui.stop(); toast("Add failed: " + d.message); },
+      done: () => { if (ui) ui.stop(); },
+    });
   } catch (e) { toast("Add failed: " + e.message); }
 }
 function renderEmbedBanner() {
@@ -2176,6 +2198,129 @@ async function toggleParallel() {
   }
 }
 
+// ---------------- RAG vector-store backend (Settings → RAG) ----------------
+// Two stores can hold data at once and they are independent files, so switching is
+// reversible. The note under the selector states what each one costs, because the
+// LanceDB store is NOT encrypted and that must not be a surprise.
+async function refreshRagBackend() {
+  const note = $("rag-backend-note");
+  if (!note) return;
+  let info;
+  try { info = await api("/api/rag/backend"); }
+  catch (e) { note.textContent = ""; return; }
+  $("set-rag-backend").value = info.backend || "lance";
+  const st = info.status || {};
+  const bits = [];
+  if (info.backend === "lance") {
+    bits.push(`<strong>Not encrypted.</strong> Chunk text and embeddings are stored in plain files at <code>${escapeHtml(info.lance_dir || "")}</code>, readable without your login password.`);
+    if (st.rows) bits.push(`${(st.rows).toLocaleString()} chunk(s) indexed.`);
+  } else {
+    bits.push(`Encrypted at rest with your login password. No durable vector index, and keyword search scans the whole scope — noticeably slower on large corpora.`);
+  }
+  if (info.duckdb_rows && info.backend === "lance") {
+    bits.push(`Your DuckDB store still holds ${info.duckdb_rows.toLocaleString()} chunk(s) — ` +
+              `<button id="btn-rag-migrate" class="small">Copy them into LanceDB</button> ` +
+              `to avoid re-embedding.`);
+  }
+  note.innerHTML = bits.join(" ");
+  const mig = $("btn-rag-migrate");
+  if (mig) mig.onclick = migrateRagStore;
+}
+async function migrateRagStore() {
+  const progressEl = $("rag-migrate-progress");
+  const ui = makeProgressUI(progressEl, {
+    onCancel: () => api("/api/stop", { method: "POST", body: { run_id: "rag-migrate" } }).catch(() => {}),
+  });
+  ui.plan([{ id: "migrate", label: "Copying vectors", weight: 1 }]);
+  await streamSSE("/api/rag/migrate", {}, {
+    begin: (d) => ui.line(`Copying ${(d.total || 0).toLocaleString()} chunk(s) from DuckDB…`),
+    progress: (d) => ui.update({ ...d, label: "Copying vectors" }),
+    warn: (d) => ui.line(`   ⚠ ${d.name}: ${d.message}`),
+    complete: (d) => {
+      ui.finish();
+      ui.line(`Copied ${(d.moved || 0).toLocaleString()} of ${(d.total || 0).toLocaleString()}; verified: ${d.verified ? "yes" : "NO"}.`);
+      if (d.verified) toast(`Migrated ${(d.moved || 0).toLocaleString()} chunks to LanceDB.`);
+      else toast("Migration finished but verification failed — your DuckDB store is untouched.", 6000);
+      refreshRagBackend();
+    },
+    error: (d) => { ui.stop(); toast("Migration failed: " + d.message); },
+    done: () => ui.stop(),
+  });
+}
+
+// ---------------- RAG embedding servers (Settings → RAG) ----------------
+// A list separate from the chat parallel_servers: a box with chat models often has no
+// embedding model pulled. There is intentionally no per-server model — the whole pool
+// embeds with rag_embed_model, because vectors from different embedding models live in
+// different spaces and mixing them would corrupt the index.
+function renderRagServers(health) {
+  const box = $("rag-servers-list");
+  const list = S.ragServers || [];
+  if (!list.length) {
+    box.className = "muted";
+    box.textContent = "No extra embedding servers — the embedding server URL above is used on its own.";
+    return;
+  }
+  box.className = "";
+  const byUrl = {};
+  ((health || {}).servers || []).forEach((h) => { byUrl[h.base_url] = h; });
+  box.innerHTML = "";
+  list.forEach((s, i) => {
+    const row = document.createElement("div");
+    row.className = "rag-server-row";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = s.enabled !== false;
+    cb.onchange = () => { S.ragServers[i].enabled = cb.checked; };
+    row.appendChild(cb);
+    const url = document.createElement("span");
+    url.className = "url";
+    url.textContent = s.base_url;
+    row.appendChild(url);
+    const h = byUrl[s.base_url];
+    if (h) {
+      const st = document.createElement("span");
+      if (!h.reachable) { st.className = "health bad"; st.textContent = "✗ unreachable"; }
+      else if (!h.has_model) { st.className = "health warn"; st.textContent = "⚠ embedding model not pulled"; }
+      else { st.className = "health ok"; st.textContent = "✓ ready"; }
+      row.appendChild(st);
+    }
+    const del = document.createElement("button");
+    del.className = "small";
+    del.textContent = "✕";
+    del.onclick = () => { S.ragServers.splice(i, 1); renderRagServers(health); };
+    row.appendChild(del);
+    box.appendChild(row);
+  });
+}
+function addRagServersFromList() {
+  const existing = new Set((S.ragServers || []).map((s) => s.base_url));
+  const primary = ($("set-rag-embed-url").value || "").trim().replace(/\/+$/, "");
+  let added = 0;
+  (S.config.servers || []).forEach((s) => {
+    const url = (s.base_url || "").replace(/\/+$/, "");
+    // Only Ollama speaks /api/embed, and the primary is already in the pool.
+    if (!url || url === primary || existing.has(url) || s.type !== "ollama") return;
+    S.ragServers.push({ base_url: url, enabled: true });
+    existing.add(url);
+    added++;
+  });
+  renderRagServers();
+  toast(added ? `Added ${added} server(s) — Save general to keep them.`
+              : "No new Ollama servers to add (configure them under Servers first).");
+}
+async function checkRagServers() {
+  setStatus("Checking embedding servers…");
+  try {
+    const h = await api("/api/rag/embed-health");
+    renderRagServers(h);
+    const bad = (h.servers || []).filter((s) => !s.reachable || !s.has_model);
+    if (!bad.length) toast(`All ${h.servers.length} server(s) ready for "${h.embed_model}".`);
+    else toast(`${bad.length} server(s) not ready — see the list.`, 5000);
+  } catch (e) { toast("Check failed: " + e.message); }
+  setStatus("");
+}
+
 // --------------------- prompt library (System/Pre) -------------------
 // A 3-column browser (Group -> Category -> Prompt) over two independent trees,
 // S.prompts.system and S.prompts.pre. The whole tree is saved back on every edit.
@@ -2434,6 +2579,14 @@ function renderSettings() {
   $("set-auto-reason").checked = !!S.config.auto_detect_reasoning;
   $("set-rag-embed-url").value = S.config.rag_embed_server_url || "http://127.0.0.1:11434";
   $("set-rag-embed-model").value = S.config.rag_embed_model || "nomic-embed-text";
+  $("set-rag-backend").value = S.config.rag_backend || "lance";
+  refreshRagBackend();
+  $("set-rag-parallel").checked = !!S.config.rag_embed_parallel;
+  $("set-rag-batch").value = S.config.rag_embed_batch_size || 64;
+  $("set-rag-concurrency").value = S.config.rag_embed_concurrency || 3;
+  $("set-rag-ann").checked = S.config.rag_ann_enabled !== false;
+  S.ragServers = (S.config.rag_embed_servers || []).map((s) => ({ ...s }));
+  renderRagServers();
   $("set-rag-topk").value = S.config.rag_top_k || 6;
   $("set-rag-mode").value = S.config.rag_retrieval_mode || "hybrid";
   $("set-rag-context").checked = !!S.config.rag_contextual_chunking;
@@ -2588,6 +2741,12 @@ async function saveGeneral() {
     auto_detect_reasoning: $("set-auto-reason").checked,
     rag_embed_server_url: $("set-rag-embed-url").value.trim() || "http://127.0.0.1:11434",
     rag_embed_model: $("set-rag-embed-model").value.trim() || "nomic-embed-text",
+    rag_backend: $("set-rag-backend").value || "lance",
+    rag_embed_parallel: $("set-rag-parallel").checked,
+    rag_embed_servers: S.ragServers || [],
+    rag_embed_batch_size: Math.max(1, parseInt($("set-rag-batch").value) || 64),
+    rag_embed_concurrency: Math.max(1, parseInt($("set-rag-concurrency").value) || 3),
+    rag_ann_enabled: $("set-rag-ann").checked,
     rag_top_k: Math.max(1, parseInt($("set-rag-topk").value) || 6),
     rag_retrieval_mode: $("set-rag-mode").value || "hybrid",
     rag_contextual_chunking: $("set-rag-context").checked,
@@ -2665,32 +2824,167 @@ async function refreshCompileStatus(kind, id, badgeEl) {
     return st;
   } catch (e) { badgeEl.innerHTML = ""; return null; }
 }
+// Duration as "d h m s", dropping leading units that are zero:
+//   45 -> "45s"   200 -> "3m 20s"   3902 -> "1h 5m 2s"   184446 -> "2d 3h 14m 6s"
+function fmtDur(s) {
+  if (s == null || !isFinite(s) || s < 0) return "—";
+  s = Math.max(0, Math.round(s));
+  const d = Math.floor(s / 86400),
+        h = Math.floor((s % 86400) / 3600),
+        m = Math.floor((s % 3600) / 60),
+        sec = s % 60;
+  const out = [];
+  if (d) out.push(d + "d");
+  if (d || h) out.push(h + "h");
+  if (d || h || m) out.push(m + "m");
+  out.push(sec + "s");
+  return out.join(" ");
+}
+
+// A progress widget with a live ETA. Phases (parse/chunk/context/embed) are measured
+// in different units, so each carries a weight and the overall fraction is the
+// weighted sum — that way the bar stays honest when embedding dominates.
+//
+// The ETA is computed HERE rather than server-side, from an exponentially-weighted
+// moving average of fraction-per-second, and re-rendered on a 1s timer. EWMA rather
+// than a plain elapsed/fraction average so the estimate adapts when a second embedding
+// server joins or a large document stalls; the timer so the countdown ticks down
+// between SSE frames instead of lurching whenever one happens to arrive.
+function makeProgressUI(progressEl, opts) {
+  opts = opts || {};
+  progressEl.classList.remove("hidden");
+  progressEl.innerHTML =
+    `<div class="compile-bar"><div class="compile-bar-fill"></div></div>
+     <div class="compile-meta">
+       <span class="compile-phase"></span>
+       <span class="compile-counts"></span>
+       <span class="compile-eta"></span>
+       ${opts.onCancel ? '<button class="small compile-cancel">Stop</button>' : ""}
+     </div>
+     <div class="compile-lanes"></div>
+     <div class="compile-log"></div>`;
+  const fill = progressEl.querySelector(".compile-bar-fill");
+  const log = progressEl.querySelector(".compile-log");
+  const phaseEl = progressEl.querySelector(".compile-phase");
+  const countsEl = progressEl.querySelector(".compile-counts");
+  const etaEl = progressEl.querySelector(".compile-eta");
+  const lanesEl = progressEl.querySelector(".compile-lanes");
+  const cancelBtn = progressEl.querySelector(".compile-cancel");
+  if (cancelBtn) cancelBtn.onclick = () => { cancelBtn.disabled = true; opts.onCancel(); };
+
+  const started = Date.now();
+  let weights = {}, fracs = {}, order = [];
+  let rate = null, lastFrac = 0, lastAt = started, finished = false;
+
+  const overall = () =>
+    order.reduce((a, id) => a + (weights[id] || 0) * (fracs[id] || 0), 0);
+
+  function render() {
+    const f = finished ? 1 : Math.min(0.999, overall());
+    fill.style.width = (f * 100).toFixed(1) + "%";
+    const elapsed = (Date.now() - started) / 1000;
+    if (finished) {
+      etaEl.textContent = `done in ${fmtDur(elapsed)}`;
+      return;
+    }
+    // Hold off on a number until there's enough signal for it to mean anything.
+    if (!rate || f < 0.03 || elapsed < 5) {
+      etaEl.textContent = `estimating… · ${fmtDur(elapsed)} elapsed`;
+      return;
+    }
+    const remaining = Math.max(0, 1 - f) / rate;
+    etaEl.textContent = `ETA ${fmtDur(remaining)} · ${fmtDur(elapsed)} elapsed`;
+  }
+
+  const timer = setInterval(render, 1000);
+
+  return {
+    line(msg) {
+      const d = document.createElement("div");
+      d.textContent = msg;
+      log.appendChild(d);
+      log.scrollTop = log.scrollHeight;
+    },
+    plan(phases) {
+      order = phases.map((p) => p.id);
+      weights = {};
+      phases.forEach((p) => { weights[p.id] = p.weight; fracs[p.id] = 0; });
+      render();
+    },
+    update(d) {
+      const id = d.phase;
+      if (!(id in weights)) {   // a phase the plan didn't mention (e.g. bare parse)
+        weights[id] = 1; order = [id];
+      }
+      const total = d.total || 0;
+      fracs[id] = total ? Math.min(1, (d.done || 0) / total) : 0;
+      // Everything before this phase in the plan must be complete.
+      const at = order.indexOf(id);
+      order.forEach((pid, i) => { if (i < at) fracs[pid] = 1; });
+
+      const now = Date.now();
+      const f = overall();
+      const dt = (now - lastAt) / 1000;
+      if (dt >= 0.5 && f > lastFrac) {
+        const inst = (f - lastFrac) / dt;
+        rate = rate == null ? inst : rate * 0.8 + inst * 0.2;   // EWMA, alpha 0.2
+        lastFrac = f; lastAt = now;
+      }
+      const label = d.label || id;
+      phaseEl.textContent = label.charAt(0).toUpperCase() + label.slice(1);
+      const parts = [];
+      if (total) parts.push(`${(d.done || 0).toLocaleString()} / ${total.toLocaleString()} ${d.unit || ""}`.trim());
+      if (d.cached) parts.push(`${d.cached.toLocaleString()} reused`);
+      if (d.failed) parts.push(`${d.failed.toLocaleString()} failed`);
+      countsEl.textContent = parts.join(" · ");
+      render();
+    },
+    lanes(list) {
+      if (!list || list.length < 2) { lanesEl.textContent = ""; return; }
+      lanesEl.innerHTML = list.map((l) =>
+        `<span class="compile-lane${l.down ? " down" : ""}">${escapeHtml(l.name)}: ` +
+        `${(l.chunks || 0).toLocaleString()} chunks${l.rate ? ` (${l.rate}/s)` : ""}` +
+        `${l.down ? " — offline" : ""}</span>`).join("");
+    },
+    finish() { finished = true; render(); clearInterval(timer); },
+    stop() { clearInterval(timer); },
+  };
+}
+
 async function runCompile(kind, id, opts, progressEl, badgeEl) {
   if (!id) { toast("Nothing to compile yet."); return; }
   opts = opts || {};
   const base = kind === "library" ? `/api/libraries/${id}` : `/api/personas/${id}`;
-  progressEl.classList.remove("hidden");
-  progressEl.innerHTML = `<div class="compile-bar"><div class="compile-bar-fill"></div></div><div class="compile-log"></div>`;
-  const fill = progressEl.querySelector(".compile-bar-fill");
-  const log = progressEl.querySelector(".compile-log");
+  const runId = `compile-${kind}-${id}`;
+  const ui = makeProgressUI(progressEl, {
+    onCancel: () => {
+      ui.line("Stopping…");
+      api("/api/stop", { method: "POST", body: { run_id: runId } }).catch(() => {});
+    },
+  });
   if (badgeEl) badgeEl.innerHTML = `<span class="cbadge working">Compiling…</span>`;
-  let total = 0, done = 0;
-  const line = (msg) => { const d = document.createElement("div"); d.textContent = msg; log.appendChild(d); log.scrollTop = log.scrollHeight; };
-  await streamSSE(`${base}/compile`, { force: !!opts.force }, {
-    begin: (d) => { total = d.total || 0; line(`Compiling ${d.name || ""} — ${total} item(s)…`); },
-    item_start: (d) => { line(`• ${d.name}…`); },
-    item_done: (d) => {
-      done++; if (total) fill.style.width = Math.round((done / total) * 100) + "%";
-      line(`   ${d.skipped ? "skipped (unchanged)" : "embedded " + (d.chunks || 0) + " chunk(s)"}: ${d.name}`);
-    },
-    warn: (d) => line(`   ⚠ ${d.name}: ${d.message}`),
+  let total = 0;
+  await streamSSE(`${base}/compile`, { force: !!opts.force, run_id: runId }, {
+    begin: (d) => { total = d.total || 0; ui.line(`Compiling ${d.name || ""} — ${total} item(s)…`); },
+    plan: (d) => ui.plan(d.phases || []),
+    progress: (d) => ui.update(d),
+    item_start: (d) => { if (total <= 20) ui.line(`• ${d.name}…`); },
+    item_done: (d) => ui.line(
+      `   ${d.skipped ? "skipped (unchanged)" : "embedded " + (d.chunks || 0) + " chunk(s)"}: ${d.name}`),
+    warn: (d) => ui.line(`   ⚠ ${d.name}: ${d.message}`),
     compiled: (d) => {
-      fill.style.width = "100%";
-      line(`Done — ${d.embedded} embedded, ${d.skipped} skipped, ${d.chunks} chunks total.`);
-      toast(`Compiled: ${d.chunks} chunks (${d.embedded} embedded, ${d.skipped} skipped).`);
+      ui.finish();
+      ui.lanes(d.lanes || []);
+      const bits = [`${d.embedded} embedded`, `${d.skipped} skipped`];
+      if (d.cached) bits.push(`${d.cached.toLocaleString()} vectors reused`);
+      if (d.failed) bits.push(`${d.failed} failed`);
+      ui.line(`${d.stopped ? "Stopped" : "Done"} — ${bits.join(", ")}; ${d.chunks} chunks total.`);
+      if (d.stopped) toast("Compile stopped — partial progress kept; recompile to finish.");
+      else if (d.failed) toast(`Compiled with ${d.failed} failed chunk(s) — check your embedding server, then recompile.`);
+      else toast(`Compiled: ${d.chunks} chunks (${d.embedded} embedded, ${d.skipped} skipped).`);
     },
-    error: (d) => { line(`Error: ${d.message}`); toast("Compile error: " + d.message); },
-    done: () => {},
+    error: (d) => { ui.stop(); ui.line(`Error: ${d.message}`); toast("Compile error: " + d.message); },
+    done: () => ui.stop(),
   });
   if (badgeEl) await refreshCompileStatus(kind, id, badgeEl);
 }
@@ -2841,13 +3135,35 @@ async function addWriteIn() {
 async function addTextFiles() {
   if (!S.activeLibrary) { toast("Select or create a library first"); return; }
   setStatus("Waiting for file selection…");
+  const progressEl = $("lib-compile-progress");
+  const libId = S.activeLibrary.id;
+  const runId = `addfiles-library-${libId}`;
+  // Parsing a stack of ebooks is minutes of CPU, so this streams per-file progress
+  // instead of blocking on one opaque request.
+  let ui = null;
   try {
-    const r = await api(`/api/libraries/${S.activeLibrary.id}/add-text-files`, { method: "POST" });
-    S.activeLibrary = r.library;
-    S.libraries = S.libraries.map((l) => (l.id === r.library.id ? r.library : l));
-    renderLibraryEditor();
-    if (r.added.length) toast(`Added ${r.added.length} file(s)`);
-    if (r.errors.length) toast("Some files failed: " + r.errors.join("; "));
+    await streamSSE(`/api/libraries/${libId}/add-text-files`, {}, {
+      begin: (d) => {
+        setStatus("");
+        if (!d.total) return;
+        ui = makeProgressUI(progressEl, {
+          onCancel: () => api("/api/stop", { method: "POST", body: { run_id: runId } }).catch(() => {}),
+        });
+        ui.plan([{ id: "parse", label: "Reading documents", weight: 1 }]);
+        ui.line(`Reading ${d.total} document(s)…`);
+      },
+      progress: (d) => { if (ui) ui.update({ ...d, label: "Reading documents" }); },
+      complete: (r) => {
+        if (ui) { ui.finish(); ui.line(`Added ${(r.added || []).length} file(s).`); }
+        S.activeLibrary = r.library;
+        S.libraries = S.libraries.map((l) => (l.id === r.library.id ? r.library : l));
+        renderLibraryEditor();
+        if ((r.added || []).length) toast(`Added ${r.added.length} file(s)`);
+        if ((r.errors || []).length) toast("Some files failed: " + r.errors.join("; "));
+      },
+      error: (d) => { if (ui) ui.stop(); toast("Add files failed: " + d.message); },
+      done: () => { if (ui) ui.stop(); },
+    });
   } catch (e) { toast("Add files failed: " + e.message); }
   setStatus("");
 }
@@ -3497,6 +3813,16 @@ function bindEvents() {
   $("btn-scan").onclick = scanRange;
   $("btn-add-scanned").onclick = addScanned;
   $("btn-save-general").onclick = saveGeneral;
+  $("btn-rag-add-servers").onclick = addRagServersFromList;
+  $("btn-rag-check-servers").onclick = checkRagServers;
+  // Refresh the note as soon as the store is changed, before Save, so the encryption
+  // trade-off is visible at the moment of choosing.
+  $("set-rag-backend").onchange = () => {
+    const v = $("set-rag-backend").value;
+    $("rag-backend-note").innerHTML = v === "lance"
+      ? "<strong>Not encrypted.</strong> Save to switch — chunk text and embeddings will be stored in plain files."
+      : "Encrypted at rest with your login password. Save to switch.";
+  };
 
   $("btn-library").onclick = openLibrarySelector;
   $("btn-libselect-save").onclick = saveLibrarySelection;
