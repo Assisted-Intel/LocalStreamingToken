@@ -86,6 +86,13 @@ can expand, inspect, **edit**, and **re-run from that point** — so when an ans
 wrong you can see which step went wrong and fix it there rather than re-rolling the
 whole response. Five model calls where one would do, in exchange for a traceable answer.
 
+A persona also carries its own **temperature**, its own **speaking style** (tone,
+formality, vocabulary, quirks, few-shot examples), and any number of named **style
+variants** you can switch between per message from the composer. The persona run stays
+isolated from the chat's libraries, attachments, and web search — its own knowledge base
+is the point — but it does honor the chat's system prompt. Queue and Batch answer
+normally, without a persona.
+
 ### Multi-server parallel fan-out
 Point the app at several Ollama servers on your LAN and run work across all of them at
 once. Two distribution modes:
@@ -204,11 +211,34 @@ keys; **incognito** leaves nothing behind. A live context-usage bar shows how fu
 window is.
 
 **Reference libraries** — build a corpus from typed sections, imported text files, URLs,
-or Brave search results. Ingests **PDF, EPUB, DOCX, TXT, and MD**. Import/export as XML.
-Select libraries per chat, optionally in **Strict** mode (answer only from these). RAG
-chunks and embeds them so large references stay inside your context window, with an
-**Auto-RAG** toggle that engages on its own once a message plus attached data crosses a
-word threshold.
+YouTube videos, or Brave search results. Ingests **PDF, EPUB, DOCX, TXT, and MD**.
+Import/export as XML. Select libraries per chat, optionally in **Strict** mode (answer
+only from these). RAG chunks and embeds them so large references stay inside your
+context window, with an **Auto-RAG** toggle that engages on its own once a message plus
+attached data crosses a word threshold.
+
+**Chat attachments** — the composer's **＋ Add** button offers the same five sources
+without creating a library, for material that belongs to one conversation. Each addition
+becomes a chip that Send consumes; 📌 pins it to the chat instead, so it stays attached
+and is put in front of the model on every turn until you remove it.
+
+**Images** — attach pictures to a chat by picker, by dragging them onto the composer, or
+with Ctrl+V straight from the clipboard, and ask a vision model to describe, read, or
+compare them. Formats no model accepts (TIFF, BMP, HEIC, …) are converted first, EXIF
+rotation is applied so a phone photo isn't read sideways, and images are scaled to a
+sensible size before sending — 🖼 **Full res** per chat when the detail matters. The
+topbar says whether the selected model reads images at all. Models that can *return* a
+picture (Gemini's image models, and OpenRouter proxies of them) have theirs rendered in
+the answer and savable to disk. The Batch tab takes a **folder of images** as its input,
+one item per picture, and can send **reference images** alongside every item; anything
+the model draws is exported next to the text under the same naming rules.
+
+**YouTube** — paste a video URL to pull its transcript and comments into one document,
+with the title, channel, date and view count, and per-comment like counts. Comments are
+optional and capped by a setting. Fetching goes through Bright Data if you have a token,
+otherwise straight from this machine; install the optional `yt-dlp` package and it acts
+as a third fallback — worth having, because YouTube currently refuses server-side caption
+requests that can't present a proof-of-origin token, and yt-dlp is what fills that gap.
 
 **Web search** — Brave for discovery, Bright Data for crawling live pages, injected as
 research context. Available per message or as a tool the model can call itself.
@@ -219,8 +249,27 @@ UPDATE statements; detect whether the source changed underneath you; then write 
 with a full audit log. **The source database is only ever opened writable during
 write-back.** See [app/database/README.md](app/database/README.md).
 
-**Batch processing** — point at a folder of `.txt`/`.md` prompts; answers are written to
-a `responses/` subfolder beside them.
+**Batch processing** — the **🗂 Batch** tab runs one prompt across many inputs. Mix as
+many sources as you like: YouTube videos, a whole **YouTube playlist**, the pages behind
+a Brave search, or a folder of documents (optionally including subfolders, reading PDF /
+EPUB / DOCX / TXT / MD). Write the instruction once as a template — `{{content}}` is the
+item's text, plus `{{title}}`, `{{url}}` and `{{source}}` — and it runs against every
+item, with the same system prompts, resource libraries and Multi-Pass refinement the chat
+has — including its own **editable evaluation prompt**, so you decide what each
+refinement round should actually look for. **Preview items** shows exactly what will run
+before you start.
+
+Results go to a batch transcript you can promote into a normal chat, and/or to exported
+files: one file per item, everything in a single file, or written **next to each file it
+processed** (which requires a prefix or an appended suffix, so the AI's answer can never
+overwrite your originals). Name files from the source title or have the model write a
+title from the content it just produced, with an editable naming prompt. Choose the
+folder, the extension, and whether the file also carries the source text and the prompt.
+Saved as named **batch projects**, so a routine job is one dropdown away.
+
+The chat composer's older **📂 Batch** button is still there for the other shape of the
+job: a folder where each `.txt`/`.md` file *is* a prompt, with answers written to a
+`responses/` subfolder beside them.
 
 **Personas** — see above; portable as XML (definition) or a `.zip` bundle (definition +
 source documents + memories). Importing a bundle re-ingests and re-embeds locally with
@@ -244,10 +293,15 @@ source documents + memories). Importing a bundle re-ingests and re-embeds locall
   vector and full-text indexes that cannot operate on ciphertext. If you would rather
   have the encryption, switch to the **DuckDB** store — it stays fully supported, keeps
   its data, and you can switch back at any time. Both stores are gitignored.
-- **Nothing is uploaded.** The server is the only thing that touches your filesystem,
-  it's bound to localhost, and file dialogs pass paths rather than contents.
+- **Nothing leaves this machine except what you send to a model.** The server is the
+  only thing that touches your filesystem and it's bound to localhost. File dialogs pass
+  paths rather than contents; images are the one thing the browser uploads, because a
+  pasted screenshot has no path — they go to the local server and are stored encrypted
+  like everything else.
 - **Exports are deliberately plaintext**, so a persona or library you export is a normal
-  portable file.
+  portable file. A chat export carries its images inline as base64 for the same reason —
+  it has to open on another machine — so an export containing photos is an unencrypted
+  copy of them. The app says so when it writes one.
 - **The repo is safe to fork.** `data/` and everything in `settings/` except the example
   template are gitignored, so your keys and chats can't be committed by accident.
 
@@ -267,7 +321,7 @@ rag-deps.md                 Which Ollama models RAG needs, and on which host
 ARCHITECTURE.md             How it works inside — start here to contribute
 
 app/
-  server.py                 Flask app factory, ~99 /api/* routes, SSE, login gate
+  server.py                 Flask app factory, ~150 /api/* routes, SSE, login gate
   logic.py                  GUI-free prompt assembly (messages, RAG, research)
   providers.py              Provider adapters behind one chat_stream() interface
   core.py                   Ollama client, web search, paths, branding, encrypted I/O
@@ -275,9 +329,14 @@ app/
   migrate.py                One-time, idempotent encryption of legacy plaintext
   store.py                  Thread-safe JSON persistence per profile
   profiles.py               Data profiles + settings profiles + incognito
-  rag.py                    DuckDB vector store: chunk, embed, retrieve
+  memory.py                 User memory cores: what the AI learns about you
+  rag.py                    RAG core: chunk, embed, retrieve (vector/keyword/hybrid)
+  vectorstore/              Two interchangeable stores: LanceDB (default) or DuckDB
   ingest.py                 PDF / EPUB / DOCX / TXT / MD extraction
+  images.py                 Image attachments: transcode, EXIF, downscale, store
   compile.py                Batch chunk+embed ("Compile Data")
+  batch.py                  Batch tab: sources -> items, filenames, exports
+  youtube.py                Video transcripts + comments; playlist enumeration
   rewrite.py                Query rewriting and the Rewrite button
   parallel.py               Multi-server fan-out (thread per lane)
   evals.py                  Model-graded evaluation

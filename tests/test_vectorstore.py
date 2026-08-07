@@ -164,6 +164,35 @@ def test_retrieval_is_scoped_to_the_requested_library(backend):
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
+def test_vector_retrieval_is_scoped_to_the_embedding_model(backend):
+    """Vectors from a different embedding model must never be searched.
+
+    Lance keys its tables by vector WIDTH, so two models of the same width (768 covers
+    nomic-embed-text, bge-base and gte-base alike) land in one table. Without a model
+    filter, a scope still holding the previous model's vectors gets ranked against the
+    new model's query vector — confident nonsense rather than an honest empty result.
+    DuckDB has always filtered on model; this pins both backends to that behaviour.
+    """
+    use(backend)
+    rag.upsert_items("library", "lib", [("a", book(30), {})], embed, "model-a",
+                     wave_size=40)
+    qv = embed(["storm chart compass"])[0]
+    assert rag.retrieve("library", ["lib"], [qv], "model-a", 5, mode="vector")
+    assert rag.retrieve("library", ["lib"], [qv], "model-b", 5, mode="vector") == []
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_keyword_retrieval_ignores_the_embedding_model(backend):
+    """BM25 scores chunk TEXT, which doesn't depend on who embedded it — so the model
+    filter that guards vector search must not leak into the keyword path."""
+    use(backend)
+    rag.upsert_items("library", "lib", [("a", "the lantern swung on the anchor rope", {})],
+                     embed, "model-a", wave_size=40)
+    assert rag.retrieve("library", ["lib"], None, "model-b", 3,
+                        mode="keyword", queries=["lantern anchor"])
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
 def test_apostrophe_in_keyword_query_is_safe(backend):
     """Scope filters are built as SQL-ish predicates on the Lance side, so quoting has
     to survive an apostrophe rather than breaking the query."""
@@ -229,6 +258,43 @@ def test_cancellation_leaves_the_item_incomplete(backend):
                      wave_size=10, batch_size=8, stop_event=stop)
     assert meta["stopped"]
     assert "big" not in meta["complete"]        # so it recompiles rather than reading done
+
+
+# ------------------------------ compile orchestration ------------------------------
+def test_cancelling_a_forced_rebuild_keeps_the_existing_vectors(tmp_path, monkeypatch):
+    """Stopping a compile must not delete what was already indexed.
+
+    The prune used to run against the MANIFEST, which deliberately omits anything that
+    didn't embed cleanly. So every item a stopped run hadn't reached yet lost its stored
+    chunks — and under "Force full rebuild", where every item is queued, that emptied the
+    whole library. Pruning against the library's current items removes deleted items (the
+    actual point) without touching items that still exist.
+    """
+    from app import compile as compile_mod
+
+    monkeypatch.setattr(core, "COMPILED_FILE", tmp_path / "compiled.json")
+    rag.set_backend("duckdb")
+
+    items = [{"id": f"i{n}", "type": "write", "label": f"Doc {n}", "content": book(40 + n)}
+             for n in range(4)]
+    lib = {"id": "lib", "name": "Shelf", "items": items}
+
+    first = compile_mod.compile_library(lib, embed, MODEL)
+    assert first["state"] == "compiled"
+    indexed = rag.count_chunks("library", "lib")
+    assert indexed > 0
+
+    # Force-rebuild everything, then cancel immediately.
+    stop = threading.Event()
+    stop.set()
+    compile_mod.compile_library(lib, embed, MODEL, force=True, stop_event=stop)
+    assert rag.count_chunks("library", "lib") == indexed
+
+    # An item genuinely removed from the library IS still pruned.
+    lib["items"] = items[:2]
+    compile_mod.compile_library(lib, embed, MODEL)
+    remaining = {i["item_id"] for i in rag.list_items("library", "lib")}
+    assert remaining == {"i0", "i1"}
 
 
 # ------------------------------ parity ------------------------------

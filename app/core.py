@@ -161,7 +161,8 @@ INCOGNITO_DIR = DATA_PROFILES_DIR / ".incognito"         # scratch dir for the p
 
 # Basenames of the per-profile data files (relative to a data-profile folder).
 DATA_FILE_NAMES = ("chats.json", "chat_groups.json", "presets.json", "prompts.json",
-                   "libraries.json", "evals.json", "db_projects.json", "context_history.json")
+                   "libraries.json", "evals.json", "db_projects.json", "context_history.json",
+                   "memory_cores.json")
 
 SETTINGS_FILE = SETTINGS_DIR / "settings.json"
 CHATS_FILE = DATA_DIR / "chats.json"
@@ -170,7 +171,9 @@ PRESETS_FILE = DATA_DIR / "presets.json"
 PROMPTS_FILE = DATA_DIR / "prompts.json"       # System/Pre-prompt library: Group -> Category -> Prompt trees
 LIBRARIES_FILE = DATA_DIR / "libraries.json"
 EVALS_FILE = DATA_DIR / "evals.json"           # Prompt Validation & Evaluation projects
+BATCH_PROJECTS_FILE = DATA_DIR / "batch_projects.json"  # Batch tab: saved source/prompt/export configs
 CONTEXT_HISTORY_FILE = DATA_DIR / "context_history.json"  # per-chat LLM-call token-usage history {chat_id: [entry, ...]}
+MEMORY_CORES_FILE = DATA_DIR / "memory_cores.json"  # user-memory cores: [{id, name, entries: [...]}] — see app/memory.py
 RAG_DB_FILE = DATA_DIR / "rag.duckdb"          # persistent RAG vector store (library chunk embeddings)
 # LanceDB alternative to RAG_DB_FILE — a *directory*, and PLAINTEXT (chunk text and
 # embeddings are not encrypted). Both stores can exist side by side; Settings → RAG
@@ -179,6 +182,10 @@ RAG_DB_FILE = DATA_DIR / "rag.duckdb"          # persistent RAG vector store (li
 RAG_LANCE_DIR = DATA_DIR / "rag.lance"
 COMPILED_FILE = DATA_DIR / "compiled.json"     # "Compile Data" manifests (rebuildable cache): {"library:<id>"/"persona:<id>": {...}}
 PERSONAS_DIR = DATA_DIR / "personas"           # one <persona_id>/ folder each (persona.xml + sources/ + memories/)
+# Image bytes, one encrypted <image_id>.bin each — see app/images.py. Deliberately NOT
+# inlined into chats.json: that file is rewritten and re-encrypted in full on every
+# settings keystroke, which a few megabytes of base64 would make unusable.
+IMAGES_DIR = DATA_DIR / "images"
 
 # --- Database Processing tab ------------------------------------------------
 # Non-secret session/project metadata lives with the data profile (like the other
@@ -194,8 +201,10 @@ def set_active_data_profile(profile_dir):
     """Point every per-data-profile path at ``profile_dir`` and ensure its subdirs
     exist. Reassigns module globals in place (callers read core.<CONST> at call time)."""
     global CHATS_FILE, CHAT_GROUPS_FILE, PRESETS_FILE, PROMPTS_FILE, LIBRARIES_FILE
-    global EVALS_FILE, CONTEXT_HISTORY_FILE, DB_PROJECTS_FILE, RAG_DB_FILE, RAG_LANCE_DIR
-    global COMPILED_FILE, PERSONAS_DIR
+    global EVALS_FILE, BATCH_PROJECTS_FILE, CONTEXT_HISTORY_FILE, DB_PROJECTS_FILE
+    global RAG_DB_FILE, RAG_LANCE_DIR
+    global MEMORY_CORES_FILE
+    global COMPILED_FILE, PERSONAS_DIR, IMAGES_DIR
     global DB_DIR, DB_STAGING_DIR, DB_AUDIT_DIR, VAULT_FILE
     d = Path(profile_dir)
     d.mkdir(parents=True, exist_ok=True)
@@ -205,17 +214,20 @@ def set_active_data_profile(profile_dir):
     PROMPTS_FILE = d / "prompts.json"
     LIBRARIES_FILE = d / "libraries.json"
     EVALS_FILE = d / "evals.json"
+    BATCH_PROJECTS_FILE = d / "batch_projects.json"
     CONTEXT_HISTORY_FILE = d / "context_history.json"
+    MEMORY_CORES_FILE = d / "memory_cores.json"
     DB_PROJECTS_FILE = d / "db_projects.json"
     RAG_DB_FILE = d / "rag.duckdb"
     RAG_LANCE_DIR = d / "rag.lance"
     COMPILED_FILE = d / "compiled.json"
     PERSONAS_DIR = d / "personas"
+    IMAGES_DIR = d / "images"
     DB_DIR = d / "db"
     DB_STAGING_DIR = DB_DIR / "staging"
     DB_AUDIT_DIR = DB_DIR / "audit"
     VAULT_FILE = d / "db_vault.enc"
-    for _d in (DB_DIR, DB_STAGING_DIR, DB_AUDIT_DIR):
+    for _d in (DB_DIR, DB_STAGING_DIR, DB_AUDIT_DIR, IMAGES_DIR):
         _d.mkdir(parents=True, exist_ok=True)
 
 
@@ -308,17 +320,30 @@ BRIGHTDATA_ACCOUNT_ERRORS = (
 )
 
 
-def _brightdata_fetch(url: str, timeout: int = 60) -> str:
-    """Fetch a URL through Bright Data's Web Unlocker and return the raw body.
-    Raises RuntimeError('Bright Data: ...') when the account/zone itself errors.
+def brightdata_request(url: str, method: str = "GET", body=None, headers=None,
+                       timeout: int = 60) -> str:
+    """Make a request through Bright Data's Web Unlocker and return the raw body.
+
+    The Web Unlocker relays more than plain GETs — ``method``/``body``/``headers`` are
+    passed through to the target — which is what lets an API called from inside a
+    protected site (YouTube's InnerTube endpoint) be reached the same way its pages are.
+    Raises RuntimeError('Bright Data: ...') when the account/zone itself errors, as
+    opposed to the target site.
     """
+    payload = {"zone": BRIGHTDATA_ZONE, "url": url, "format": "raw"}
+    if method and method.upper() != "GET":
+        payload["method"] = method.upper()
+    if body is not None:
+        payload["body"] = body
+    if headers:
+        payload["headers"] = headers
     resp = requests.post(
         BRIGHTDATA_ENDPOINT,
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {BRIGHTDATA_TOKEN}",
         },
-        json={"zone": BRIGHTDATA_ZONE, "url": url, "format": "raw"},
+        json=payload,
         timeout=timeout,
     )
     resp.raise_for_status()
@@ -328,6 +353,11 @@ def _brightdata_fetch(url: str, timeout: int = 60) -> str:
         reason = _html_to_text(text)[:200] or "unknown error"
         raise RuntimeError(f"Bright Data: {reason}")
     return text
+
+
+def _brightdata_fetch(url: str, timeout: int = 60) -> str:
+    """Fetch a URL through Bright Data's Web Unlocker and return the raw body."""
+    return brightdata_request(url, timeout=timeout)
 
 
 def _html_to_text(fragment: str) -> str:
@@ -768,6 +798,15 @@ _DEFAULT_UA = (
 # Library scrapes keep far more text than a chat web-search snippet: the content is
 # chunked + embedded by "Compile Data", so the fuller the article the better.
 LIBRARY_PAGE_CHARS = 200_000
+
+# Ceiling on pages a single Brave search-and-crawl will fetch. Matches the Resources
+# tab's `max="20"` input, which browsers do not enforce against a typed value.
+# ``crawl_search`` itself only clamps the LOWER bound, so every entry point has to
+# apply one of these — a mistyped 500 is 500 page fetches against a metered API.
+MAX_CRAWL_PAGES = 20
+# The Batch tab's own ceiling. Higher on purpose: a batch run is deliberately bulk
+# work, where a 20-page corpus is often the point rather than a mistake.
+MAX_BATCH_CRAWL_PAGES = 50
 
 
 def _title_from_html(html: str, fallback: str = "") -> str:

@@ -21,7 +21,7 @@ the source can't change until you approve.
 | `staging.py` | One DuckDB file per session; typed table + bookkeeping cols; insert / paged read / cell edit / add column / dirty tracking / fingerprints |
 | `processing.py` | **AI bridge** (see below) |
 | `dryrun.py` | Render exact UPDATE statements (parameterized + literal), capped, source-column-only |
-| `conflict.py` | Diff current source vs import-time fingerprints → unchanged/changed/new/deleted |
+| `conflict.py` | Diff current source vs import-time fingerprints → unchanged/changed/new/deleted (see *Conflict detection* below) |
 | `writeback.py` | Transactional bulk + row-by-row write-back, conflict-guarded, audited |
 | `audit.py` | Append-only JSONL audit log per session |
 | `routes.py` | All `/api/db/*` Flask routes; registered by `app.server.create_app` via `register_db_routes(app, ctx)` |
@@ -75,6 +75,35 @@ prompt template can reference an earlier column via `{ThatColumn}`.
 Column roles (`ColumnDef.ctype`): `source` (imported), `web_source`
 (`core.web_search(fill_prompt(search_query, row))`), `prompt` / `output` (LLM).
 
+## Conflict detection
+
+At import, each staged row keeps a `__src_key` (its primary-key identity) and a
+`__row_hash` (a fingerprint of the source row). A conflict check re-reads the
+source, recomputes the hashes, and diffs. **How the source is re-read depends on
+the selection mode**, and this matters:
+
+| Selection | Re-read | `changed` / `deleted` | `new` |
+|---|---|---|---|
+| `full` | one full scan | exact | exact |
+| `first_n` / `random_n` / `custom` | keyed: `WHERE pk IN (…)` over the staged keys, batched | exact | **not available** |
+
+A sampled selection is **not re-runnable**: `random_n` renders `ORDER BY RANDOM()
+LIMIT n` and draws a different sample every call, and `first_n` without an
+`ORDER BY` is unordered on Postgres/MySQL. Re-issuing the selection compared the
+baseline against unrelated rows — nearly every staged key looked deleted, so
+`has_conflict` was permanently true and a sampled import could never be written
+back. Those modes re-read exactly the staged keys instead
+(`StagingManager.staged_keys` → `StreamingImporter.stream_by_keys`), which makes
+changed/deleted exact at the cost of not seeing rows *added* to the source since
+import. Re-import to pick those up.
+
+Write-back re-baselines through the same path, so the rows it just wrote do not
+read as third-party drift on the next check.
+
+Detection needs primary-key columns. Without them every row falls back to a
+synthetic `{"__rowid": n}` key, so the report comes back empty with an
+explanatory note and write-back refuses to run.
+
 ## HTTP API (all under `/api/db`)
 
 `state` · vault `unlock`/`lock`/`change-password` · `profiles` (GET masked / POST /
@@ -113,4 +142,11 @@ engine, and re-run the `pip download` step so their wheels are vendored too.
 * Profiles are masked (`has_password` flags only) before they leave the server.
 * SQL WHERE / ORDER BY fragments are passed through verbatim — this is a local,
   single-user tool pointed at the user's own database, so raw SQL is trusted by
-  design. Do not expose these endpoints to untrusted clients.
+  design. Do not expose these endpoints to untrusted clients. That licence is
+  deliberate and narrow: it covers the fragments the user authored. Everything
+  else that reaches SQL is bound as a parameter or validated — write-back values
+  and keys are bound, identifiers go through the dialect preparer, and a staging
+  column's DDL type is checked against `types_map.sanitize_ddl_type`.
+* Write-back never claims more than it did. An UPDATE that matches no source row
+  is audited as `nomatch`, left out of the applied counts, and NOT retired from
+  staging, so the pending edit survives instead of being silently dropped.

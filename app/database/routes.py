@@ -25,6 +25,7 @@ from .importer import StreamingImporter, DEFAULT_CHUNK
 from .models import ColumnDef, ColumnType, ConnectionProfile, ImportSession, SelectionSpec
 from .processing import StagingProcessor
 from .staging import StagingManager
+from .types_map import sanitize_ddl_type
 from .vault import VaultError, VaultLocked
 from .writeback import WriteBackEngine
 
@@ -55,6 +56,31 @@ def register_db_routes(app, ctx):
         """Placeholder response for an endpoint that isn't built yet."""
         return jsonify({"error": f"Not implemented yet (arrives in Phase {phase})."}), 501
 
+    def _int_arg(name, default, *, lo=0, hi=None):
+        """A non-negative int from the query string. Garbage returns the default rather
+        than raising ValueError out of the route (which surfaced as a 500)."""
+        try:
+            v = int(request.args.get(name, default))
+        except (TypeError, ValueError):
+            return default
+        v = max(lo, v)
+        return min(v, hi) if hi is not None else v
+
+    def _resolve_stale_status(proj):
+        """Downgrade a status left mid-flight by a disconnected client.
+
+        ``importing``/``processing`` are set before the SSE stream starts and cleared
+        by the generator's own exit. If the browser goes away the generator is
+        abandoned, so the session would advertise work that is no longer running,
+        forever. ``runs.active`` distinguishes that from a genuinely in-flight run
+        (e.g. another tab watching the same session), which must be left alone."""
+        if proj.get("status") in ("importing", "processing") \
+                and not runs.active(proj.get("run_id")):
+            proj["status"] = "staged" if proj.get("row_count") else "new"
+            proj["run_id"] = ""
+            store.upsert_db_project(proj)
+        return proj
+
     def _resolve_profile(body) -> ConnectionProfile:
         """Return a full ConnectionProfile (with secrets) from a request body that
         carries either a saved ``profile_id`` or an inline ``profile`` dict. For an
@@ -71,7 +97,15 @@ def register_db_routes(app, ctx):
                 for f in ConnectionProfile.SECRET_FIELDS:
                     if not getattr(prof, f, ""):
                         setattr(prof, f, getattr(stored, f, ""))
+            except VaultLocked:
+                # VaultLocked subclasses VaultError, so the broad catch below used to
+                # swallow it and connect with a BLANK password — the user then got an
+                # authentication failure from their own database instead of being told
+                # to unlock the vault.
+                raise
             except VaultError:
+                # No such saved profile (e.g. an id from a deleted one). Fine: use the
+                # inline fields as given.
                 pass
         return prof
 
@@ -195,7 +229,7 @@ def register_db_routes(app, ctx):
         proj = store.get_db_project(session_id)
         if not proj:
             return jsonify({"error": "not found"}), 404
-        return jsonify({"session": proj})
+        return jsonify({"session": _resolve_stale_status(proj)})
 
     @app.route("/api/db/session/<session_id>", methods=["DELETE"])
     def db_session_delete(session_id):
@@ -249,7 +283,11 @@ def register_db_routes(app, ctx):
                     columns=[ColumnDef(name=c["name"], ctype=ColumnType.SOURCE.value,
                                        source_type=c["source_type"], duckdb_type=c["duckdb_type"]).to_dict()
                              for c in cols])
-                store.add_db_project(session.to_dict())
+                # Recorded so a session left "importing" by a disconnected client can be
+                # told apart from one whose import is genuinely still running.
+                rec = session.to_dict()
+                rec["run_id"] = run_id
+                store.add_db_project(rec)
 
                 sm = StagingManager(session.id, session.staging_table)
                 sm.create_table(cols)
@@ -265,12 +303,16 @@ def register_db_routes(app, ctx):
                 session.status = "cancelled" if stopped else "staged"
                 session.source_fingerprint = {"count": done, "captured_at": datetime.utcnow().isoformat()}
                 session.updated = datetime.utcnow().isoformat()
-                store.upsert_db_project(session.to_dict())
+                rec = session.to_dict()
+                rec["run_id"] = ""
+                store.upsert_db_project(rec)
                 yield sse("done", {"session_id": session.id, "row_count": done, "stopped": stopped})
             except Exception as e:
                 if session is not None:
                     session.status = "error"
-                    store.upsert_db_project(session.to_dict())
+                    rec = session.to_dict()
+                    rec["run_id"] = ""
+                    store.upsert_db_project(rec)
                 yield sse("error", {"message": str(e)})
             finally:
                 runs.done(run_id)
@@ -285,8 +327,9 @@ def register_db_routes(app, ctx):
         proj = store.get_db_project(session_id)
         if not proj:
             return jsonify({"error": "not found"}), 404
-        offset = int(request.args.get("offset", 0))
-        limit = min(int(request.args.get("limit", 100)), 500)
+        _resolve_stale_status(proj)
+        offset = _int_arg("offset", 0)
+        limit = _int_arg("limit", 100, lo=1, hi=500)
         sm = StagingManager(session_id, proj.get("staging_table", "staged"))
         try:
             return jsonify(sm.get_page(offset=offset, limit=limit))
@@ -321,7 +364,8 @@ def register_db_routes(app, ctx):
         if not name:
             return jsonify({"error": "Column name required."}), 400
         ctype = body.get("ctype") or ColumnType.OUTPUT.value
-        ddl_type = body.get("duckdb_type") or "VARCHAR"
+        # The type lands in DDL, which cannot be parameterized — validate, don't trust.
+        ddl_type = sanitize_ddl_type(body.get("duckdb_type"))
         sm = StagingManager(session_id, proj.get("staging_table", "staged"))
         try:
             sm.add_column(name, ddl_type)
@@ -368,9 +412,10 @@ def register_db_routes(app, ctx):
         cols = proj.get("columns", [])
         by_name = {c["name"]: c for c in cols}
         for rc in run_cols:
-            sm.add_column(rc["name"], rc.get("duckdb_type") or "VARCHAR")
+            ddl_type = sanitize_ddl_type(rc.get("duckdb_type"))
+            sm.add_column(rc["name"], ddl_type)
             cfg = ColumnDef(name=rc["name"], ctype=rc["ctype"],
-                            duckdb_type=rc.get("duckdb_type") or "VARCHAR",
+                            duckdb_type=ddl_type,
                             prompt_template=rc.get("prompt_template", ""),
                             input_columns=rc.get("input_columns", []),
                             search_query=rc.get("search_query", ""),
@@ -378,6 +423,7 @@ def register_db_routes(app, ctx):
             by_name[rc["name"]] = cfg
         proj["columns"] = list(by_name.values())
         proj["status"] = "processing"
+        proj["run_id"] = run_id
         store.upsert_db_project(proj)
 
         processor = StagingProcessor(
@@ -393,10 +439,12 @@ def register_db_routes(app, ctx):
                         web_min_pages=core.MIN_CRAWLED_PAGES, stop_event=stop):
                     yield sse(kind, data)
                 proj["status"] = "cancelled" if stop.is_set() else "ready"
+                proj["run_id"] = ""
                 store.upsert_db_project(proj)
                 yield sse("done", {"stopped": stop.is_set()})
             except Exception as e:
                 proj["status"] = "error"
+                proj["run_id"] = ""
                 store.upsert_db_project(proj)
                 yield sse("error", {"message": str(e)})
             finally:
@@ -464,7 +512,12 @@ def register_db_routes(app, ctx):
             return proj
         body = request.get_json(force=True) or {}
         mode = body.get("mode", "bulk")
-        approved = bool(body.get("approved") or proj.get("auto_approve"))
+        # Approval must be explicit in THIS request. It used to fall back to a
+        # persisted proj["auto_approve"], which nothing in the app ever sets and which
+        # upsert_db_project would store from any client-supplied key — an arbitrary
+        # field could switch off the only guard on the one endpoint that opens the
+        # source database writable.
+        approved = bool(body.get("approved"))
         on_conflict = body.get("on_conflict", "abort")
         continue_on_error = bool(body.get("continue_on_error"))
         import uuid as _uuid
@@ -478,13 +531,28 @@ def register_db_routes(app, ctx):
                 yield sse("start", {"run_id": run_id})
                 changes = sm.dirty_changes()
                 applied = 0
+                applied_pairs = []
                 for kind, data in engine.run(profile, proj, changes, mode=mode,
                                              approved=approved, on_conflict=on_conflict,
                                              continue_on_error=continue_on_error, stop_event=stop):
                     if kind == "done":
                         applied = data.get("applied_rows", 0)
+                        applied_pairs = data.get("applied_pairs") or []
+                        # Not part of the wire contract — it exists to drive the
+                        # retirement below and would only bloat the SSE frame.
+                        data = {k: v for k, v in data.items() if k != "applied_pairs"}
                     yield sse(kind, data)
                 if applied:
+                    # Retire the cells that actually committed, then re-read the source
+                    # so the rows we just wrote become the new conflict baseline. Without
+                    # this the session stays dirty forever and the next conflict check
+                    # flags our own writes as third-party changes.
+                    try:
+                        sm.retire_changes(applied_pairs)
+                        sm.rebaseline(ConflictDetector(conns).current_fingerprints(profile, proj))
+                    except Exception as e:
+                        yield sse("warn", {"message": f"Write-back applied, but the staging "
+                                                      f"baseline could not be refreshed: {e}"})
                     proj["status"] = "written"
                     proj["updated"] = datetime.utcnow().isoformat()
                     store.upsert_db_project(proj)
@@ -501,6 +569,6 @@ def register_db_routes(app, ctx):
         """Read the session's append-only audit log, one page at a time."""
         from .audit import AuditLog
         log = AuditLog(session_id)
-        limit = int(request.args.get("limit", 500))
-        offset = int(request.args.get("offset", 0))
+        limit = _int_arg("limit", 500, lo=1, hi=5000)
+        offset = _int_arg("offset", 0)
         return jsonify({"entries": log.read(limit=limit, offset=offset), "total": log.count()})

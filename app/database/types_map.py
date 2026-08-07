@@ -12,6 +12,8 @@ imports nothing heavy at module load.
 
 from __future__ import annotations
 
+import re
+
 # SQLAlchemy generic type class-name  ->  DuckDB type.
 # We match on the uppercased class name (e.g. "INTEGER", "BIGINT", "NUMERIC").
 _MAP = {
@@ -27,6 +29,39 @@ _MAP = {
     "TEXT": "VARCHAR", "CLOB": "VARCHAR", "STRING": "VARCHAR",
     "VARCHAR": "VARCHAR", "NVARCHAR": "VARCHAR", "CHAR": "VARCHAR", "NCHAR": "VARCHAR",
 }
+
+
+# DuckDB type names a client is allowed to name when adding a staging column. The
+# type goes into DDL (`ALTER TABLE ... ADD COLUMN "x" <type>`), which cannot be
+# parameterized, so it is validated against this list rather than interpolated as
+# given. Unlike the WHERE/ORDER BY fragments — which the feature documents as
+# deliberately trusted, user-authored SQL — nothing in the UI ever sends anything
+# but VARCHAR here, so there is no expressiveness to preserve.
+_ALLOWED_DDL = {
+    "BOOLEAN", "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT",
+    "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT",
+    "REAL", "FLOAT", "DOUBLE", "DECIMAL", "NUMERIC",
+    "VARCHAR", "TEXT", "STRING", "BLOB", "BIT", "UUID", "JSON",
+    "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL",
+}
+# DECIMAL(p,s) / VARCHAR(n) — a bare width/precision suffix on an allowed base type.
+_PARAM_DDL = re.compile(r"^([A-Z_]+)\s*\(\s*\d+\s*(?:,\s*\d+\s*)?\)$")
+
+
+def sanitize_ddl_type(raw: str, default: str = "VARCHAR") -> str:
+    """Return ``raw`` if it names an allowed DuckDB type, else ``default``.
+
+    Accepts a bare name (``BIGINT``) or a parameterized one (``DECIMAL(18,2)``).
+    Case-insensitive; always returns the canonical upper-case form."""
+    name = (raw or "").strip().upper()
+    if not name:
+        return default
+    if name in _ALLOWED_DDL:
+        return name
+    m = _PARAM_DDL.match(name)
+    if m and m.group(1) in _ALLOWED_DDL:
+        return name
+    return default
 
 
 def duckdb_type_for(sa_type) -> str:

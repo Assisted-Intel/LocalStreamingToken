@@ -119,9 +119,15 @@ class StagingManager:
 
     def _display_columns(self, con) -> list:
         """All non-bookkeeping columns (source + AI-output), in table order."""
+        return [n for n, _t in self._display_columns_typed(con)]
+
+    def _display_columns_typed(self, con) -> list:
+        """[(name, duckdb_type)] for the non-bookkeeping columns, in table order.
+        The grid needs the types to tell "cleared a text cell" (-> '') from
+        "cleared a numeric cell" (-> NULL); PRAGMA already returns them."""
         rows = con.execute(f"PRAGMA table_info({_qi(self.staging_table)})").fetchall()
         # PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk
-        return [r[1] for r in rows if not str(r[1]).startswith("__")]
+        return [(r[1], str(r[2])) for r in rows if not str(r[1]).startswith("__")]
 
     # ------------------------------ lifecycle ------------------------------
     def create_table(self, columns: list) -> None:
@@ -174,23 +180,27 @@ class StagingManager:
 
     # ------------------------------ read (Phase 4) ------------------------------
     def get_page(self, offset: int = 0, limit: int = 100) -> dict:
-        """Return {columns, rows, total} for a page of the staging table. Each row
-        includes __rowid and __dirty plus the display columns (JSON-safe)."""
+        """Return {columns, column_types, rows, total, dirty} for a page of the
+        staging table. Each row includes __rowid and __dirty plus the display
+        columns (JSON-safe)."""
         con, lock = self._conn()
         st = _qi(self.staging_table)
         with lock:
-            cols = self._display_columns(con)
+            typed = self._display_columns_typed(con)
+            cols = [c for c, _t in typed]
             sel = ", ".join([_qi("__rowid"), _qi("__dirty")] + [_qi(c) for c in cols])
             cur = con.execute(
                 f"SELECT {sel} FROM {st} ORDER BY __rowid LIMIT ? OFFSET ?", [int(limit), int(offset)])
             names = [d[0] for d in cur.description]
             fetched = cur.fetchall()
             total = self.row_count()
+            dirty = int(con.execute(f"SELECT COUNT(*) FROM {st} WHERE __dirty = 1").fetchone()[0])
         rows = []
         for r in fetched:
             d = {names[i]: _jsonsafe(v) for i, v in enumerate(r)}
             rows.append(d)
-        return {"columns": cols, "rows": rows, "total": total}
+        return {"columns": cols, "column_types": dict(typed), "rows": rows,
+                "total": total, "dirty": dirty}
 
     def iter_rows(self, only_dirty: bool = False) -> Iterator[dict]:
         """Yield staged rows as dicts keyed by column name (display columns +
@@ -274,6 +284,71 @@ class StagingManager:
         with lock:
             rows = con.execute(f"SELECT __src_key, __row_hash FROM {st}").fetchall()
         return {r[0]: r[1] for r in rows}
+
+    def staged_keys(self) -> list:
+        """The parsed ``__src_key`` dicts of every staged row, in __rowid order.
+
+        This is what the conflict detector asks the source about. Re-running the
+        session's original SELECT is not equivalent: a ``random_n`` selection draws a
+        FRESH sample each time (``ORDER BY RANDOM() LIMIT n``), so it would compare
+        the baseline against a different set of rows entirely. Rows whose key is the
+        synthetic ``{"__rowid": n}`` fallback (no primary key on the source) are
+        skipped — they cannot address a source row."""
+        con, lock = self._conn()
+        st = _qi(self.staging_table)
+        with lock:
+            rows = con.execute(
+                f"SELECT __src_key FROM {st} ORDER BY __rowid").fetchall()
+        out = []
+        for (raw,) in rows:
+            if not raw:
+                continue
+            try:
+                key = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(key, dict) and key and "__rowid" not in key:
+                out.append(key)
+        return out
+
+    # ------------------------------ post-write-back ------------------------------
+    def retire_changes(self, pairs) -> int:
+        """Forget the recorded originals for cells that have been written back.
+
+        ``__cell_orig`` is what ``dirty_changes`` reads, so leaving applied cells in it
+        keeps the session permanently dirty and makes a second write-back re-issue every
+        UPDATE. ``pairs`` is [(rowid, column)]. A row whose last outstanding change is
+        retired also loses its ``__dirty`` flag."""
+        pairs = [(int(r), str(c)) for r, c in (pairs or [])]
+        if not pairs:
+            return 0
+        con, lock = self._conn()
+        st = _qi(self.staging_table)
+        with lock:
+            con.executemany("DELETE FROM __cell_orig WHERE rowid = ? AND col = ?",
+                            [[r, c] for r, c in pairs])
+            con.execute(
+                f"UPDATE {st} SET __dirty = 0 WHERE __dirty = 1 AND __rowid NOT IN "
+                f"(SELECT DISTINCT rowid FROM __cell_orig)")
+        return len(pairs)
+
+    def rebaseline(self, fingerprints: dict) -> int:
+        """Replace ``__row_hash`` from a freshly-read {src_key: row_hash} map.
+
+        After a write-back the source rows hold what we just wrote, so the import-time
+        fingerprints no longer match and the NEXT conflict check would report every row
+        the user themselves wrote as "changed in source" — which, under the default
+        ``on_conflict='abort'``, would lock the session out of ever writing again. The
+        map must come from re-reading the source, not from the staging values, so type
+        coercion by the database is reflected."""
+        if not fingerprints:
+            return 0
+        con, lock = self._conn()
+        st = _qi(self.staging_table)
+        with lock:
+            con.executemany(f"UPDATE {st} SET __row_hash = ? WHERE __src_key = ?",
+                            [[h, k] for k, h in fingerprints.items()])
+        return len(fingerprints)
 
     # ------------------------------ teardown ------------------------------
     def close(self) -> None:

@@ -12,7 +12,7 @@ import threading
 import uuid
 from datetime import datetime
 
-from . import core, crypto
+from . import core, crypto, memory
 # The per-profile file paths (CHATS_FILE, SETTINGS_FILE, …) are read via the core
 # module at call time (core.CHATS_FILE), NOT bound here, because they are reassigned
 # whenever the active profile changes. Only the profile-invariant helpers are imported.
@@ -88,6 +88,12 @@ DEFAULT_SETTINGS = {
     # Persona pipeline / memory tuning.
     "memory_weight_influence": 0.35,     # how strongly emotional weight reorders memory retrieval (0=off)
     "pipeline_max_retries": 3,           # structured-JSON retries per llm step before pausing
+    # Image attachments. Originals are always stored at full resolution; this only
+    # caps the long edge of the copy that is SENT, because an unscaled phone photo
+    # costs the same context as several pages of text for no extra detail the model
+    # can use. Per-chat and per-batch-project toggles override it with "full res".
+    "image_max_dim": 1568,               # long-edge clamp for outgoing images (px)
+    "image_full_res_default": False,     # new chats start with the full-res toggle on
 }
 
 DEFAULT_PRESETS = [
@@ -141,8 +147,10 @@ class Store:
         self.prompts = None
         self.libraries = []
         self.evals = []
+        self.batch_projects = []
         self.db_projects = []
         self.context_history = {}
+        self.memory_cores = []
 
     def _load_data_collections(self):
         """(Re)load every data collection from the CURRENT core.* profile paths and run
@@ -153,9 +161,15 @@ class Store:
         self.prompts = load_json(core.PROMPTS_FILE, None)
         self.libraries = load_json(core.LIBRARIES_FILE, [])
         self.evals = load_json(core.EVALS_FILE, [])
+        self.batch_projects = load_json(core.BATCH_PROJECTS_FILE, [])
         self.db_projects = load_json(core.DB_PROJECTS_FILE, [])
         # Per-chat context-usage history: {chat_id: [ContextHistoryEntry, ...]}.
         self.context_history = load_json(core.CONTEXT_HISTORY_FILE, {})
+        # User memory cores. Normalized on load so a hand-edited file can't reach the
+        # injector or the Memory tab in a bad shape.
+        self.memory_cores = [memory.normalize_core(c)
+                             for c in load_json(core.MEMORY_CORES_FILE, [])
+                             if isinstance(c, dict)]
 
         # One-time migration: backfill stable per-item ids on existing libraries so
         # the RAG store keys embeddings by identity (survives reorder/mid-list edits).
@@ -172,8 +186,13 @@ class Store:
             self.prompts = self._migrate_prompts_from_presets()
             self.save_prompts()
 
-        # Backfill the new system_prompt/pre_prompt toggle fields on legacy chats.
-        if len([1 for c in self.chats if self._ensure_prompt_fields(c)]) > 0:
+        # Backfill the new system_prompt/pre_prompt toggle fields on legacy chats, and
+        # drop library_ids pointing at libraries that no longer exist (deletions before
+        # prune_library_refs left them behind, pinning RAG on with nothing to retrieve).
+        dirty = len([1 for c in self.chats if self._ensure_prompt_fields(c)]) > 0
+        if self._prune_orphan_library_refs():
+            dirty = True
+        if dirty:
             self.save_chats()
 
     def _apply_tokens(self):
@@ -204,8 +223,32 @@ class Store:
             save_json(core.PROMPTS_FILE, self.prompts)
             save_json(core.LIBRARIES_FILE, self.libraries)
             save_json(core.EVALS_FILE, self.evals)
+            save_json(core.BATCH_PROJECTS_FILE, self.batch_projects)
             save_json(core.DB_PROJECTS_FILE, self.db_projects)
             save_json(core.CONTEXT_HISTORY_FILE, self.context_history)
+            save_json(core.MEMORY_CORES_FILE, self.memory_cores)
+
+    @staticmethod
+    def _merge_images(chats, batch_projects, dest_dir):
+        """Copy every image file the given chats/projects reference into ``dest_dir``.
+
+        Read + write go through core.read_bytes/write_bytes rather than a file copy so
+        the bytes land re-encrypted under the same key rather than being moved as
+        opaque ciphertext — the two profiles share the app key, but going through the
+        helpers is what keeps this correct if that ever stops being true."""
+        from pathlib import Path
+        from . import images as images_mod
+        live = images_mod.collect_ids(chats, batch_projects)
+        if not live:
+            return
+        dest = Path(dest_dir)
+        dest.mkdir(parents=True, exist_ok=True)
+        for image_id in live:
+            try:
+                data, _mt = images_mod.load(image_id)
+            except Exception:
+                continue          # already gone: the chat keeps a dead reference, not a crash
+            core.write_bytes(dest / f"{image_id}.bin", data)
 
     def merge_into(self, target_dir):
         """Merge the current in-memory (incognito) data INTO the profile at target_dir
@@ -222,6 +265,15 @@ class Store:
             inco_prompts = self.prompts or {"system": [], "pre": []}
             inco_libs = list(self.libraries)
             inco_evals = list(self.evals)
+            inco_batch = list(self.batch_projects)
+            inco_cores = list(self.memory_cores)
+
+            # ---- images: copy the bytes across before the records travel ----
+            # Image records reference a file in the ACTIVE profile's image dir, which
+            # is about to stop being this one. Without this, every merged chat would
+            # come out of incognito pointing at pictures that no longer exist. Ids are
+            # uuids, so they can be reused verbatim in the target.
+            self._merge_images(inco_chats, inco_batch, target_dir / "images")
 
             # ---- chats: append into the target's default tab with fresh ids ----
             self.chats = load_json(target_dir / "chats.json", [])
@@ -263,6 +315,29 @@ class Store:
                     ev["id"] = uuid.uuid4().hex[:12]
                 ev_ids.add(ev.get("id"))
                 self.evals.insert(0, ev)
+
+            # ---- batch projects: append with fresh ids (same rule as evals) ----
+            self.batch_projects = load_json(target_dir / "batch_projects.json", [])
+            bp_ids = {b.get("id") for b in self.batch_projects}
+            for bp in inco_batch:
+                bp = dict(bp)
+                if bp.get("id") in bp_ids:
+                    bp["id"] = uuid.uuid4().hex[:12]
+                bp_ids.add(bp.get("id"))
+                self.batch_projects.insert(0, bp)
+
+            # ---- memory cores: append with fresh ids, disambiguating names ----
+            self.memory_cores = [memory.normalize_core(c) for c
+                                 in load_json(target_dir / "memory_cores.json", [])
+                                 if isinstance(c, dict)]
+            have_names = {c.get("name") for c in self.memory_cores}
+            for src in inco_cores:
+                mc = memory.normalize_core(src)
+                mc["id"] = uuid.uuid4().hex[:12]
+                if mc["name"] in have_names:
+                    mc["name"] = f"{mc['name']} (incognito)"
+                have_names.add(mc["name"])
+                self.memory_cores.append(mc)
 
             # db_projects: keep the target's as-is (incognito DB sessions aren't merged).
             self.db_projects = load_json(target_dir / "db_projects.json", [])
@@ -341,11 +416,23 @@ class Store:
                 return
             save_json(core.EVALS_FILE, self.evals)
 
+    def save_batch_projects(self):
+        with self._lock:
+            if self.incognito:
+                return
+            save_json(core.BATCH_PROJECTS_FILE, self.batch_projects)
+
     def save_db_projects(self):
         with self._lock:
             if self.incognito:
                 return
             save_json(core.DB_PROJECTS_FILE, self.db_projects)
+
+    def save_memory_cores(self):
+        with self._lock:
+            if self.incognito:
+                return
+            save_json(core.MEMORY_CORES_FILE, self.memory_cores)
 
     # ---------------- settings (masked view) ----------------
     def masked_config(self):
@@ -523,10 +610,42 @@ class Store:
             return True
 
     # ---------------- chat export / import ----------------
+    # Total base64 an export will carry before it stops embedding images. An export
+    # is a plaintext JSON file meant to be moved between machines; past a few hundred
+    # megabytes it stops being one.
+    EXPORT_IMAGE_BUDGET = 200 * 1024 * 1024
+
+    def _export_images(self, chats):
+        """Embed the images the exported chats reference, as {id: {…record, data}}.
+
+        Ids alone would be useless on another machine — the bytes live in this
+        profile's image dir. Returns (map, warnings)."""
+        import base64
+        from . import images as images_mod
+        out, warnings, spent = {}, [], 0
+        for image_id in sorted(images_mod.collect_ids(chats)):
+            try:
+                data, media_type = images_mod.load(image_id)
+            except Exception:
+                continue          # a dead reference exports as a dead reference
+            encoded = base64.b64encode(data).decode("ascii")
+            if spent + len(encoded) > self.EXPORT_IMAGE_BUDGET:
+                warnings.append(
+                    "Some images were left out: the export reached its "
+                    f"{self.EXPORT_IMAGE_BUDGET // (1024 * 1024)} MB image limit.")
+                break
+            spent += len(encoded)
+            out[image_id] = {"media_type": media_type, "data": encoded}
+        return out, warnings
+
     def export_chats(self, ids=None):
         """Return an export envelope. ids=None exports every saved chat; otherwise
         only the listed ids. Chats never hold secrets, and group_id (a local tab
-        reference) is dropped — grouping is decided at import time."""
+        reference) is dropped — grouping is decided at import time.
+
+        Any attached or generated images travel inside the envelope as base64: the
+        file has to open on another machine, where this profile's image store does
+        not exist."""
         with self._lock:
             if ids is None:
                 selected = list(self.chats)
@@ -539,13 +658,19 @@ class Store:
                 copy.pop("group_id", None)
                 copy["private"] = False
                 out.append(copy)
-            return {
+            image_map, warnings = self._export_images(out)
+            envelope = {
                 "app": "LocalStreamingToken",
                 "kind": "chats",
                 "version": 1,
                 "exported": datetime.utcnow().isoformat(),
                 "chats": out,
             }
+            if image_map:
+                envelope["images"] = image_map
+            if warnings:
+                envelope["warnings"] = warnings
+            return envelope
 
     def import_chats(self, envelope, group_name):
         """Import chats from an export envelope into a new sidebar tab. Each chat
@@ -556,6 +681,10 @@ class Store:
             if not isinstance(chats, list):
                 raise ValueError("Not a valid chat export file.")
             group = self.add_group(group_name)
+            # Write any embedded images into THIS profile's store first, keeping a
+            # map from the file's ids to the fresh ones, so the references rewritten
+            # below point at bytes that actually exist here.
+            id_map = self._import_images((envelope or {}).get("images"))
             count = 0
             # Insert preserving the file's order (first chat ends up on top).
             for src in reversed(chats):
@@ -567,10 +696,235 @@ class Store:
                 chat["private"] = False
                 chat.setdefault("messages", [])
                 chat.setdefault("title", "Imported Chat")
+                if id_map:
+                    self._remap_image_ids(chat, id_map)
                 self.chats.insert(0, chat)
                 count += 1
             self.save_chats()
             return group, count
+
+    @staticmethod
+    def _import_images(image_map):
+        """Store an envelope's embedded images here. Returns {old_id: new_id}.
+        Fresh ids on purpose: an import must never overwrite an image this profile
+        already has under the same id."""
+        import base64
+        from . import images as images_mod
+        out = {}
+        for old_id, entry in (image_map or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                data = base64.b64decode(entry.get("data") or "", validate=False)
+                if not data:
+                    continue
+                rec = images_mod.store(data, entry.get("media_type") or "image/png",
+                                       name=entry.get("name") or "",
+                                       origin=entry.get("origin") or "user")
+            except Exception:
+                continue
+            out[old_id] = rec["id"]
+        return out
+
+    @staticmethod
+    def _remap_image_ids(chat, id_map):
+        """Point a freshly imported chat's image references at the new local ids.
+
+        Rebuilds rather than mutating in place: the chat dict is a shallow copy of the
+        envelope's, so editing a message would reach back into the file's own data.
+        An id with no mapping is left alone rather than dropped — the reference is
+        already dead, and quietly editing the message would hide that."""
+        def remap(ref):
+            if isinstance(ref, dict) and ref.get("id") in id_map:
+                return {**ref, "id": id_map[ref["id"]]}
+            return ref
+
+        msgs = []
+        for msg in chat.get("messages") or []:
+            if isinstance(msg, dict) and msg.get("images"):
+                msg = {**msg, "images": [remap(r) for r in msg["images"]]}
+            msgs.append(msg)
+        chat["messages"] = msgs
+        if chat.get("attachments"):
+            chat["attachments"] = [remap(a) for a in chat["attachments"]]
+
+    # ---------------- memory cores ----------------
+    # Cores are small (a few dozen short entries), so every mutation rewrites the whole
+    # file, exactly like libraries. The core dicts themselves are shaped by app.memory.
+    def add_memory_core(self, name):
+        with self._lock:
+            mc = memory.new_core(name)
+            self.memory_cores.append(mc)
+            self.save_memory_cores()
+            return mc
+
+    def get_memory_core(self, core_id):
+        with self._lock:
+            for mc in self.memory_cores:
+                if mc.get("id") == core_id:
+                    return mc
+            return None
+
+    def memory_cores_snapshot(self):
+        """A shallow copy of the core list for read paths (generation, /api/state) that
+        must not observe the list mid-rewrite while a pass or a delete is running."""
+        with self._lock:
+            return list(self.memory_cores)
+
+    def mutate_memory_core(self, core_id, fn):
+        """Apply ``fn(core)`` to a core under the lock, then save. Returns
+        ``(core, result)``, or ``(None, None)`` if the core no longer exists.
+
+        Extraction passes used to hold a core they resolved at request start and mutate
+        it minutes later with no lock, racing every entry edit and every other pass. The
+        core must be re-resolved by id *inside* the lock each time, because a delete
+        between resolve and write would otherwise have the pass writing into an orphan.
+        The slow part — the LLM call — stays outside; only applying its result is
+        serialised."""
+        with self._lock:
+            mc = self.get_memory_core(core_id)
+            if not mc:
+                return None, None
+            result = fn(mc)
+            self.save_memory_cores()
+            return mc, result
+
+    def update_memory_core(self, core_id, patch):
+        """Patch a core's name and per-core tuning. Entries are never touched here —
+        they go through the entry helpers or an extraction pass."""
+        with self._lock:
+            mc = self.get_memory_core(core_id)
+            if not mc:
+                return None
+            for key in ("name", "auto_extract", "extract_every", "inject_limit"):
+                if key in (patch or {}):
+                    mc[key] = patch[key]
+            # Re-validate the scalars only; the live entries list is left alone (it was
+            # normalized on load and is maintained by the entry helpers).
+            clean = memory.normalize_core({**mc, "entries": []})
+            for key in ("name", "auto_extract", "extract_every", "inject_limit"):
+                mc[key] = clean[key]
+            memory.touch(mc)
+            self.save_memory_cores()
+            return mc
+
+    def delete_memory_core(self, core_id):
+        """Delete a core and scrub every chat that pointed at it. Leaving the id behind
+        keeps those chats reporting memory_enabled with a core that no longer resolves —
+        the 🧠 toggle reads on while nothing is ever injected, and only the chat open at
+        the time would have been repaired by the browser."""
+        with self._lock:
+            before = len(self.memory_cores)
+            self.memory_cores = [c for c in self.memory_cores if c.get("id") != core_id]
+            if len(self.memory_cores) == before:
+                return False
+            self.save_memory_cores()
+            touched = False
+            for chat in self.chats:
+                if chat.get("memory_core_id") == core_id:
+                    chat["memory_core_id"] = ""
+                    chat["memory_enabled"] = False
+                    chat["memory_turns_since"] = 0
+                    touched = True
+            if touched:
+                self.save_chats()
+            return True
+
+    def upsert_memory_entry(self, core_id, entry):
+        """Add or edit one entry. An entry with no id is created; entries created this
+        way are the user's own, so they carry origin='user' and are protected from
+        automated deletion.
+
+        Returns ``(entry, '')`` on success or ``(None, reason)`` — the reasons are
+        distinct so the caller can say which went wrong. An edit naming an id that is
+        gone reports 'gone' rather than silently reappearing as a new user entry, which
+        is what a second tab deleting it out from under this one looks like."""
+        with self._lock:
+            mc = self.get_memory_core(core_id)
+            if not mc:
+                return None, "core"
+            entry = entry or {}
+            wanted_id = entry.get("id") or ""
+            existing = None
+            for e in mc.get("entries", []):
+                if e.get("id") and e.get("id") == wanted_id:
+                    existing = e
+                    break
+            if existing:
+                saved = memory.apply_entry_patch(existing, entry)
+            elif wanted_id:
+                return None, "gone"
+            else:
+                saved = memory.new_entry(entry.get("text", ""), entry.get("category"),
+                                         entry.get("importance", 5), origin="user",
+                                         pinned=bool(entry.get("pinned")))
+                if not saved["text"]:
+                    return None, "text"
+                mc.setdefault("entries", []).append(saved)
+            memory.touch(mc)
+            self.save_memory_cores()
+            return saved, ""
+
+    def delete_memory_entry(self, core_id, entry_id):
+        with self._lock:
+            mc = self.get_memory_core(core_id)
+            if not mc:
+                return False
+            entries = mc.setdefault("entries", [])
+            before = len(entries)
+            # Mutate in place rather than rebinding: an extraction pass that resolved
+            # this list moments ago would otherwise be appending to a detached object,
+            # and its new memories would vanish on the next save.
+            entries[:] = [e for e in entries if e.get("id") != entry_id]
+            if len(entries) == before:
+                return False
+            memory.touch(mc)
+            self.save_memory_cores()
+            return True
+
+    # ---------------- memory core export / import ----------------
+    def export_memory_cores(self, ids=None):
+        """Export envelope for one or more cores. Cores hold no secrets; ids are kept
+        as-is here and reassigned at import time."""
+        with self._lock:
+            if ids is None:
+                selected = list(self.memory_cores)
+            else:
+                idset = set(ids)
+                selected = [c for c in self.memory_cores if c.get("id") in idset]
+            return {
+                "app": "LocalStreamingToken",
+                "kind": "memory_cores",
+                "version": 1,
+                "exported": datetime.utcnow().isoformat(),
+                "cores": [dict(c) for c in selected],
+            }
+
+    def import_memory_cores(self, envelope):
+        """Import cores from an export envelope. Each core (and every entry in it) gets
+        a fresh id so an existing core is never overwritten, and a clashing name is
+        suffixed. Returns (imported_cores, count)."""
+        with self._lock:
+            cores = (envelope or {}).get("cores")
+            if not isinstance(cores, list):
+                raise ValueError("Not a valid memory core export file.")
+            have_names = {c.get("name") for c in self.memory_cores}
+            imported = []
+            for src in cores:
+                if not isinstance(src, dict):
+                    continue
+                mc = memory.normalize_core(src)
+                mc["id"] = uuid.uuid4().hex[:12]
+                for e in mc["entries"]:
+                    e["id"] = uuid.uuid4().hex[:12]
+                if mc["name"] in have_names:
+                    mc["name"] = f"{mc['name']} (imported)"
+                have_names.add(mc["name"])
+                self.memory_cores.append(mc)
+                imported.append(mc)
+            if imported:
+                self.save_memory_cores()
+            return imported, len(imported)
 
     # ---------------- presets ----------------
     def set_presets(self, presets):
@@ -717,12 +1071,67 @@ class Store:
             self.save_libraries()
             return lib
 
+    def append_library_items(self, lib_id, items):
+        """Append items to the LIVE library under the lock and persist.
+
+        The long-running add routes (file parse, URL scrape, YouTube, Brave crawl) run
+        for minutes. Holding the dict they read at request start and upserting it at the
+        end silently discarded any autosave PUT that landed in between, because
+        ``upsert_library`` REPLACES the list entry and detaches every held reference.
+        Re-reading here keeps the append atomic against concurrent edits.
+
+        Returns the updated library, or None if it was deleted mid-flight."""
+        with self._lock:
+            lib = self.get_library(lib_id)
+            if lib is None:
+                return None
+            for it in items:
+                if not it.get("id"):
+                    it["id"] = uuid.uuid4().hex[:12]
+            lib.setdefault("items", []).extend(items)
+            lib["updated"] = datetime.utcnow().isoformat()
+            self.save_libraries()
+            return lib
+
     def delete_library(self, lib_id):
         with self._lock:
             before = len(self.libraries)
             self.libraries = [l for l in self.libraries if l.get("id") != lib_id]
             self.save_libraries()
+            self.prune_library_refs(lib_id)
             return len(self.libraries) < before
+
+    def prune_library_refs(self, lib_id):
+        """Drop a library id from every chat's ``library_ids``.
+
+        Without this a deleted library leaves chats pointing at a dead id, which keeps
+        RAG permanently active for those chats (``logic.resolve_rag`` only checks that
+        the list is non-empty) while retrieving nothing — and the Library button reads
+        "none", so there is no way to see why. Returns the number of chats changed."""
+        with self._lock:
+            changed = 0
+            for c in self.chats:
+                ids = c.get("library_ids") or []
+                if lib_id in ids:
+                    c["library_ids"] = [i for i in ids if i != lib_id]
+                    changed += 1
+            if changed:
+                self.save_chats()
+            return changed
+
+    def _prune_orphan_library_refs(self):
+        """Drop chat ``library_ids`` entries with no matching library. Repairs chats
+        broken by deletions that predate ``prune_library_refs``. Returns True if any
+        chat was mutated (so the caller can persist)."""
+        known = {l.get("id") for l in self.libraries}
+        changed = False
+        for c in self.chats:
+            ids = c.get("library_ids") or []
+            kept = [i for i in ids if i in known]
+            if len(kept) != len(ids):
+                c["library_ids"] = kept
+                changed = True
+        return changed
 
     # ---------------- evals (Prompt Validation & Evaluation) ----------------
     def eval_summaries(self):
@@ -763,6 +1172,43 @@ class Store:
             self.evals = [e for e in self.evals if e.get("id") != eval_id]
             self.save_evals()
             return len(self.evals) < before
+
+    # ---------------- batch projects (Batch tab) ----------------
+    # A saved Batch config: input sources, the prompt template, and the export
+    # settings. Holds no secrets and no item content — sources are re-resolved on
+    # every run, so a project stays small no matter how much it processes.
+    def batch_project_summaries(self):
+        with self._lock:
+            return [
+                {"id": p["id"], "name": p.get("name", "Untitled batch"),
+                 "updated": p.get("updated", "")}
+                for p in self.batch_projects
+            ]
+
+    def get_batch_project(self, project_id):
+        with self._lock:
+            for p in self.batch_projects:
+                if p.get("id") == project_id:
+                    return p
+            return None
+
+    def upsert_batch_project(self, proj):
+        with self._lock:
+            existing = self.get_batch_project(proj.get("id"))
+            if existing is None:
+                self.batch_projects.insert(0, proj)
+            else:
+                self.batch_projects[self.batch_projects.index(existing)] = proj
+            self.save_batch_projects()
+            return proj
+
+    def delete_batch_project(self, project_id):
+        with self._lock:
+            before = len(self.batch_projects)
+            self.batch_projects = [p for p in self.batch_projects
+                                   if p.get("id") != project_id]
+            self.save_batch_projects()
+            return len(self.batch_projects) < before
 
     # ---------------- database import sessions (Database tab) ----------------
     # NB: these hold only NON-secret metadata (name, source-profile id ref, table,

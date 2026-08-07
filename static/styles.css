@@ -152,6 +152,8 @@ textarea { resize: vertical; width: 100%; }
 #domain-input { flex: 1 1 200px; }
 #domain-list { width: 100%; }
 .tools-status { font-size: 12px; color: var(--status-unknown); }
+/* A model the current server doesn't list, kept selectable rather than silently replaced. */
+.model-missing { color: var(--status-warn); }
 
 /* Input */
 #input-row { display: flex; gap: 10px; align-items: flex-end; }
@@ -217,7 +219,46 @@ textarea { resize: vertical; width: 100%; }
 .data-chip-x { background: none; border: none; color: #b04646; cursor: pointer; font-size: 12px;
   padding: 3px 9px 3px 4px; border-radius: 0 14px 14px 0; }
 .data-chip-x:hover { background: rgba(176,70,70,.12); }
-#btn-data-mode.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+/* Pinned chips outlive the send that consumes the rest, so they read as attached to
+   the chat rather than staged for the next message. */
+.data-chip.pinned { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.data-chip-pin { background: none; border: none; cursor: pointer; font-size: 11px;
+  padding: 3px 4px; opacity: 0.45; }
+.data-chip-pin:hover { opacity: 0.85; }
+.data-chip.pinned .data-chip-pin { opacity: 1; }
+.data-chip-kind { font-size: 9px; letter-spacing: 0.4px; color: #fff; border-radius: 9px;
+  padding: 1px 6px; margin-left: 7px; }
+.data-chip-kind.file { background: rgb(30, 80, 160); }
+.data-chip-kind.write { background: rgb(28, 120, 55); }
+.data-chip-kind.url { background: rgb(150, 70, 20); }
+.data-chip-kind.youtube { background: rgb(160, 32, 32); }
+.data-chip-kind.search { background: rgb(95, 60, 150); }
+.data-chip-kind.image { background: rgb(120, 55, 130); }
+/* An image chip leads with the picture — "which one did I attach?" is a much better
+   question for 18 pixels of the thing than for a filename. */
+.data-chip-thumb { width: 18px; height: 18px; object-fit: cover; border-radius: 3px;
+  margin-right: 5px; vertical-align: middle; background: var(--row); }
+#btn-data-mode.active, #btn-composer-add.active,
+#btn-image-res.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* Images in message bubbles + the drop target on the composer. */
+.bubble-images { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.bubble-images.hidden { display: none; }
+.bubble-images img { max-height: 170px; max-width: 240px; object-fit: contain;
+  border-radius: 6px; border: 1px solid var(--border); cursor: zoom-in; background: #fff; }
+#input-row.drop-target { outline: 2px dashed var(--accent); outline-offset: 3px;
+  border-radius: 6px; }
+.image-modal-frame { display: flex; justify-content: center; align-items: center;
+  background: var(--row); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px; margin: 8px 0; max-height: 65vh; overflow: auto; }
+.image-modal-frame img { max-width: 100%; max-height: 62vh; object-fit: contain; }
+#composer-add-row { flex-wrap: wrap; }
+#add-url-panel #add-url-input { flex: 1 1 auto; }
+.lib-search-fields #add-yt-input { flex: 3 1 260px; }
+.lib-search-fields #add-search-query { flex: 2 1 200px; }
+.lib-search-fields #add-search-sites { flex: 3 1 240px; }
+#add-yt-panel, #add-search-panel { flex-direction: column; align-items: stretch; }
+#add-yt-panel .compile-progress, #add-search-panel .compile-progress { margin-top: 8px; width: 100%; }
 
 /* Buttons */
 button {
@@ -245,6 +286,8 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .lib-item .tag.file { background: rgb(30, 80, 160); }
 .lib-item .tag.write { background: rgb(28, 120, 55); }
 .lib-item .tag.url { background: rgb(150, 70, 20); }
+.lib-item .tag.youtube { background: rgb(160, 32, 32); }
+.lib-item .tag.search { background: rgb(95, 60, 150); }
 .lib-item .item-label { flex: 1 1 auto; }
 .lib-item .item-source { font-size: 11px; word-break: break-all; opacity: 0.85; }
 .lib-item textarea { min-height: 60px; }
@@ -257,8 +300,10 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .lib-search-fields #lib-search-sites { flex: 3 1 240px; }
 .lib-search-max { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
 .lib-search-max input { width: 60px; }
-#lib-search-panel { flex-direction: column; align-items: stretch; }
-#lib-search-panel .compile-progress { margin-top: 8px; width: 100%; }
+.lib-search-fields #lib-yt-input { flex: 3 1 260px; }
+#lib-yt-max input, .lib-search-max #lib-yt-max { width: 70px; }
+#lib-search-panel, #lib-yt-panel { flex-direction: column; align-items: stretch; }
+#lib-search-panel .compile-progress, #lib-yt-panel .compile-progress { margin-top: 8px; width: 100%; }
 
 /* ---------------- Compile Data (RAG) ---------------- */
 .compile-badge-slot { display: inline-flex; align-items: center; }
@@ -304,21 +349,26 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 
 /* ---------------- Modals ---------------- */
 .modal-backdrop {
-  position: fixed; inset: 0; background: rgba(0,0,0,.4);
-  display: flex; align-items: center; justify-content: center; z-index: 100;
+  position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 100;
 }
+/* Absolutely centred rather than flex-centred, so two dialogs can stack. */
 .modal {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
   background: #fff; border-radius: 10px; padding: 18px 20px; width: 520px; max-width: 92vw;
   max-height: 86vh; overflow-y: auto; box-shadow: 0 12px 40px rgba(0,0,0,.3);
 }
+/* A dialog with another one open on top of it: visible, but dimmed and inert. */
+.modal-below { pointer-events: none; filter: brightness(.88); }
 .modal h3 { margin: 0 0 8px; }
 .muted { color: #777; font-size: 12px; margin: 0 0 10px; }
 .modal-btns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
-#server-rows { display: flex; flex-direction: column; gap: 8px; }
 .server-row { display: flex; gap: 6px; align-items: center; }
 .server-row input { flex: 1 1 auto; }
 .server-row .name { flex: 0 0 130px; }
-#modal-prompt input, #modal-servers input { width: 100%; }
+#modal-prompt input[type="text"] { width: 100%; }
+/* optional tickbox under the field (e.g. "treat the delimiter as a regex") */
+#prompt-check-row { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 13px; }
+#prompt-check { width: auto; }
 #modal-newdata input[type=text], #modal-incognito-save input[type=text],
 #modal-incognito-save select, #modal-delprofile select { width: 100%; }
 .radio-col { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; }
@@ -361,9 +411,17 @@ button.danger { background: var(--stop-btn); color: #fff; border: none; }
 /* ---------------- Multi-Pass ---------------- */
 #multipass-panel .mp-row { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
 #multipass-panel .mp-row input[type=number] { width: 70px; }
-#multipass-panel .mp-label { font-size: 12px; color: #555; }
-#multipass-panel code { background: #e6e6ea; padding: 1px 4px; border-radius: 4px; font-size: 11px; }
-#multipass-panel textarea { min-height: 92px; }
+/* Shared with the Batch tab's copy of the panel, so the two read identically — it is
+   the same evaluation-prompt template with the same [tag] vocabulary. The Batch panel
+   inherits .lib-inline-panel (a ROW), which would squash the textarea, so it is
+   overridden to a column here rather than in the markup. */
+#multipass-panel .mp-label,
+#batch-multipass-panel .mp-label { font-size: 12px; color: #555; }
+#multipass-panel code,
+#batch-multipass-panel code { background: #e6e6ea; padding: 1px 4px; border-radius: 4px; font-size: 11px; }
+#multipass-panel textarea,
+#batch-multipass-panel textarea { min-height: 92px; }
+#batch-multipass-panel { flex-direction: column; align-items: stretch; }
 .bubble.assistant.intermediate { opacity: .82; border-left: 3px solid rgb(150, 150, 160); }
 .bubble.assistant.intermediate .role { color: #777; }
 
@@ -493,6 +551,7 @@ button.danger { background: var(--stop-btn); color: #fff; border: none; }
 .eval-crit-label { flex: 1 1 200px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; font-weight: 600; }
 .eval-crit-mode { padding: 5px 6px; }
 .eval-crit-range { display: inline-flex; align-items: center; gap: 4px; color: #666; font-size: 12px; }
+.eval-crit-range.invalid input { border-color: var(--stop-btn); }
 .eval-crit-num { width: 52px; padding: 4px 5px; }
 .eval-grader-row { margin-top: 10px; }
 
@@ -532,6 +591,7 @@ button.danger { background: var(--stop-btn); color: #fff; border: none; }
 .eval-cell-score.bad { color: var(--stop-btn); }
 .eval-td-input { max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
 .eval-td-response { max-width: 340px; white-space: pre-wrap; }
+.eval-td-error { color: var(--stop-btn); font-style: italic; }
 .eval-td-reasoning { max-width: 240px; white-space: pre-wrap; color: #555; }
 .eval-model-detail { border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; background: var(--item-row); }
 .eval-model-detail summary { cursor: pointer; font-weight: 600; }
@@ -573,6 +633,11 @@ button.danger { background: var(--stop-btn); color: #fff; border: none; }
 .db-grid-table td.db-rowid { padding: 4px 8px; color: var(--muted, #888); text-align: right; background: var(--panel); }
 .db-cell { border: 0; background: transparent; width: 100%; min-width: 90px; padding: 4px 8px; color: inherit; font: inherit; }
 .db-cell:focus { outline: 2px solid var(--accent); outline-offset: -2px; background: var(--item-row); }
+/* An empty box is ambiguous: NULL and "" write back differently. The ∅ placeholder
+   marks the NULL ones. */
+.db-cell::placeholder { color: var(--muted, #888); opacity: .55; }
+.db-cell-null { font-style: italic; }
+.db-cell-bad { outline: 2px solid #d9534f; outline-offset: -2px; }
 .db-row-dirty td.db-rowid { border-left: 3px solid var(--accent); }
 .db-grid-pager { display: flex; align-items: center; gap: 12px; margin-top: 8px; }
 
@@ -609,6 +674,9 @@ button.danger { background: var(--stop-btn); color: #fff; border: none; }
 .side-list { display: flex; flex-direction: column; gap: 3px; }
 .side-item { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; font-size: 13px; }
 .side-item.active { border-color: var(--accent, #5b8def); }
+/* A persona whose persona.xml no longer parses: listed so it can be deleted, but not
+   openable and never offered in the composer. */
+.side-item.broken { border-color: #e6c86a; background: #fbeecb; color: #7a5b00; cursor: default; }
 .side-item em { opacity: 0.6; }
 .persona-editor-head { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; }
 .pe-name { font-size: 16px; font-weight: 600; flex: 0 0 auto; min-width: 16em; }
@@ -622,3 +690,139 @@ button.danger { background: var(--stop-btn); color: #fff; border: none; }
 .warn-banner { background: #fbeecb; color: #7a5b00; border: 1px solid #e6c86a; border-radius: 6px; padding: 6px 8px; margin-bottom: 8px; font-size: 12px; }
 .warn-banner.hidden { display: none; }
 .muted { opacity: 0.6; }
+
+/* ---------------- Memory tab ---------------- */
+/* Same two-pane shape as Personas; the entry list is the only new furniture. */
+#tab-memory.active { display: flex; height: 100%; }
+#memory-sidebar { width: 240px; border-right: 1px solid var(--border); padding: 10px; overflow-y: auto; box-sizing: border-box; display: flex; flex-direction: column; }
+#memory-main { flex: 1; padding: 14px; overflow-y: auto; }
+.mc-io { margin-top: auto; padding-top: 10px; display: flex; gap: 6px; }
+.mc-io button { flex: 1; }
+.mc-empty { max-width: 46em; }
+.mc-empty.hidden, #mc-editor.hidden { display: none; }
+/* Incognito never writes to disk, and this tab stays editable — so it has to say so. */
+.mc-incognito {
+  max-width: 46em; margin-bottom: 14px; padding: 8px 11px; font-size: 12.5px; line-height: 1.5;
+  background: var(--row-selected); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  border-radius: 6px;
+}
+.mc-incognito.hidden { display: none; }
+.mc-empty p { line-height: 1.55; margin: 10px 0 16px; }
+
+.mc-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+#mc-name { font-size: 16px; font-weight: 600; min-width: 18em; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; }
+.mc-settings { margin-bottom: 14px; }
+.mc-settings input[type="number"] { width: 4.5em; }
+
+.mc-entries { display: flex; flex-direction: column; gap: 14px; }
+.mc-none { max-width: 40em; line-height: 1.5; }
+.mc-cat-head { font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--accent); margin-bottom: 5px; }
+.mc-entry {
+  display: flex; align-items: center; gap: 8px; padding: 6px 8px; font-size: 13px;
+  background: var(--item-row); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 4px;
+}
+/* Stored but below the injection limit — present, just not being sent. */
+.mc-entry.muted-entry { opacity: 0.55; }
+.mc-importance {
+  flex: 0 0 auto; min-width: 1.9em; text-align: center; font-size: 11px; font-weight: 600;
+  background: var(--row-selected); color: var(--user-header); border-radius: 10px; padding: 1px 5px;
+}
+.mc-text { flex: 1; line-height: 1.45; }
+.mc-tags { flex: 0 0 auto; display: flex; gap: 3px; }
+.mc-flag { font-size: 11px; cursor: default; }
+
+.mcb-list { max-height: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; margin: 8px 0; }
+.mcb-row { padding: 3px 4px; border-radius: 4px; }
+.mcb-row:hover { background: var(--row); }
+/* Scoring the extractor: sample transcripts in, grades out. */
+.mcs-row, .mcs-result { padding: 7px 9px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 6px; }
+.mcs-row-head { font-size: 12px; font-weight: 600; color: var(--accent); margin-bottom: 4px; }
+.mcs-transcript {
+  margin: 0; font-size: 11.5px; line-height: 1.45; white-space: pre-wrap;
+  max-height: 8em; overflow-y: auto; opacity: 0.75;
+}
+.mcs-existing { font-size: 11.5px; margin-top: 4px; opacity: 0.7; }
+.mcs-results { max-height: 340px; overflow-y: auto; margin-top: 8px; }
+.mcs-scores { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 5px; }
+.mcs-score {
+  font-size: 11px; padding: 1px 6px; border-radius: 10px;
+  background: var(--row-selected); color: var(--user-header); cursor: help;
+}
+.mcs-ops { margin: 0; padding-left: 1.2em; font-size: 12px; line-height: 1.5; }
+.mcs-summary { padding: 8px 10px; border-radius: 6px; background: var(--row-selected); font-size: 13px; }
+
+#memory-core-select { max-width: 14em; }
+#memory-core-select.hidden, #btn-memory-extract.hidden { display: none; }
+
+/* ---------------- Batch tab ---------------- */
+/* .tab-page.active is display:flex, so the single column needs to claim the row and
+   own its own scrolling (same rule as #settings-main / #db-main / #eval-main). */
+#batch-main { flex: 1 1 auto; overflow-y: auto; padding: 16px 22px; max-width: 1120px; }
+
+#batch-main textarea {
+  width: 100%; font-family: inherit; font-size: 13px; padding: 7px 9px;
+  border: 1px solid var(--border); border-radius: 6px; background: #fff;
+  color: #1b1b1b; resize: vertical;
+}
+
+/* One input source row. */
+.batch-source {
+  border: 1px solid var(--border); border-radius: 6px; background: var(--row);
+  padding: 8px 10px; margin-bottom: 8px;
+}
+.batch-source .bsrc-path { word-break: break-all; }
+
+/* Resolved-item preview list. */
+.batch-items { margin: 8px 0; max-height: 220px; overflow-y: auto; }
+.batch-items-head { font-size: 12px; font-weight: 600; margin-bottom: 4px; }
+.batch-item-row {
+  display: flex; align-items: center; gap: 8px; padding: 3px 6px;
+  border-radius: 4px; font-size: 12px;
+}
+.batch-item-row:nth-child(odd) { background: var(--item-row); }
+.batch-item-title { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.batch-item-row .tag {
+  font-size: 11px; padding: 2px 7px; border-radius: 10px; color: #fff;
+  background: rgb(110, 110, 120);
+}
+.batch-item-row .tag.folder { background: rgb(30, 80, 160); }
+.batch-item-row .tag.youtube, .batch-item-row .tag.playlist { background: rgb(160, 32, 32); }
+.batch-item-row .tag.search { background: rgb(95, 60, 150); }
+
+/* Per-item results transcript. */
+.batch-results { margin-top: 10px; }
+.batch-result {
+  border: 1px solid var(--border); border-radius: 6px; margin-bottom: 8px;
+  background: var(--assistant-bubble);
+}
+.batch-result-head {
+  display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap;
+  padding: 6px 10px; border-bottom: 1px solid var(--border);
+  font-weight: 600; font-size: 12px; color: var(--assistant-header);
+}
+.batch-result-body {
+  padding: 8px 10px; white-space: pre-wrap; font-size: 13px;
+  color: var(--assistant-text); max-height: 260px; overflow-y: auto;
+}
+.warn-inline { color: rgb(160, 60, 20); font-weight: 400; }
+.batch-result .bubble-images { padding: 8px 10px; margin-top: 0; }
+.batch-item-row .tag.images { background: rgb(120, 55, 130); }
+
+/* Reference images: sent with every item. */
+.batch-subhead { margin: 14px 0 2px 0; font-size: 13px; }
+.batch-refimgs { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+.batch-refimg { position: relative; display: inline-flex; }
+.batch-refimg img {
+  width: 52px; height: 52px; object-fit: cover; border-radius: 5px;
+  border: 1px solid var(--border); cursor: zoom-in; background: #fff;
+}
+.batch-refimg-x {
+  position: absolute; top: -6px; right: -6px; width: 18px; height: 18px;
+  border-radius: 50%; border: 1px solid var(--border); background: var(--panel);
+  color: #b04646; font-size: 10px; line-height: 1; cursor: pointer; padding: 0;
+}
+.batch-refimg-x:hover { background: rgba(176, 70, 70, .15); }
+
+/* Lane columns are sized for the full-height chat view; inside a card they need a cap. */
+#batch-lanes { max-height: 320px; }
+#batch-lanes.hidden { display: none; }

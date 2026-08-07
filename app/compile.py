@@ -80,22 +80,29 @@ def _put_manifest(key: str, manifest: dict) -> None:
         _save_all(data)
 
 
-def _drop_manifest(key: str) -> None:
+def _drop_manifests_all_backends(kind: str, obj_id: str) -> None:
+    """Drop ``kind:id`` manifests under EVERY backend suffix, plus the pre-backend
+    legacy key. ``_manifest_key`` namespaces by the active backend, so deleting while
+    LanceDB was active used to leave the DuckDB manifest (and vice versa) on disk
+    forever, still describing content the user asked to remove."""
     with _MANIFEST_LOCK:
         data = _load_all()
-        if key in data:
-            del data[key]
+        prefix = f"{kind}:{obj_id}"
+        doomed = [k for k in data if k == prefix or k.startswith(prefix + "@")]
+        if doomed:
+            for k in doomed:
+                del data[k]
             _save_all(data)
 
 
 def forget_library(lib_id: str) -> None:
     """Drop a library's compile manifest (called on library delete)."""
-    _drop_manifest(_manifest_key(LIBRARY, lib_id))
+    _drop_manifests_all_backends(LIBRARY, lib_id)
 
 
 def forget_persona(persona_id: str) -> None:
     """Drop a persona's compile manifest (called on persona delete)."""
-    _drop_manifest(_manifest_key("persona", persona_id))
+    _drop_manifests_all_backends("persona", persona_id)
 
 
 # --------------------------- signature / fingerprints ---------------------------
@@ -204,7 +211,12 @@ def _state_from(manifest: dict, sig: dict, current_items: dict, stored_chunks: i
     """Decide compiled / stale / none from a manifest vs the current items + signature.
     ``current_items`` maps item_id -> fingerprint. Never embeds or parses heavy files
     beyond the cheap fingerprints the caller already gathered."""
-    if not manifest or not manifest.get("items"):
+    # Keyed on the manifest's absence, not on an empty items map: a library whose items
+    # are all empty compiles to zero items, and treating that as "never compiled" made
+    # the badge read "Not compiled" right after the toast said "Compiled: 0 chunks".
+    if not manifest:
+        return {"state": "none", "reasons": ["not compiled yet"]}
+    if not manifest.get("items") and current_items:
         return {"state": "none", "reasons": ["not compiled yet"]}
     reasons = []
     if manifest.get("signature") != sig:
@@ -356,7 +368,13 @@ def compile_library(lib: dict, embed_fn, embed_model: str, contextualize=None,
                 _emit(emit, "warn", name=label,
                       message="not fully embedded — will recompile")
 
-    rag.prune_items(LIBRARY, lib_id, list(new_items.keys()))
+    # Prune against every item the library STILL HAS, not against the manifest.
+    # ``new_items`` deliberately omits anything that didn't embed cleanly, so pruning
+    # by it deleted the stored chunks of items a stopped or half-failed run never
+    # reached — with Force full rebuild that is every item, i.e. the whole library's
+    # vectors. Items dropped from the library are still pruned, which is the point.
+    # (This matches how compile_persona has always pruned; see below.)
+    rag.prune_items(LIBRARY, lib_id, [item_id for item_id, _c, _m in items])
     failed = int(meta_out.get("failed") or 0)
     stopped = bool(meta_out.get("stopped"))
     manifest = {
@@ -492,8 +510,11 @@ def compile_persona(persona: dict, embed_fn, embed_model: str, contextualize=Non
                 embedded += 1
                 _emit(emit, "item_done", index=idx, total=total, name=title, chunks=n, skipped=False)
             except Exception as e:
-                n = 0
+                # Left out of the manifest, like a knowledge doc that didn't embed:
+                # recording it would make persona_status read "compiled" while this
+                # memory has no vectors.
                 _emit(emit, "warn", name=title, message=str(e))
+                continue
         new_items[mkey] = {"fingerprint": fp, "chunks": n}
 
     # Prune deleted knowledge/memory rows from the vector store.

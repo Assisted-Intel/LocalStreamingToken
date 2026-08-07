@@ -20,10 +20,12 @@ Injected dependencies (all optional except llm_complete):
     memory_search(queries: list[str])          -> list[dict]
     rewrite_queries(message, history)          -> {"variants":[...], "keywords":[...]}
     emit(event, data)                          -> None         (progress callback → SSE)
+    should_stop()                              -> bool         (cancel between steps)
 
 Emitted events: step_started, step_output, step_failed, token, run_complete, run_paused.
 """
 
+import json
 import re
 import time
 
@@ -110,7 +112,8 @@ class PipelineEngine:
 
     def __init__(self, persona, *, llm_complete, llm_stream=None,
                  knowledge_search=None, memory_search=None, rewrite_queries=None,
-                 emit=None, max_retries=3):
+                 emit=None, max_retries=3, should_stop=None, variant="",
+                 extra_system=""):
         self.persona = persona or {}
         self.llm_complete = llm_complete
         self.llm_stream = llm_stream
@@ -118,23 +121,50 @@ class PipelineEngine:
         self.memory_search = memory_search
         self.rewrite_queries = rewrite_queries
         self.emit = emit or (lambda ev, data: None)
-        self.max_retries = max_retries
+        # A predicate rather than a threading.Event, so the engine stays free of
+        # threading and a test can stop a run with a plain lambda.
+        self.should_stop = should_stop or (lambda: False)
+        self.max_retries = max(1, int(max_retries or 1))
+        # The selected style variant's name (see _variant_description) and any system
+        # text from the surrounding chat, both applied on top of the persona's own identity.
+        self.variant = variant or ""
+        self.extra_system = extra_system or ""
         self._defs = list(persona.get("pipeline", []))
         self.run = PipelineRun(self._defs)
 
     # --------------------------- context ---------------------------
 
+    def _variant(self):
+        """(name, description) for the selected style variant, matched case- and
+        whitespace-insensitively since the name round-trips through a <select> value.
+        The persona's own spelling of the name wins over whatever the caller sent.
+        Returns (requested_name, "") when the variant no longer exists."""
+        want = self.variant.strip().lower()
+        if not want:
+            return "", ""
+        for v in (self.persona.get("speaking", {}).get("variants") or []):
+            if str(v.get("name", "")).strip().lower() == want:
+                return str(v.get("name", "")).strip(), str(v.get("description", "") or "")
+        return self.variant.strip(), ""
+
     def _base_ctx(self, user_message: str, history: str) -> dict:
         """The template variables available to every step before any step has run.
         Steps add to this dict as they produce output, so a later prompt can reference
         an earlier step's fields by name. Only the first 5 speaking examples are
-        included, to bound the prompt size."""
+        included, to bound the prompt size.
+
+        A selected style variant is folded into ``speaking_style`` (and exposed on its
+        own as ``{variant}``), so the default pipeline's stylize step picks it up with
+        no prompt changes."""
         prof = self.persona.get("profile", {})
         sp = self.persona.get("speaking", {})
         style_bits = []
         for k in ("tone", "formality", "vocabulary", "quirks"):
             if sp.get(k):
                 style_bits.append(f"{k}: {sp[k]}")
+        vname, vdesc = self._variant()
+        if vname:
+            style_bits.append(f"variant: {vname}" + (f" — {vdesc}" if vdesc else ""))
         for ex in (sp.get("examples") or [])[:5]:
             style_bits.append(f"Example — user: {ex.get('user','')} | {prof.get('name','')}: {ex.get('reply','')}")
         return {
@@ -144,6 +174,7 @@ class PipelineEngine:
             "user_message": user_message or "",
             "history": history or "",
             "speaking_style": "\n".join(style_bits) or "(no specific style)",
+            "variant": vdesc or vname,
             "knowledge": "(not retrieved yet)",
             "memories": "(not retrieved yet)",
             "draft": "",
@@ -155,14 +186,19 @@ class PipelineEngine:
         return step.get("model") or self.persona.get("models", {}).get("chat_model", "") or ""
 
     def _system_msg(self):
-        """The identity system message prepended to every llm step."""
+        """The identity system message prepended to every llm step. Any ``extra_system``
+        (the surrounding chat's own system prompt) is appended after the identity, so the
+        persona still knows who it is but the chat's standing instructions apply."""
         prof = self.persona.get("profile", {})
         bits = [f"You are {prof.get('name','a persona')}."]
         if prof.get("role"):
             bits.append(f"Role: {prof['role']}.")
         if prof.get("bio"):
             bits.append(prof["bio"])
-        return {"role": "system", "content": " ".join(bits)}
+        content = " ".join(bits)
+        if self.extra_system.strip():
+            content += "\n\n" + self.extra_system.strip()
+        return {"role": "system", "content": content}
 
     # --------------------------- step execution ---------------------------
 
@@ -232,6 +268,7 @@ class PipelineEngine:
             err = "response was not valid JSON" if obj is None else validate_against_schema(obj, schema)
             if err is None:
                 sstate["output"] = obj
+                sstate["raw"] = None    # drop an earlier failed attempt's text
                 self.run.ctx[sstate["id"]] = obj
                 if isinstance(obj, dict):
                     self.run.ctx.update(obj)         # expose fields (e.g. knowledge_queries)
@@ -258,15 +295,49 @@ class PipelineEngine:
         sstate["output"] = {"queries": queries, "results": results}
         return True
 
+    def _resolve_final(self) -> str:
+        """The answer to show when no step assigned one.
+
+        Only a free-text llm step sets ``run.final``, so a pipeline ending in a
+        structured or retrieval step used to complete with an empty answer — and so did
+        a re-run of the LAST step, which re-executes nothing. Rather than show the user
+        an empty bubble, fall back to the most recent usable text: the last free-text
+        output, else the last structured output's ``draft``, else that output as JSON."""
+        for st in reversed(self.run.steps):
+            out = st.get("output")
+            if isinstance(out, str) and out.strip():
+                return out.strip()
+            if isinstance(out, dict):
+                draft = out.get("draft")
+                if isinstance(draft, str) and draft.strip():
+                    return draft.strip()
+                # A retrieval step's output is bookkeeping, not an answer.
+                if st.get("type") in ("knowledge_retrieval", "memory_retrieval"):
+                    continue
+                try:
+                    return json.dumps(out, indent=2)
+                except Exception:
+                    return str(out)
+        return ""
+
     def _execute(self, start_index, user_message, history):
         """Run steps from ``start_index`` to the end, emitting progress as it goes.
 
         Stops at the first failure and leaves the run "paused" rather than raising, so
         the caller can surface the partial result and let the user edit and resume.
-        Any exception from a step is caught and recorded as that step's error."""
+        Any exception from a step is caught and recorded as that step's error.
+        ``should_stop`` is checked between steps: the model call inside a step can only
+        be interrupted by the provider adapter, but a cancelled run must not go on to
+        start the next step."""
         self.run.status = "running"
         n = len(self._defs)
         for i in range(start_index, n):
+            if self.should_stop():
+                self.run.status = "stopped"
+                self.run.final = self.run.final or self._resolve_final()
+                self.emit("run_paused", {"index": i, "run": self.run.to_dict(),
+                                         "stopped": True})
+                return self.run
             sdef, sstate = self._defs[i], self.run.steps[i]
             sstate["status"] = StepStatus.RUNNING
             sstate["error"] = None
@@ -293,6 +364,8 @@ class PipelineEngine:
             sstate["status"] = StepStatus.DONE
             self.emit("step_output", {"index": i, "id": sstate["id"], "output": sstate["output"]})
         self.run.status = "complete"
+        if not (self.run.final or "").strip():
+            self.run.final = self._resolve_final()
         self.emit("run_complete", {"run": self.run.to_dict(), "final": self.run.final})
         return self.run
 
@@ -314,6 +387,9 @@ class PipelineEngine:
         um = getattr(self, "_user_message", "")
         hist = getattr(self, "_history", "")
         self.run.ctx = self._base_ctx(um, hist)
+        # A re-run re-derives the answer, so the previous one must not linger: a run
+        # that pauses before the final step would otherwise report the OLD final.
+        self.run.final = ""
         # Replay context from already-good upstream steps.
         for j in range(index):
             st = self.run.steps[j]
@@ -323,7 +399,10 @@ class PipelineEngine:
                 self.run.ctx.update(out)
             elif st["type"] == "llm":
                 self.run.ctx[st["id"]] = out
-                self.run.ctx["draft"] = out
+                # First free-text step wins, matching _run_llm_step. Assigning
+                # unconditionally made {draft} resolve to a DIFFERENT step on a re-run
+                # than on the original run whenever a pipeline had two free-text steps.
+                self.run.ctx["draft"] = self.run.ctx.get("draft") or out
             elif st["type"] in ("knowledge_retrieval", "memory_retrieval") and isinstance(out, dict):
                 key = "knowledge" if st["type"] == "knowledge_retrieval" else "memories"
                 self.run.ctx[key] = format_excerpts(out.get("results") or [])

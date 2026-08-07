@@ -13,9 +13,12 @@ configured column we:
   * PROMPT / OUTPUT column -> render ``prompt_template`` with fill_prompt against
     the row, wrap it in a **synthetic chat** dict
     ``{"server_url","model","messages":[{"role":"user","content":filled}],"num_ctx"}``,
-    and run it through the app's ``generate_one`` (single) or
-    ``parallel.run_parallel`` (fan-out). The accumulated ``chunk`` text becomes the
-    cell value.
+    and run it through the app's ``generate_one``. The accumulated ``chunk`` text
+    becomes the cell value.
+
+Rows are processed one at a time against a single server. Multi-server fan-out via
+``parallel.run_parallel`` would fit here — a row is an independent unit of work — but is
+NOT implemented; an unused ``run_parallel`` argument used to advertise otherwise.
 
 Columns process in order, and each output is written back into the DuckDB staging
 row immediately, so a later column's template can read an earlier column's output.
@@ -51,12 +54,11 @@ class StagingProcessor:
     own LLM engine. Injected callables keep it decoupled from Flask/providers."""
 
     def __init__(self, staging, *, fill_prompt: Callable, generate_one: Callable,
-                 web_search: Optional[Callable] = None, run_parallel: Optional[Callable] = None):
+                 web_search: Optional[Callable] = None):
         self.staging = staging
         self.fill_prompt = fill_prompt
         self.generate_one = generate_one
         self.web_search = web_search
-        self.run_parallel = run_parallel
 
     def process(self, columns: list, *, server_url: str, model: str, num_ctx: int = 4096,
                 web_min_pages: int = 5, stop_event=None) -> Iterator[tuple]:

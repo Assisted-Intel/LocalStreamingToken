@@ -23,6 +23,11 @@ from .types_map import duckdb_type_for
 # Rows pulled per round-trip. Modest for memory; the route may override.
 DEFAULT_CHUNK = 1000
 
+# Keys per WHERE ... OR ... batch in stream_by_keys. Each key costs one bound
+# parameter per key column, so 200 keys stays far inside every driver's limit
+# (SQLite's default SQLITE_MAX_VARIABLE_NUMBER is the tightest at 999).
+KEY_BATCH = 200
+
 # Dialect-specific RANDOM() function for random sampling.
 _RANDOM_FN = {"sqlite": "RANDOM()", "postgresql": "random()", "mysql": "RAND()",
               "mssql": "NEWID()", "oracle": "DBMS_RANDOM.VALUE"}
@@ -96,6 +101,46 @@ class StreamingImporter:
                     "nullable": bool(c.get("nullable", True)),
                 })
             return out
+        finally:
+            eng.dispose()
+
+    def stream_by_keys(self, profile: ConnectionProfile, table: str, key_columns: list,
+                       keys: list, chunk: int = KEY_BATCH) -> Iterator[list]:
+        """Yield lists of row-dicts for EXACTLY the rows named by ``keys``.
+
+        ``keys`` is [{key_col: value}]. Used by conflict detection, which must ask
+        about the rows that were actually staged rather than re-running the session's
+        selection — a ``random_n`` selection returns a different sample every time it
+        runs, so re-issuing it compares the baseline against unrelated rows.
+
+        Emits batched ``WHERE (k1 = :p0_0 AND k2 = :p0_1) OR (...)`` reads. Values are
+        bound as parameters (never interpolated) and identifiers go through the
+        dialect preparer. ``chunk`` bounds keys per round-trip, keeping the statement
+        inside driver parameter limits."""
+        from sqlalchemy import text
+        if not key_columns or not keys:
+            return
+        eng = self.conns.build_engine(profile, readonly=True)
+        try:
+            qt = self._qtable(eng, table)
+            prep = eng.dialect.identifier_preparer
+            qcols = [prep.quote(c) for c in key_columns]
+            with eng.connect() as conn:
+                for start in range(0, len(keys), chunk):
+                    batch = keys[start:start + chunk]
+                    clauses, params = [], {}
+                    for i, key in enumerate(batch):
+                        parts = []
+                        for j, kc in enumerate(key_columns):
+                            p = f"p{i}_{j}"
+                            parts.append(f"{qcols[j]} = :{p}")
+                            params[p] = key.get(kc)
+                        clauses.append("(" + " AND ".join(parts) + ")")
+                    sql = f"SELECT * FROM {qt} WHERE {' OR '.join(clauses)}"
+                    result = conn.execute(text(sql), params)
+                    rows = [dict(r) for r in result.mappings()]
+                    if rows:
+                        yield rows
         finally:
             eng.dispose()
 

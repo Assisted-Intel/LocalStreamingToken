@@ -9,14 +9,16 @@ processing. Filesystem operations use native OS dialogs (app.native_dialog) and
 read/write paths directly on the machine — nothing is uploaded.
 """
 
+import base64
 import ipaddress
 import json
 import queue
 import shutil
 import threading
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,10 +26,10 @@ import requests
 from flask import (Flask, request, jsonify, Response, send_from_directory,
                    stream_with_context, session, redirect)
 
-from . import (compile as compile_mod, context_tracker, core, crypto, evals, ingest,
-               logic, migrate, native_dialog, parallel, persona as persona_mod,
-               persona_io, persona_store, pipeline as pipeline_mod, profiles, providers,
-               rag, rewrite)
+from . import (batch as batch_mod, compile as compile_mod, context_tracker, core, crypto,
+               evals, images as images_mod, ingest, logic, memory, migrate, native_dialog,
+               parallel, persona as persona_mod, persona_io, persona_store,
+               pipeline as pipeline_mod, profiles, providers, rag, rewrite, youtube)
 from .database import staging as db_staging
 from .database.routes import register_db_routes
 from .database.vault import Vault
@@ -68,6 +70,27 @@ def _expand_range(rng: str):
     return [str(ipaddress.ip_address(rng))]
 
 
+def _store_model_image(frame):
+    """Persist an image a model returned and return its record, or None.
+
+    Returns the record rather than the bytes so the SSE frame stays small — the
+    browser fetches the picture from /api/images/<id> once, instead of receiving it
+    JSON-escaped in the stream and again in the chat it persists afterwards.
+    A picture that can't be decoded is dropped: it must not take the answer with it.
+    """
+    try:
+        data = base64.b64decode(frame.get("b64") or "", validate=False)
+        if not data:
+            return None
+        prep = images_mod.prepare(data, frame.get("media_type") or "")
+        return images_mod.store_prepared(
+            prep, name=f"generated-{frame.get('index', 0) + 1}"
+                       f"{images_mod.ext_for(prep['media_type'])}",
+            origin="model")
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Active-generation registry: maps a run id -> threading.Event so /api/stop can
 # cancel an in-flight stream or batch run.
@@ -101,6 +124,16 @@ class RunRegistry:
         with self._lock:
             self._events.pop(run_id, None)
 
+    def active(self, run_id):
+        """True while ``run_id`` is registered. A liveness probe that, unlike stop(),
+        does not cancel the run — the Database tab uses it to tell a genuinely
+        in-flight import from one whose client disconnected and left the session
+        advertising work that no longer exists."""
+        if not run_id:
+            return False
+        with self._lock:
+            return run_id in self._events
+
 
 def create_app():
     app = Flask(__name__, static_folder=None)
@@ -108,6 +141,9 @@ def create_app():
     # with default admin/admin on first run). The app data is encrypted at rest and is
     # only loaded after the user logs in — see the auth block below.
     app.secret_key = crypto.get_flask_secret(core.APP_KEYFILE)
+    # Image uploads are the only request body that isn't small JSON. A ceiling turns
+    # "someone dragged a 2 GB scan in" from an out-of-memory server into a 413.
+    app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
     # Profiles: run first-run migration, then point core's data/settings paths at the
     # persisted active profiles BEFORE building the Store/Vault that read those paths.
     pm = profiles.ProfileManager()
@@ -147,7 +183,31 @@ def create_app():
     psvc = persona_mod.PersonaService()
     kbsvc = persona_store.KnowledgeService()
     memsvc = persona_store.MemoryService()
-    pipeline_runs = {}
+    # Bounded: each entry pins a persona, an adapter closure, and the run's full state
+    # (every step's output, its retrieved excerpts, and any raw model text). Unbounded,
+    # a long session of persona chat grew this forever. Only recent runs can plausibly
+    # be re-run from a step, so keep the newest few and evict oldest-first.
+    PIPELINE_RUNS_MAX = 20
+    pipeline_runs = OrderedDict()
+
+    def _remember_run(run_id, eng):
+        pipeline_runs[run_id] = eng
+        pipeline_runs.move_to_end(run_id)
+        while len(pipeline_runs) > PIPELINE_RUNS_MAX:
+            pipeline_runs.popitem(last=False)
+
+    def _gc_images():
+        """Sweep image files nothing references any more.
+
+        A sweep rather than refcounting: a private chat writes its images long before
+        (and usually instead of) being persisted, so no count is ever correct.
+        images.gc() spares anything recently written for exactly that reason. Best
+        effort — failing to tidy up must never break the thing that triggered it."""
+        try:
+            live = images_mod.collect_ids(store.chats, store.batch_projects)
+            return images_mod.gc(live)
+        except Exception:
+            return 0
 
     # ----------------------------- Profile switching ------------------------
     def _switch_data_runtime():
@@ -162,6 +222,10 @@ def create_app():
         # The new profile has its own stores, so re-decide which backend to open.
         _apply_rag_backend()
         caps_cache.clear()
+        # The image caches hold DECRYPTED bytes keyed only by id, so carrying them
+        # across a profile switch would leak the previous profile's pictures.
+        images_mod.clear_caches()
+        _gc_images()
 
     def _switch_settings_runtime():
         core.set_active_settings_profile(pm.active_settings_dir())
@@ -194,6 +258,50 @@ def create_app():
             return None
         caps = _ollama_caps(server, server_url, model)
         return ("tools" in caps) if caps else None
+
+    # Cloud model-name markers for image INPUT. Only Ollama actually reports a
+    # "vision" capability tag; everywhere else this is the best that can be done.
+    _CLOUD_VISION = ("gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-5", "chatgpt-4o",
+                     "o3", "o4-mini", "claude-", "gemini-", "grok-2-vision",
+                     "grok-3", "grok-4", "pixtral", "llama-3.2-11b", "llama-3.2-90b",
+                     "llama-4", "qwen2.5-vl", "qwen3-vl", "internvl", "llava",
+                     "-vl", "vision", "moondream", "minicpm-v", "mistral-small-3")
+    # Names we are confident have NO vision, so the warning can fire honestly.
+    _CLOUD_TEXT_ONLY = ("deepseek-chat", "deepseek-reasoner", "gpt-3.5", "o1-mini",
+                        "text-embedding", "whisper", "tts-", "-embed", "embedding")
+    # Models that return an image through the chat-completions path.
+    _IMAGE_OUTPUT = ("gemini-2.5-flash-image", "gemini-2.0-flash-preview-image",
+                     "gemini-3-pro-image", "flash-image", "-image-preview")
+
+    def model_supports_vision(server_url, model):
+        """Return True/False/None for image input.
+
+        Ollama reports the real capability tag. Cloud providers report nothing, so
+        this falls back to name markers and answers **None** when neither list
+        matches — an honest "don't know" is what keeps the UI from warning about a
+        model that is perfectly capable, or staying silent about one that isn't."""
+        if not model:
+            return None
+        server = store.resolve_server(server_url)
+        if server.get("type") == "ollama":
+            caps = _ollama_caps(server, server_url, model)
+            return ("vision" in caps) if caps else None
+        m = model.lower()
+        if any(h in m for h in _CLOUD_VISION):
+            return True
+        if any(h in m for h in _CLOUD_TEXT_ONLY):
+            return False
+        return None
+
+    def model_returns_images(server_url, model):
+        """True for the handful of models that hand back a picture. Name-only: no
+        provider advertises this, and Ollama's chat endpoint cannot do it at all."""
+        if not model:
+            return False
+        if store.resolve_server(server_url).get("type") == "ollama":
+            return False
+        m = model.lower()
+        return any(h in m for h in _IMAGE_OUTPUT)
 
     # Cloud model-name markers that indicate a reasoning/thinking model.
     _CLOUD_REASONING = ("reasoner", "o1", "o3", "-thinking", "magistral",
@@ -251,6 +359,13 @@ def create_app():
         _apply_rag_backend()
         vault.set_path(core.VAULT_FILE)   # re-point the (separate) DB connection vault
         caps_cache.clear()
+
+    @app.errorhandler(413)
+    def _payload_too_large(_e):
+        """Flask aborts oversized uploads before the route runs; without this the
+        client gets an HTML error page where it expects JSON."""
+        mb = app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024)
+        return jsonify({"error": f"That file is too large (limit {mb} MB)."}), 413
 
     @app.before_request
     def _require_login():
@@ -340,6 +455,12 @@ def create_app():
             "default_eval_prompt": logic.DEFAULT_EVAL_PROMPT,
             "evals": store.eval_summaries(),
             "default_criteria": evals.DEFAULT_CRITERIA,
+            "batch_projects": store.batch_project_summaries(),
+            "default_batch_project": batch_mod.new_project(),
+            "batch_source_kinds": batch_mod.SOURCE_KINDS,
+            "batch_exts": sorted(ingest.SUPPORTED_EXTS),
+            "memory_cores": memory.decorate_all(store.memory_cores_snapshot()),
+            "memory_categories": memory.CATEGORIES,
         })
 
     # ----------------------------- Profiles ---------------------------------
@@ -445,9 +566,9 @@ def create_app():
         if mode == "new":
             prof = pm.create_data(data.get("name", ""), seed="blank")
             dest = pm.data_dir(prof["id"])
-            # Carry over the RAG store, DB staging/audit and the credential vault that
-            # were written into the scratch during the session.
-            for name in ("rag.duckdb", "rag.duckdb.wal", "db", "db_vault.enc"):
+            # Carry over the RAG store, DB staging/audit, the credential vault and any
+            # attached images that were written into the scratch during the session.
+            for name in ("rag.duckdb", "rag.duckdb.wal", "db", "db_vault.enc", "images"):
                 src = scratch / name
                 if src.exists():
                     dst = dest / name
@@ -570,7 +691,8 @@ def create_app():
                    "rag_embed_parallel", "rag_embed_servers", "rag_ann_enabled",
                    "rag_backend",
                    "memory_weight_influence", "pipeline_max_retries",
-                   "provider_context_windows")
+                   "provider_context_windows",
+                   "image_max_dim", "image_full_res_default")
         patch = {k: data[k] for k in allowed if k in data}
         if "provider_context_windows" in patch:
             raw = patch["provider_context_windows"]
@@ -588,9 +710,17 @@ def create_app():
                 "vector", "keyword", "hybrid"):
             patch.pop("rag_retrieval_mode")
         for boolk in ("rag_contextual_chunking", "rag_query_rewrite",
-                      "rag_embed_parallel", "rag_ann_enabled"):
+                      "rag_embed_parallel", "rag_ann_enabled",
+                      "image_full_res_default"):
             if boolk in patch:
                 patch[boolk] = bool(patch[boolk])
+        if "image_max_dim" in patch:
+            try:
+                # Below ~256 an image carries no usable detail; above 8192 nothing
+                # accepts it and the base64 alone would swamp the context.
+                patch["image_max_dim"] = max(256, min(8192, int(patch["image_max_dim"])))
+            except Exception:
+                patch.pop("image_max_dim")
         if "rag_embed_servers" in patch:
             # [{base_url, enabled}] — no per-server model on purpose: the whole pool
             # embeds with rag_embed_model, since vectors from different embedding
@@ -680,6 +810,10 @@ def create_app():
         return jsonify({
             "tools": supported,
             "reasoning_hint": looks_like_reasoning_model(model),
+            # None = unknown (a cloud model we have no marker for). The UI stays
+            # quiet on None rather than guessing in either direction.
+            "vision": model_supports_vision(server_url, model),
+            "image_output": model_returns_images(server_url, model),
         })
 
     # ----------------------------- Chats ------------------------------------
@@ -750,6 +884,9 @@ def create_app():
     @app.route("/api/chats/<chat_id>", methods=["DELETE"])
     def api_chat_delete(chat_id):
         store.delete_chat(chat_id)
+        # Its images are now unreferenced. The age guard in images.gc keeps this from
+        # touching anything a still-open chat is using.
+        _gc_images()
         return jsonify({"ok": True})
 
     # -------------------- Chat export / import (native dialogs) -------------
@@ -765,7 +902,12 @@ def create_app():
             Path(dest).write_text(json.dumps(envelope, indent=2), encoding="utf-8")
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
-        return jsonify({"ok": True, "path": dest, "count": len(envelope.get("chats", []))})
+        return jsonify({"ok": True, "path": dest,
+                        "count": len(envelope.get("chats", [])),
+                        # An export is deliberately plaintext so it opens anywhere.
+                        # When it carries pictures, that is worth saying out loud.
+                        "images": len(envelope.get("images") or {}),
+                        "warnings": envelope.get("warnings") or []})
 
     @app.route("/api/chats/export", methods=["POST"])
     def api_chats_export():
@@ -928,9 +1070,15 @@ def create_app():
                               and compile_mod.library_status(lib, embed_model).get("state") != "compiled"]
                 if uncompiled:
                     names = ", ".join(f'"{n}"' for n in uncompiled)
-                    return ({"active": True, "blocked": True}, None,
-                            f"⚠ Library {names} needs compiling before RAG can use it — "
-                            f"open Resources → Compile Data.")
+                    msg = (f"⚠ Library {names} needs compiling before RAG can use it — "
+                           f"open Resources → Compile Data.")
+                    # Dropping the library also drops the Strict preamble, so a chat set
+                    # to answer ONLY from its references answers from general knowledge
+                    # this turn. Say so rather than letting it pass silently.
+                    if chat.get("library_strict"):
+                        msg += (" Strict mode is NOT in effect for this message — the "
+                                "answer may come from the model's own knowledge.")
+                    return ({"active": True, "blocked": True}, None, msg)
             mode = rag_plan.get("mode", "hybrid")
             queries = rag_plan.get("queries") or ([rag_plan["query"]] if rag_plan["query"] else [])
             # Prompt Reword: expand the message into 2-3 retrieval queries (+ keywords),
@@ -964,7 +1112,8 @@ def create_app():
             if rag_plan["data_text"]:
                 retrieved += rag.retrieve_inline(
                     qvecs, rag_plan["data_text"], embed_fn if wants_vectors else None,
-                    rag_plan["top_k"], mode=mode, queries=queries)
+                    rag_plan["top_k"], mode=mode, queries=queries,
+                    embed_model=embed_model)
             retrieved.sort(key=lambda d: d.get("score", -1.0), reverse=True)
             rag_retrieved = retrieved[:rag_plan["top_k"]]
             return rag_plan, rag_retrieved, f"📚 RAG ({mode}): injected {len(rag_retrieved)} relevant chunk(s)"
@@ -1003,6 +1152,12 @@ def create_app():
         think = model_is_reasoning(server_url, model)
         show_reasoning = not bool(chat.get("hide_thinking", False))
         tools_supported = model_supports_tools(server_url, model)
+        # 0 means "send the originals untouched"; otherwise clamp the long edge, which
+        # is what keeps a handful of phone photos from eating the whole context window.
+        image_max_dim = (0 if chat.get("image_full_res")
+                         else int(store.config.get("image_max_dim")
+                                  or images_mod.DEFAULT_MAX_DIM))
+        pinned_images = logic.attachment_images(chat)
 
         # Multi-Pass: N refinement rounds after the initial answer.
         multi = bool(chat.get("multi_pass"))
@@ -1047,9 +1202,15 @@ def create_app():
                         yield ("status", {"message": rag_status})
                     if use_rag:
                         messages = logic.build_messages(chat, store.libraries, skip_library_dump=True)
+                        # Pinned attachments go in first so the RAG excerpts stay the
+                        # message closest to the question.
+                        messages = logic.inject_attachments(
+                            messages, logic.resolve_attachments(chat, use_rag))
                         messages = logic.inject_rag(messages, rag_retrieved, store.libraries)
                     else:
                         messages = logic.build_messages(chat, store.libraries)
+                        messages = logic.inject_attachments(
+                            messages, logic.resolve_attachments(chat, use_rag))
                     ws = logic.resolve_web_search(chat, store.config, search_query, tools_supported)
                     if ws["worker_query"]:
                         yield ("status", {"message":
@@ -1064,6 +1225,12 @@ def create_app():
                                                 "content": "", "reasoning": ""})
                             break
                         messages = logic.inject_research(messages, ws["worker_query"], research)
+                    # What the assistant has learned about this user, if the chat opted
+                    # in. Pass 0 only, like RAG — refinement passes rework an answer
+                    # that was already written with the memory in view.
+                    mem_core = memory.resolve_memory(chat, store.memory_cores_snapshot())
+                    if mem_core:
+                        messages = logic.inject_memory(messages, memory.render_core(mem_core))
                     pass_tools = ws["tools"]
                     tool_executor = logic.make_tool_executor(
                         stop_event, min_pages=ws["min_pages"], allowed_domains=ws["allowed_domains"])
@@ -1076,13 +1243,36 @@ def create_app():
                     else:
                         messages = logic.build_eval_messages(
                             chat, input_prompt, last_answer, store.libraries, pass_use_system)
+                    # Pinned attachments follow into every refinement round. They are
+                    # reference material for the whole conversation, and the pass that
+                    # writes the FINAL answer is the one that most needs to see them.
+                    # (Memory is deliberately pass-0 only — see above — because the
+                    # answer being refined was already written with it in view.)
+                    messages = logic.inject_attachments(
+                        messages, logic.resolve_attachments(chat, use_rag))
                     pass_tools, tool_executor = None, None
+
+                # Pinned images follow into every pass, like the attachment block:
+                # material pinned to the conversation is meant to be in view for the
+                # whole of it, and the pass writing the final answer needs it most.
+                messages = logic.inject_images(messages, pinned_images)
 
                 # Context-usage: pre-call estimate (breakdown + full prompt) so the
                 # bar can move while the request is in flight. Isolation is inherently
                 # correct here — excluded history was never in `messages`.
+                # Measured BEFORE hydration, so the tracker never walks base64.
                 breakdown = context_tracker.breakdown_from_messages(messages)
                 prompt_estimate = context_tracker.estimate_messages(messages)
+                # Attached images cost real prompt tokens the text estimate can't see —
+                # without this an image-only turn reports as free and the bar lies.
+                image_tokens = images_mod.estimate_message_tokens(messages)
+                if image_tokens:
+                    prompt_estimate += image_tokens
+                    breakdown["user"] = breakdown.get("user", 0) + image_tokens
+
+                # Swap image ids for inline bytes. The one place image data is read
+                # during a generation; the adapters reshape it per provider from here.
+                messages = images_mod.hydrate_messages(messages, image_max_dim)
                 yield ("context", {
                     "phase": "start", "chat_id": chat_id,
                     "server": server_id, "server_name": server_name,
@@ -1093,6 +1283,7 @@ def create_app():
                 })
 
                 content, reasoning = "", ""
+                pass_images = []
                 exact_usage = None
                 for kind, text in adapter.chat_stream(
                     model, messages, options, stop_event,
@@ -1104,6 +1295,14 @@ def create_app():
                         if show_reasoning:
                             reasoning += text
                             yield ("reasoning", {"content": text})
+                    elif kind == "image":
+                        # Store the bytes and forward only the record: the same
+                        # megabytes would otherwise cross the wire twice (once
+                        # JSON-escaped into an SSE frame, once in the persist body).
+                        rec = _store_model_image(text)
+                        if rec:
+                            pass_images.append(rec)
+                            yield ("image", rec)
                     else:
                         content += text
                         yield ("chunk", {"content": text})
@@ -1133,7 +1332,8 @@ def create_app():
 
                 yield ("pass_end", {"label": label, "intermediate": intermediate,
                                     "content": content,
-                                    "reasoning": reasoning if show_reasoning else ""})
+                                    "reasoning": reasoning if show_reasoning else "",
+                                    "images": pass_images})
         except Exception as e:
             yield ("error", {"message": str(e)})
 
@@ -1216,7 +1416,7 @@ def create_app():
                 return [[] for _ in texts]
         return embed_fn, embed_model
 
-    def _persona_engine(persona, chat, run_id):
+    def _persona_engine(persona, chat, run_id, variant=""):
         """Assemble a PipelineEngine with real Ollama/provider + persona-store I/O."""
         server_url = chat.get("server_url") or DEFAULT_LOCAL_URL
         adapter = adapter_for(server_url)
@@ -1227,19 +1427,34 @@ def create_app():
         reword = persona.get("stores", {}).get("prompt_reword", True)
         top_k = int(store.config.get("rag_top_k") or 6)
         wants_vectors = mode in ("vector", "hybrid")
-        stop_event = runs.new(run_id)
+        try:
+            temperature = float(persona.get("models", {}).get("temperature", 0.7))
+        except (TypeError, ValueError):
+            temperature = 0.7
+        # A mutable holder, not the Event itself: each action (start, then any re-run
+        # from a step) registers a FRESH Event with `runs`, and llm_stream has to see
+        # the current one or Stop stops nothing. _pipeline_sse rebinds holder["event"].
+        stop_holder = {"event": runs.new(run_id)}
+        # The persona pipeline is otherwise isolated from the chat's context (no
+        # libraries, attachments, or web search), but the chat's own system prompt is a
+        # standing instruction from the user and applies to a persona answer too.
+        chat_system, _pre = logic._resolve_prompts(chat)
 
         def llm_complete(model, messages, schema):
+            # Pass the run's stop event: without it every structured step ran to
+            # completion after the user pressed Stop.
             return rewrite.run_completion(adapter, model or chat_model, messages,
                                           num_ctx=chat.get("num_ctx") or 4096,
                                           max_tokens=store.config.get("max_output_tokens", 4096),
-                                          fmt=schema)
+                                          fmt=schema, temperature=temperature,
+                                          stop=stop_holder["event"])
 
         def llm_stream(model, messages):
             options = {"num_ctx": chat.get("num_ctx") or 4096,
-                       "max_output_tokens": store.config.get("max_output_tokens", 16000)}
+                       "max_output_tokens": store.config.get("max_output_tokens", 16000),
+                       "temperature": temperature}
             for kind, text in adapter.chat_stream(model or chat_model, messages, options,
-                                                  stop_event, think=False):
+                                                  stop_holder["event"], think=False):
                 if kind == "content":
                     yield text
 
@@ -1269,8 +1484,10 @@ def create_app():
             persona, llm_complete=llm_complete, llm_stream=llm_stream,
             knowledge_search=knowledge_search, memory_search=memory_search,
             rewrite_queries=rewrite_queries, emit=None,
-            max_retries=int(store.config.get("pipeline_max_retries", 3)))
-        eng._stop_event = stop_event
+            max_retries=int(store.config.get("pipeline_max_retries", 3)),
+            should_stop=lambda: stop_holder["event"].is_set(),
+            variant=variant, extra_system=chat_system)
+        eng._stop_holder = stop_holder
         return eng
 
     def _pipeline_sse(run_id, action):
@@ -1285,6 +1502,13 @@ def create_app():
                 yield sse("done", {})
             return _missing()
         eng.emit = lambda ev, data: frames.put((ev, data))
+        # Re-register with the stop registry for EVERY action, not just the first.
+        # The generator's `finally` calls runs.done(run_id), so after the initial run
+        # the engine was holding an Event nobody could reach: a re-run from a step
+        # streamed to completion with POST /api/stop answering "not found".
+        holder = getattr(eng, "_stop_holder", None)
+        if holder is not None:
+            holder["event"] = runs.new(run_id)
 
         def work():
             try:
@@ -1405,7 +1629,7 @@ def create_app():
         pool, embed_model, embed_url = _compile_embedder(persona)
         contextualize = _compile_contextualizer(embed_url, want_ctx)
         batch_size, max_workers = _compile_tuning()
-        run_id = body.get("run_id") or f"compile-persona-{pid}"
+        run_id = body.get("run_id") or f"compile-persona-{pid}-{uuid.uuid4().hex[:8]}"
 
         def work(emit, stop_event):
             compile_mod.compile_persona(persona, pool, embed_model,
@@ -1575,8 +1799,9 @@ def create_app():
             return jsonify({"error": str(e)}), 404
         user_message = _persona_user_message(chat)
         history = rewrite.history_text(chat.get("messages", []))
-        eng = _persona_engine(persona, chat, run_id)
-        pipeline_runs[run_id] = eng
+        variant = data.get("variant") or chat.get("persona_variant") or ""
+        eng = _persona_engine(persona, chat, run_id, variant=variant)
+        _remember_run(run_id, eng)
         gen = _pipeline_sse(run_id, lambda e: e.start(user_message, history))
         return Response(stream_with_context(gen), mimetype="text/event-stream",
                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -1587,8 +1812,15 @@ def create_app():
         data = request.get_json(force=True) or {}
         if run_id not in pipeline_runs:
             return jsonify({"error": "run not found (start a new message)"}), 404
-        index = int(data.get("index", 0))
+        try:
+            index = int(data.get("index", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "index must be an integer"}), 400
+        # Out of range would otherwise surface as an IndexError inside the SSE stream.
+        if not (0 <= index < len(pipeline_runs[run_id].run.steps)):
+            return jsonify({"error": "step index out of range"}), 400
         edited = data.get("output", None)
+        pipeline_runs.move_to_end(run_id)   # a re-run keeps it clear of the LRU eviction
         gen = _pipeline_sse(run_id, lambda e: e.run_from(index, edited))
         return Response(stream_with_context(gen), mimetype="text/event-stream",
                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -1604,24 +1836,39 @@ def create_app():
         "required": ["title", "description"],
     }
 
+    def _persona_or_404(pid):
+        """(persona, None) or (None, error_response). Every persona sub-resource route
+        goes through this: without it an unknown id fell through to the store layer,
+        which answered 200 with an empty list (and used to scaffold a folder for it),
+        and a malformed id raised PersonaError into a 500."""
+        try:
+            return psvc.load(pid), None
+        except persona_mod.PersonaError as e:
+            return None, (jsonify({"error": str(e)}), 404)
+
     @app.route("/api/personas/<pid>/memories", methods=["GET"])
     def api_persona_memories(pid):
+        _p, err = _persona_or_404(pid)
+        if err:
+            return err
         return jsonify({"memories": memsvc.list_memories(pid)})
 
     @app.route("/api/personas/<pid>/memories", methods=["POST"])
     def api_persona_memory_create(pid):
         data = request.get_json(force=True) or {}
         mem = data.get("memory") or data
-        try:
-            persona = psvc.load(pid)
-        except persona_mod.PersonaError as e:
-            return jsonify({"error": str(e)}), 404
+        persona, err = _persona_or_404(pid)
+        if err:
+            return err
         embed_fn, embed_model = _persona_embed(persona)
         saved = memsvc.save_memory(pid, mem, embed_fn, embed_model)
         return jsonify({"memory": saved, "memories": memsvc.list_memories(pid)})
 
     @app.route("/api/personas/<pid>/memories/<mem_id>", methods=["DELETE"])
     def api_persona_memory_delete(pid, mem_id):
+        _p, err = _persona_or_404(pid)
+        if err:
+            return err
         memsvc.delete_memory(pid, mem_id)
         return jsonify({"ok": True, "memories": memsvc.list_memories(pid)})
 
@@ -1661,6 +1908,9 @@ def create_app():
     # ----------------------------- Persona knowledge ------------------------
     @app.route("/api/personas/<pid>/knowledge", methods=["GET"])
     def api_persona_kb_list(pid):
+        _p, err = _persona_or_404(pid)
+        if err:
+            return err
         return jsonify({"documents": kbsvc.list_documents(pid)})
 
     @app.route("/api/personas/<pid>/knowledge/add-files", methods=["POST"])
@@ -1674,6 +1924,9 @@ def create_app():
             return jsonify({"error": str(e)}), 404
         paths = native_dialog.pick_files(
             title="Add documents to persona knowledge", filetypes_key="documents")
+        # Unique per invocation: a fixed "addfiles-persona-<pid>" meant two concurrent
+        # runs for one persona shared a stop event, so cancelling one cancelled both.
+        run_id = f"addfiles-persona-{pid}-{uuid.uuid4().hex[:8]}"
         embed_url = store.config.get("rag_embed_server_url") or DEFAULT_LOCAL_URL
         embed_fn, embed_model = _persona_embed(persona)
         mode = persona.get("stores", {}).get("retrieval", "hybrid")
@@ -1684,7 +1937,8 @@ def create_app():
         contextualize = _contextualizer_for(ctx_model, embed_url)
 
         def work(emit, stop_event):
-            emit("begin", {"total": len(paths), "name": persona.get("profile", {}).get("name", "")})
+            emit("begin", {"total": len(paths), "run_id": run_id,
+                           "name": persona.get("profile", {}).get("name", "")})
             added, errors = [], []
             for i, p in enumerate(paths):
                 if stop_event is not None and stop_event.is_set():
@@ -1710,7 +1964,7 @@ def create_app():
             emit("complete", {"documents": kbsvc.list_documents(pid),
                               "added": added, "errors": errors})
 
-        return _compile_sse(work, f"addfiles-persona-{pid}")
+        return _compile_sse(work, run_id)
 
     @app.route("/api/personas/<pid>/knowledge/add-text", methods=["POST"])
     def api_persona_kb_add_text(pid):
@@ -1728,6 +1982,9 @@ def create_app():
 
     @app.route("/api/personas/<pid>/knowledge/<doc_id>", methods=["DELETE"])
     def api_persona_kb_remove(pid, doc_id):
+        _p, err = _persona_or_404(pid)
+        if err:
+            return err
         kbsvc.remove_document(pid, doc_id)
         return jsonify({"documents": kbsvc.list_documents(pid)})
 
@@ -1770,6 +2027,478 @@ def create_app():
             return jsonify({"error": f"import failed: {e}"}), 400
         return jsonify({"persona": persona, "personas": psvc.list_all()})
 
+    # ----------------------------- User memory cores ------------------------
+    # A memory core is the assistant's profile OF THE USER, grown from their chats and
+    # editable here. Distinct from persona memories above (in-character recollections,
+    # embedded + retrieved); a core is small, plain JSON, and injected whole. See
+    # app/memory.py for the model and the extraction prompts.
+
+    def _memory_eligible(chat, mode="auto"):
+        """Why a chat may not feed a memory core: '' when it may.
+
+        Incognito never writes anything to disk, and private chats are excluded — but an
+        explicit press of the Extract button in a private chat is the user asking for it,
+        so 'manual' overrides that one. The two reasons are reported separately because
+        they are not the same thing to the user; incognito used to be reported as
+        'private', which named the wrong cause."""
+        if store.incognito:
+            return "incognito"
+        if (chat or {}).get("private") and mode != "manual":
+            return "private"
+        return ""
+
+    # Shown when neither a rewrite model nor a chat model is available to run a pass.
+    _NO_MEMORY_MODEL = ("No model available for memory extraction. Set a Rewrite model "
+                        "in Settings, or open a chat with a model selected.")
+
+    def _memory_model(chat):
+        """(adapter, model) for a memory pass. Reuses the small helper model already
+        configured for query rewrite / the Rewrite button, falling back to the chat's
+        own model. Returns (None, '') when nothing is usable."""
+        model = store.config.get("rewrite_model") or (chat or {}).get("model") or ""
+        if not model:
+            return None, ""
+        server_url = ((chat or {}).get("server_url")
+                      or store.config.get("last_server_url") or DEFAULT_LOCAL_URL)
+        try:
+            return adapter_for(server_url), model
+        except Exception:
+            return None, ""
+
+    def _empty_summary():
+        return {"added": 0, "updated": 0, "merged": 0, "deleted": 0}
+
+    def _memory_ops(adapter, model, messages):
+        """One extractor call → ``(ok, operations)``. The single place a memory pass
+        talks to a model, so the eval route scores the same call the feature makes.
+
+        ``ok`` is False only when the call itself failed. That is deliberately distinct
+        from a call that succeeded and returned nothing: a pass the model never answered
+        must not be recorded as a consolidation attempt, or one flaky request would
+        suppress compaction until the core grew past its old size.
+        """
+        try:
+            raw = rewrite.run_completion(adapter, model, messages,
+                                         num_ctx=8192, max_tokens=1500,
+                                         fmt=memory.EXTRACT_SCHEMA)
+        except Exception:
+            return False, None
+        return True, (rewrite._extract_json(raw) or {}).get("operations")
+
+    def _memory_pass(core_id, build_messages, chat=None, after=None):
+        """Run one LLM pass and apply the operations it returns. Never raises — a
+        failed or unparseable pass is a no-op, because this runs behind an ordinary
+        send and must not be able to break it.
+
+        The core is resolved twice by id: once (unlocked) to build the prompt, and again
+        under the store lock to apply the result. Holding one reference across the whole
+        call let a concurrent entry edit or a delete race the write — and because
+        ``delete_memory_entry`` replaced the entries list, an in-flight pass could append
+        to a detached one and lose everything it learned. ``build_messages(core)`` and
+        the optional ``after(core)`` both run against a freshly resolved core.
+
+        Returns the summary dict; an empty one also covers "the core was deleted"."""
+        mc = store.get_memory_core(core_id)
+        if not mc:
+            return _empty_summary()
+        adapter, model = _memory_model(chat)
+        if not adapter:
+            return _empty_summary()
+        # Slow, and deliberately outside the lock: a pass must not block reads.
+        ok, ops = _memory_ops(adapter, model, build_messages(mc))
+        if not ok:
+            return _empty_summary()
+
+        def apply(core):
+            summary = memory.apply_operations(core, ops, source_chat=chat)
+            if after:
+                after(core)
+            return summary
+
+        _, summary = store.mutate_memory_core(core_id, apply)
+        return summary or _empty_summary()
+
+    def _memory_extract(core_id, chat, mark_built=False):
+        """Learn from one chat, then compact the core if that pushed it over the line.
+        Both halves go through the same operations vocabulary. Returns (summary, alive)
+        — ``alive`` is False once the core has been deleted, which ends a bulk build.
+
+        ``mark_built`` is set only by the retroactive build. The every-N-turns trigger
+        deliberately does not mark, because the chat it just read is still going: a later
+        build must be free to come back to it once it has grown."""
+        marker = (lambda c: _mark_built(c, chat)) if mark_built else None
+        transcript = memory.transcript_text(chat)
+        if not transcript.strip():
+            # An empty chat has nothing to teach — record it as read so a bulk build
+            # stops reconsidering it on every run.
+            if marker:
+                mc, _ = store.mutate_memory_core(core_id, marker)
+                return _empty_summary(), mc is not None
+            return _empty_summary(), store.get_memory_core(core_id) is not None
+
+        summary = _memory_pass(
+            core_id, lambda c: memory.build_extract_messages(c, transcript), chat,
+            after=marker)
+
+        mc = store.get_memory_core(core_id)
+        if not mc:
+            return summary, False
+        if memory.needs_consolidation(mc):
+            # Record the attempt whether or not it compacts anything — a pass that
+            # returns no operations is exactly what the backoff exists to stop repeating.
+            extra = _memory_pass(core_id, memory.build_consolidate_messages, chat,
+                                 after=memory.mark_consolidated)
+            for k, v in extra.items():
+                summary[k] = summary.get(k, 0) + v
+        return summary, store.get_memory_core(core_id) is not None
+
+    def _mark_built(core, chat):
+        """Remember that this core has read this chat, so a re-run of the retroactive
+        build doesn't pay for the whole history again."""
+        chat_id = (chat or {}).get("id") or ""
+        if not chat_id:
+            return
+        built = core.setdefault("built_chat_ids", [])
+        if chat_id not in built:
+            built.append(chat_id)
+
+    def _cores_payload():
+        """Every core, decorated with what each entry's injection status actually is."""
+        return memory.decorate_all(store.memory_cores_snapshot())
+
+    def _core_payload(core_id):
+        return memory.decorate_for_client(store.get_memory_core(core_id))
+
+    @app.route("/api/memory/cores", methods=["GET"])
+    def api_memory_cores():
+        """The tab's refresh path — re-reads on entering Memory, so edits made in
+        another browser tab or by a background pass don't leave it stale."""
+        return jsonify({"cores": _cores_payload(),
+                        "categories": memory.CATEGORIES})
+
+    @app.route("/api/memory/cores", methods=["POST"])
+    def api_memory_core_create():
+        data = request.get_json(force=True) or {}
+        mc = store.add_memory_core(data.get("name", ""))
+        return jsonify({"core": memory.decorate_for_client(mc), "cores": _cores_payload()})
+
+    @app.route("/api/memory/cores/<core_id>", methods=["PATCH"])
+    def api_memory_core_update(core_id):
+        mc = store.update_memory_core(core_id, request.get_json(force=True) or {})
+        if not mc:
+            return jsonify({"error": "not found"}), 404
+        return jsonify({"core": memory.decorate_for_client(mc), "cores": _cores_payload()})
+
+    @app.route("/api/memory/cores/<core_id>", methods=["DELETE"])
+    def api_memory_core_delete(core_id):
+        if not store.delete_memory_core(core_id):
+            return jsonify({"error": "not found"}), 404
+        # Deleting a core also clears it off every chat that referenced it, so the
+        # browser needs the refreshed summaries, not just the core list.
+        return jsonify({"ok": True, "cores": _cores_payload(),
+                        "chats": store.chat_summaries()})
+
+    @app.route("/api/memory/cores/<core_id>/entries", methods=["POST"])
+    def api_memory_entry_upsert(core_id):
+        data = request.get_json(force=True) or {}
+        entry, reason = store.upsert_memory_entry(core_id, data.get("entry") or data)
+        if entry is None:
+            problem = {
+                "core": ("memory core not found", 404),
+                "gone": ("That memory was deleted somewhere else — nothing to edit.", 409),
+                "text": ("A memory needs some text.", 400),
+            }.get(reason, ("could not save entry", 400))
+            return jsonify({"error": problem[0]}), problem[1]
+        return jsonify({"entry": entry, "core": _core_payload(core_id)})
+
+    @app.route("/api/memory/cores/<core_id>/entries/<entry_id>", methods=["DELETE"])
+    def api_memory_entry_delete(core_id, entry_id):
+        if not store.delete_memory_entry(core_id, entry_id):
+            return jsonify({"error": "not found"}), 404
+        return jsonify({"ok": True, "core": _core_payload(core_id)})
+
+    @app.route("/api/memory/extract", methods=["POST"])
+    def api_memory_extract():
+        """One extraction pass over a chat. ``mode`` is 'auto' (the every-N-turns
+        trigger) or 'manual' (the chat button, which may run on a private chat)."""
+        data = request.get_json(force=True) or {}
+        mode = data.get("mode") or "auto"
+        # The browser owns live chat state, so prefer the posted chat over the store's
+        # copy — an unsaved private chat has no stored copy at all.
+        chat = data.get("chat") or store.get_chat(data.get("chat_id") or "")
+        if not chat:
+            return jsonify({"error": "chat not found"}), 404
+        core_id = data.get("core_id") or ""
+        mc = store.get_memory_core(core_id)
+        if not mc:
+            return jsonify({"error": "memory core not found"}), 404
+        skipped = _memory_eligible(chat, mode)
+        if skipped:
+            return jsonify({"ok": False, "skipped": skipped, "summary": {},
+                            "core": memory.decorate_for_client(mc)})
+        if not _memory_model(chat)[0]:
+            return jsonify({"ok": False, "error": _NO_MEMORY_MODEL,
+                            "core": memory.decorate_for_client(mc)})
+        summary, alive = _memory_extract(core_id, chat)
+        if not alive:
+            return jsonify({"ok": False, "error": "That memory core was deleted."}), 404
+        # A pass that ran is a completed cycle, so the countdown restarts here rather
+        # than in the browser — a reload used to lose the count and two tabs on one chat
+        # used to double it.
+        stored = store.get_chat((chat or {}).get("id") or "")
+        if stored is not None:
+            stored["memory_turns_since"] = 0
+            store.save_chats()
+        return jsonify({"ok": True, "summary": summary,
+                        "text": memory.summary_text(summary),
+                        "core": _core_payload(core_id)})
+
+    @app.route("/api/memory/cores/<core_id>/consolidate", methods=["POST"])
+    def api_memory_consolidate(core_id):
+        """Manual refine pass: merge overlapping memories and sharpen wording."""
+        mc = store.get_memory_core(core_id)
+        if not mc:
+            return jsonify({"error": "not found"}), 404
+        if store.incognito:
+            return jsonify({"ok": False, "skipped": "incognito",
+                            "core": memory.decorate_for_client(mc)})
+        # No chat is involved in a refine pass, so only the configured helper model
+        # (plus the browser's current model, posted as a fallback) can run it.
+        data = request.get_json(silent=True) or {}
+        chat = {"model": data.get("model") or "",
+                "server_url": data.get("server_url")
+                or store.config.get("last_server_url") or DEFAULT_LOCAL_URL}
+        if not _memory_model(chat)[0]:
+            return jsonify({"ok": False, "error": _NO_MEMORY_MODEL,
+                            "core": memory.decorate_for_client(mc)})
+        summary = _memory_pass(core_id, memory.build_consolidate_messages, chat,
+                               after=memory.mark_consolidated)
+        if not store.get_memory_core(core_id):
+            return jsonify({"error": "That memory core was deleted."}), 404
+        return jsonify({"ok": True, "summary": summary,
+                        "text": memory.summary_text(summary),
+                        "core": _core_payload(core_id)})
+
+    @app.route("/api/memory/cores/<core_id>/build", methods=["POST"])
+    def api_memory_build(core_id):
+        """SSE. Retroactively grow a core from existing chats — one extraction pass per
+        chat, oldest first so later conversations refine what earlier ones established.
+        Private chats are skipped (this is the bulk path, never an explicit ask)."""
+        mc = store.get_memory_core(core_id)
+        if not mc:
+            return jsonify({"error": "not found"}), 404
+        data = request.get_json(force=True) or {}
+        ids = data.get("chat_ids")
+        run_id = data.get("run_id")
+        chats = [c for c in store.chats if ids is None or c.get("id") in set(ids)]
+        chats = [c for c in chats if not _memory_eligible(c, "auto")]
+        # Skip what this core has already read unless the user asked to start over —
+        # a second run used to re-pay for the entire history.
+        skipped = 0
+        if not data.get("reread"):
+            already = set(mc.get("built_chat_ids") or [])
+            before = len(chats)
+            chats = [c for c in chats if c.get("id") not in already]
+            skipped = before - len(chats)
+        chats.sort(key=lambda c: c.get("created") or "")
+
+        def work(emit, stop_event):
+            total = len(chats)
+            if not total:
+                emit("status", {"message": (
+                    f"Nothing new to read — all {skipped} chat(s) already learned from."
+                    if skipped else "No eligible chats to learn from.")})
+                emit("built", {"summary": _empty_summary(), "text": "",
+                               "core": _core_payload(core_id)})
+                return
+            if not _memory_model(chats[0])[0]:
+                emit("error", {"message": _NO_MEMORY_MODEL})
+                return
+            if skipped:
+                emit("status", {"message": f"Skipping {skipped} chat(s) already read."})
+            # Frame shape matches the shared compile progress UI (makeProgressUI).
+            emit("plan", {"phases": [{"id": "chats", "weight": 1}]})
+            totals = _empty_summary()
+            for i, chat in enumerate(chats):
+                if stop_event is not None and stop_event.is_set():
+                    break
+                emit("status", {"message": f"Reading “{chat.get('title') or 'Untitled'}”…"})
+                summary, alive = _memory_extract(core_id, chat, mark_built=True)
+                for k, v in summary.items():
+                    totals[k] = totals.get(k, 0) + v
+                if not alive:
+                    # The core was deleted from another tab. Stop rather than spending
+                    # the rest of the run on an orphan nobody will ever see.
+                    emit("error", {"message": "That memory core was deleted — build stopped."})
+                    return
+                emit("progress", {"phase": "chats", "label": "reading chats",
+                                  "unit": "chats", "done": i + 1, "total": total})
+            emit("built", {"summary": totals, "text": memory.summary_text(totals),
+                           "core": _core_payload(core_id)})
+
+        return _compile_sse(work, run_id)
+
+    # ------------------- scoring the extractor itself -------------------
+    # Everything above tests that the memory pipeline *works*. This measures whether it
+    # remembers the RIGHT things — the one question a stub model can never answer.
+
+    def _eval_core_from(text):
+        """A throwaway core seeded with one memory per line, as the tab lists them.
+        Never enters the store: an eval must not leave anything behind."""
+        mc = memory.new_core("evaluation")
+        for line in (text or "").splitlines():
+            line = line.strip()
+            if line:
+                mc["entries"].append(memory.new_entry(line, origin="user"))
+        return mc
+
+    def _eval_response_text(ops, mc, summary):
+        """What the judge is shown: the operations the extractor chose, and the profile
+        they produced. Both, because a plausible-looking operation list can still add up
+        to a bad profile."""
+        return (
+            "Operations returned by the extractor:\n"
+            + json.dumps(ops if isinstance(ops, list) else [], indent=2)
+            + "\n\nResulting memory profile:\n"
+            + (memory.render_core_for_prompt(mc) or "(no memories)")
+            + f"\n\nCounts: {memory.summary_text(summary) or 'nothing changed'}"
+        )
+
+    @app.route("/api/memory/eval", methods=["POST"])
+    def api_memory_eval():
+        """SSE. Score the memory extractor against a judge model.
+
+        Each row is a transcript plus the memories already held. The row runs through the
+        *production* extractor — ``build_extract_messages`` → ``_memory_ops`` (schema and
+        all) → ``apply_operations`` — against a scratch core that is never stored, and the
+        judge then grades what came out.
+
+        Deliberately not the generic eval runner: that builds a single user message with
+        no schema and routes it through ``generate_one``, so it would score a hand-copied
+        paraphrase of the extractor prompt that drifts the moment ``_EXTRACT_SYS`` is
+        edited. The scoring half of ``app/evals.py`` is reused verbatim.
+        """
+        data = request.get_json(force=True) or {}
+        project = data.get("eval") or {}
+        run_id = data.get("run_id")
+        rows = project.get("rows") or []
+        criteria = project.get("criteria") or evals.MEMORY_CRITERIA
+        if not rows:
+            return jsonify({"error": "Add at least one transcript to score."}), 400
+        if not project.get("grader_model"):
+            return jsonify({"error": "Pick a grader model."}), 400
+        if not project.get("gen_model"):
+            return jsonify({"error": "Pick the model whose extraction you want scored."}), 400
+        graded_project = {**project, "criteria": criteria}
+
+        def work(emit, stop_event):
+            try:
+                gen_adapter = adapter_for(project.get("gen_server_url") or DEFAULT_LOCAL_URL)
+                grader_adapter = adapter_for(project.get("grader_server_url")
+                                             or project.get("gen_server_url")
+                                             or DEFAULT_LOCAL_URL)
+            except Exception as e:
+                emit("error", {"message": f"Could not reach a model server: {e}"})
+                return
+            emit("plan", {"phases": [{"id": "rows", "weight": 1}]})
+            all_grades = []
+            for i, row in enumerate(rows):
+                if stop_event is not None and stop_event.is_set():
+                    break
+                transcript = (row.get("Transcript") or "").strip()
+                emit("status", {"message": f"Row {i + 1} of {len(rows)}: extracting…"})
+                if not transcript:
+                    emit("row_result", {"row": i, "ungraded": True,
+                                        "note": "empty transcript"})
+                    emit("progress", {"phase": "rows", "label": "rows", "unit": "rows",
+                                      "done": i + 1, "total": len(rows)})
+                    continue
+
+                mc = _eval_core_from(row.get("ExistingMemories"))
+                messages = memory.build_extract_messages(mc, transcript)
+                # An extractor that fails is still a result worth grading: it recorded
+                # nothing, which the judge scores like any other empty answer.
+                _ok, ops = _memory_ops(gen_adapter, project["gen_model"], messages)
+                summary = memory.apply_operations(mc, ops)
+                task = messages[-1].get("content", "")
+                response = _eval_response_text(ops, mc, summary)
+
+                emit("status", {"message": f"Row {i + 1} of {len(rows)}: grading…"})
+                try:
+                    raw = rewrite.run_completion(
+                        grader_adapter, project["grader_model"],
+                        evals.build_grader_messages(graded_project, task, response),
+                        num_ctx=8192, max_tokens=1200, stop=stop_event)
+                    grades = evals.normalize_grades(evals.parse_grader_json(raw), criteria)
+                except Exception as e:
+                    emit("status", {"message": f"Row {i + 1} could not be graded: {e}"})
+                    grades = evals.normalize_grades({}, criteria)
+
+                scored = any(g.get("score") is not None for g in grades.values())
+                if scored:
+                    all_grades.append(grades)
+                emit("row_result", {
+                    "row": i, "ungraded": not scored, "grades": grades,
+                    "operations": ops if isinstance(ops, list) else [],
+                    "summary": summary, "note": row.get("Note", ""),
+                    "profile": memory.render_core_for_prompt(mc),
+                })
+                emit("progress", {"phase": "rows", "label": "rows", "unit": "rows",
+                                  "done": i + 1, "total": len(rows)})
+
+            emit("summary", {"aggregate": evals.aggregate(all_grades, criteria),
+                             "rows": len(rows)})
+
+        return _compile_sse(work, run_id)
+
+    @app.route("/api/memory/eval/seed", methods=["GET"])
+    def api_memory_eval_seed():
+        """The starting dataset and criteria for the extractor eval."""
+        return jsonify({"rows": [dict(r) for r in evals.MEMORY_SEED_ROWS],
+                        "criteria": [dict(c) for c in evals.MEMORY_CRITERIA]})
+
+    @app.route("/api/memory/cores/export", methods=["POST"])
+    def api_memory_export():
+        """Export all cores (scope='all') or a subset (ids=[...]) to a JSON file the
+        user picks. Exports stay plaintext by design, like chat exports."""
+        data = request.get_json(force=True) or {}
+        ids = None if data.get("scope") == "all" else (data.get("ids") or None)
+        envelope = store.export_memory_cores(ids)
+        cores = envelope.get("cores") or []
+        default_name = ("all_memory_cores.json" if ids is None or len(cores) != 1
+                        else (cores[0].get("name") or "memory_core").strip().replace(" ", "_") + ".json")
+        dest = native_dialog.save_file(title="Export memory cores as JSON",
+                                       default_name=default_name, filetypes_key="json")
+        if not dest:
+            return jsonify({"ok": False, "cancelled": True})
+        try:
+            if not dest.lower().endswith(".json"):
+                dest += ".json"
+            Path(dest).write_text(json.dumps(envelope, indent=2), encoding="utf-8")
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": True, "path": dest, "count": len(cores)})
+
+    @app.route("/api/memory/cores/import", methods=["POST"])
+    def api_memory_import():
+        """Import cores from a JSON export. Fresh ids throughout, so importing never
+        overwrites a core the user already has."""
+        paths = native_dialog.pick_files(title="Import memory cores (JSON)",
+                                         filetypes_key="json")
+        if not paths:
+            return jsonify({"ok": False, "cancelled": True})
+        path = Path(paths[0])
+        try:
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"Could not read file: {e}"}), 400
+        try:
+            imported, count = store.import_memory_cores(envelope)
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+        return jsonify({"ok": True, "count": count, "cores": _cores_payload(),
+                        "imported": [c.get("id") for c in imported]})
+
     # ------------------- Multi-server parallel processing -------------------
     def _parallel_lanes():
         """Resolve the saved parallel_servers into lane dicts (with credentials)."""
@@ -1780,13 +2509,24 @@ def create_app():
                           "name": srv.get("name") or srv["base_url"]})
         return lanes
 
-    def _parallel_sse(items, run_id, on_item_done=None):
+    def _parallel_sse(items, run_id, on_item_done=None, lanes=None, mode=None,
+                      stop_event=None):
         """Shared SSE generator: fan `items` across the saved lanes and multiplex
         every frame into one stream. on_item_done(frame) runs server-side as each
-        item finishes (e.g. to write a batch response to disk) before forwarding."""
-        stop_event = runs.new(run_id)
-        lanes = _parallel_lanes()
-        mode = store.config.get("parallel_mode", "balanced")
+        item finishes (e.g. to write a batch response to disk) before forwarding.
+
+        ``lanes``/``mode`` override the saved multi-server config. The Batch tab uses
+        this to run through a SINGLE synthetic lane when multi-server processing is
+        off — a one-lane run_parallel is exactly the sequential case, which means batch
+        needs no second generation loop of its own. ``stop_event`` lets a caller that
+        already registered the run (e.g. to resolve sources first) reuse it instead of
+        registering a second time."""
+        if stop_event is None:
+            stop_event = runs.new(run_id)
+        if lanes is None:
+            lanes = _parallel_lanes()
+        if mode is None:
+            mode = store.config.get("parallel_mode", "balanced")
         frames = queue.Queue()
         sentinel = object()
 
@@ -1945,6 +2685,15 @@ def create_app():
         return jsonify({"config": store.masked_config()})
 
     # ----------------------------- Libraries --------------------------------
+    def _append_items(lib_id, items):
+        """Atomically append freshly fetched items to a library, re-reading it under
+        the store lock. The add routes run for minutes; writing back the dict they read
+        at request start clobbered any autosave that landed in between. Returns the
+        updated library, or None if it was deleted mid-flight."""
+        if not items:
+            return store.get_library(lib_id)
+        return store.append_library_items(lib_id, items)
+
     @app.route("/api/libraries", methods=["GET"])
     def api_libraries_get():
         return jsonify({"libraries": store.libraries})
@@ -1967,6 +2716,8 @@ def create_app():
 
     @app.route("/api/libraries/<lib_id>", methods=["DELETE"])
     def api_library_delete(lib_id):
+        # delete_library also strips the id from every chat's library_ids — a dangling
+        # reference would keep RAG active for those chats with nothing to retrieve.
         store.delete_library(lib_id)
         rag.delete_source(lib_id)          # drop this library's vectors
         compile_mod.forget_library(lib_id) # drop its compile manifest
@@ -1999,31 +2750,42 @@ def create_app():
             else:
                 wanted.append(str(path))
 
+        # Unique per invocation. A fixed "addfiles-library-<id>" meant two runs on one
+        # library shared a registry slot: RunRegistry.new OVERWRITES, so the first run's
+        # stop event was orphaned and unreachable, and whichever generator finished
+        # first deregistered the other's. Clients read the id off _compile_sse's own
+        # `start` frame rather than composing it.
+        run_id = f"addfiles-library-{lib_id}-{uuid.uuid4().hex[:8]}"
+
         def work(emit, stop_event):
             emit("begin", {"total": len(wanted), "name": lib.get("name", "")})
-            added = []
+            added, items = [], []
             errs = list(errors)
             if wanted:
                 results = ingest.extract_many(
                     wanted,
                     on_progress=lambda d, t, name: emit(
                         "progress", {"phase": "parse", "done": d, "total": t,
-                                     "unit": "files", "name": name}))
+                                     "unit": "files", "name": name}),
+                    should_stop=lambda: bool(stop_event and stop_event.is_set()))
                 for res in results:
                     name = Path(res.get("path", "")).name
                     if not res.get("ok"):
                         errs.append(f"{name}: {res.get('error', 'parse failed')}")
                         continue
-                    item = _new_library_item(item_type="file", label=name,
-                                             content=res.get("text") or "",
-                                             filename=name)
-                    lib.setdefault("items", []).append(item)
+                    items.append(_new_library_item(item_type="file", label=name,
+                                                   content=res.get("text") or "",
+                                                   filename=name))
                     added.append(name)
-            lib["updated"] = datetime.utcnow().isoformat()
-            store.upsert_library(lib)
-            emit("complete", {"library": lib, "added": added, "errors": errs})
+            saved = _append_items(lib_id, items)
+            if saved is None:
+                emit("error", {"message": "That library was deleted while the files "
+                                          "were being read."})
+                return
+            emit("complete", {"library": saved, "added": added,
+                              "added_items": items, "errors": errs})
 
-        return _compile_sse(work, f"addfiles-library-{lib_id}")
+        return _compile_sse(work, run_id)
 
     @app.route("/api/libraries/<lib_id>/add-url", methods=["POST"])
     def api_library_add_url(lib_id):
@@ -2044,10 +2806,11 @@ def create_app():
             return jsonify({"library": lib, "added": [], "errors": [str(e)]})
         item = _new_library_item(item_type="url", label=page["title"],
                                  content=page["text"], filename=page["url"])
-        lib.setdefault("items", []).append(item)
-        lib["updated"] = datetime.utcnow().isoformat()
-        store.upsert_library(lib)
-        return jsonify({"library": lib, "added": [page["title"]], "errors": [],
+        saved = _append_items(lib_id, [item])
+        if saved is None:
+            return jsonify({"error": "that library was deleted"}), 404
+        return jsonify({"library": saved, "added": [page["title"]],
+                        "added_items": [item], "errors": [],
                         "via": page.get("via")})
 
     @app.route("/api/libraries/<lib_id>/brave-search", methods=["GET"])
@@ -2066,28 +2829,38 @@ def create_app():
             max_results = int(request.args.get("max") or 5)
         except ValueError:
             max_results = 5
+        # Clamped here as well as in the browser: the <input max> attribute is not
+        # enforced against a typed value, and a mistyped 500 is 500 page fetches.
+        max_results = max(1, min(core.MAX_CRAWL_PAGES, max_results))
 
-        def work(emit):
+        def work(emit, stop_event):
             pages, errors, attempted = [], [], 0
-            for ev in core.crawl_search(query, sites=sites, max_results=max_results):
+            for ev in core.crawl_search(query, sites=sites, max_results=max_results,
+                                        should_stop=lambda: bool(stop_event and stop_event.is_set())):
                 if ev.get("type") == "progress":
                     emit("progress", ev)
                 elif ev.get("type") == "result":
                     pages = ev.get("pages") or []
                     errors = ev.get("errors") or []
                     attempted = ev.get("attempted") or 0
-            added = []
+            added, items = [], []
             for p in pages:
-                item = _new_library_item(item_type="url", label=p["title"],
-                                         content=p["text"], filename=p["url"])
-                lib.setdefault("items", []).append(item)
+                items.append(_new_library_item(item_type="url", label=p["title"],
+                                               content=p["text"], filename=p["url"]))
                 added.append(p["title"])
-            if pages:
-                lib["updated"] = datetime.utcnow().isoformat()
-                store.upsert_library(lib)
-            emit("complete", {"library": lib, "added": added,
+            saved = _append_items(lib_id, items)
+            if saved is None:
+                emit("error", {"message": "That library was deleted while the crawl "
+                                          "was running."})
+                return
+            emit("complete", {"library": saved, "added": added, "added_items": items,
                               "attempted": attempted, "errors": errors})
-        return _compile_sse(work)
+        # A run_id is what gives this stream a stop event at all: without one
+        # _compile_sse passes stop_event=None, so should_stop above was permanently
+        # False and neither the Stop button nor a client disconnect could end the crawl.
+        # Unique per invocation (see the add-files route) — the client takes the id from
+        # the `start` frame instead of composing it from the library id.
+        return _compile_sse(work, f"brave-library-{lib_id}-{uuid.uuid4().hex[:8]}")
 
     @app.route("/api/libraries/import-xml", methods=["POST"])
     def api_library_import_xml():
@@ -2126,12 +2899,308 @@ def create_app():
             return jsonify({"ok": False, "error": str(e)}), 500
         return jsonify({"ok": True, "path": dest})
 
+    # ----------------------------- YouTube ----------------------------------
+    def _youtube_params():
+        """Read the shared query params for both YouTube routes.
+        Returns (url, include_comments, max_comments)."""
+        url = (request.args.get("url") or "").strip()
+        include_comments = (request.args.get("comments") or "1") not in ("0", "false", "")
+        try:
+            max_comments = int(request.args.get("max") or youtube.DEFAULT_MAX_COMMENTS)
+        except ValueError:
+            max_comments = youtube.DEFAULT_MAX_COMMENTS
+        return url, include_comments, max_comments
+
+    def _youtube_fetch_work(url, include_comments, max_comments, on_complete):
+        """Build the SSE worker shared by the library and chat YouTube routes.
+
+        ``on_complete(emit, result)`` decides what happens with the fetched video —
+        appending it to a library, or just handing the text back to the composer.
+        """
+        def work(emit, stop_event):
+            emit("begin", {"url": url, "comments": include_comments,
+                           "max": max_comments})
+            result = youtube.fetch_video(
+                url,
+                include_comments=include_comments,
+                max_comments=max_comments,
+                on_progress=lambda phase, **fields: emit(
+                    "progress", {"phase": phase, **fields}),
+                should_stop=lambda: bool(stop_event and stop_event.is_set()),
+            )
+            on_complete(emit, result)
+        return work
+
+    @app.route("/api/libraries/<lib_id>/add-youtube", methods=["GET"])
+    def api_library_add_youtube(lib_id):
+        """SSE (EventSource is GET-only). Query params: url, comments (0/1), max.
+
+        Fetches a video's transcript and comments and appends them as a single
+        'youtube' library item. The watch URL goes in the item's ``filename`` exactly
+        like 'url' items do, so it round-trips through XML export/import.
+        """
+        lib = store.get_library(lib_id)
+        if not lib:
+            return jsonify({"error": "not found"}), 404
+        url, include_comments, max_comments = _youtube_params()
+        if not url:
+            return jsonify({"error": "no url"}), 400
+
+        def on_complete(emit, result):
+            item = _new_library_item(item_type="youtube", label=result["title"],
+                                     content=result["text"], filename=result["url"])
+            saved = _append_items(lib_id, [item])
+            if saved is None:
+                emit("error", {"message": "That library was deleted while the video "
+                                          "was being fetched."})
+                return
+            emit("complete", {"library": saved, "added": [result["title"]],
+                              "added_items": [item],
+                              "via": result.get("via"), "errors": result.get("errors") or [],
+                              "comment_count": len(result.get("comments") or []),
+                              "transcript_chars": len(result.get("transcript") or "")})
+
+        # Unique per invocation (see the add-files route); the client reads the id off
+        # the `start` frame rather than composing it from the library id, which it could
+        # only do from whichever library happened to be selected when Cancel was pressed.
+        return _compile_sse(
+            _youtube_fetch_work(url, include_comments, max_comments, on_complete),
+            f"youtube-library-{lib_id}-{uuid.uuid4().hex[:8]}")
+
+    @app.route("/api/youtube/fetch", methods=["GET"])
+    def api_youtube_fetch():
+        """SSE. Same params as the library route, but writes nothing — the composer
+        stages the returned text as a chat attachment instead."""
+        url, include_comments, max_comments = _youtube_params()
+        if not url:
+            return jsonify({"error": "no url"}), 400
+
+        def on_complete(emit, result):
+            emit("complete", {"title": result["title"], "url": result["url"],
+                              "text": result["text"], "via": result.get("via"),
+                              "errors": result.get("errors") or [],
+                              "comment_count": len(result.get("comments") or []),
+                              "transcript_chars": len(result.get("transcript") or "")})
+
+        return _compile_sse(
+            _youtube_fetch_work(url, include_comments, max_comments, on_complete),
+            f"youtube-chat-{uuid.uuid4().hex[:8]}")
+
+    # ------------------ Chat-scoped sources (no library write) --------------
+    # The composer offers the same sources as the Resources tab, for material that
+    # belongs to one conversation rather than a reusable library. Each route is its
+    # library counterpart with the item-append tail removed.
+
+    @app.route("/api/fetch-url", methods=["POST"])
+    def api_fetch_url():
+        """Body: {url}. Scrape a page to readable text and return it un-stored."""
+        url = ((request.get_json(force=True) or {}).get("url") or "").strip()
+        if not url:
+            return jsonify({"error": "no url"}), 400
+        try:
+            page = core.fetch_url_text(url)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify(page)
+
+    @app.route("/api/extract-files", methods=["POST"])
+    def api_extract_files():
+        """SSE. Native multi-file picker + parallel document parsing, returning the
+        extracted text rather than writing it anywhere."""
+        paths = native_dialog.pick_files(
+            title="Attach document(s) to this chat", filetypes_key="documents")
+        errors = []
+        wanted = []
+        for p in paths:
+            path = Path(p)
+            if not ingest.is_supported(path):
+                errors.append(f"{path.name}: unsupported type")
+            else:
+                wanted.append(str(path))
+
+        def work(emit, stop_event):
+            emit("begin", {"total": len(wanted)})
+            docs = []
+            errs = list(errors)
+            if wanted:
+                results = ingest.extract_many(
+                    wanted,
+                    on_progress=lambda d, t, name: emit(
+                        "progress", {"phase": "parse", "done": d, "total": t,
+                                     "unit": "files", "name": name}))
+                for res in results:
+                    name = Path(res.get("path", "")).name
+                    if not res.get("ok"):
+                        errs.append(f"{name}: {res.get('error', 'parse failed')}")
+                        continue
+                    docs.append({"title": res.get("title") or name,
+                                 "filename": name,
+                                 "text": res.get("text") or ""})
+            emit("complete", {"docs": docs, "errors": errs})
+
+        return _compile_sse(work, f"extract-files-{uuid.uuid4().hex[:8]}")
+
+    @app.route("/api/brave-search-text", methods=["GET"])
+    def api_brave_search_text():
+        """SSE. Query params: q, sites, max. Same discovery + crawl as the library
+        Brave search, returning the pages instead of storing them."""
+        query = (request.args.get("q") or "").strip()
+        sites = [s.strip() for s in (request.args.get("sites") or "").split(",") if s.strip()]
+        try:
+            max_results = int(request.args.get("max") or 5)
+        except ValueError:
+            max_results = 5
+        # Same clamp as the Resources-tab crawl, and for the same reason: the input's
+        # `max` attribute is not enforced against a typed value, and crawl_search only
+        # bounds this from below.
+        max_results = max(1, min(core.MAX_CRAWL_PAGES, max_results))
+
+        def work(emit, stop_event):
+            pages, errors, attempted = [], [], 0
+            for ev in core.crawl_search(query, sites=sites, max_results=max_results,
+                                        should_stop=lambda: bool(stop_event and stop_event.is_set())):
+                if ev.get("type") == "progress":
+                    emit("progress", ev)
+                elif ev.get("type") == "result":
+                    pages = ev.get("pages") or []
+                    errors = ev.get("errors") or []
+                    attempted = ev.get("attempted") or 0
+            emit("complete", {"pages": pages, "attempted": attempted, "errors": errors})
+
+        return _compile_sse(work, f"brave-chat-{uuid.uuid4().hex[:8]}")
+
     # ----------------------------- Native dialogs ---------------------------
     @app.route("/api/pick-folder", methods=["POST"])
     def api_pick_folder():
         data = request.get_json(silent=True) or {}
         path = native_dialog.pick_folder(title=data.get("title", "Choose a folder"))
         return jsonify({"path": path})
+
+    # ----------------------------- Images -----------------------------------
+    # Images are the one thing the browser actually uploads. Everything else in this
+    # app exchanges paths and lets the server read the disk, but a screenshot pasted
+    # from the clipboard and an image dragged onto the composer have no path to send
+    # — so /api/images/upload takes bytes, and /api/images/pick keeps the native
+    # dialog available for picking files that do exist on disk.
+
+    def _upload_max_dim():
+        """Long-edge clamp for an upload: whatever the client asked for, else the
+        configured default. Storing a downscaled copy is not the same as sending one
+        — this is the user explicitly choosing not to keep the full-size original."""
+        raw = (request.form.get("max_dim") or "").strip()
+        if raw:
+            try:
+                return max(0, min(8192, int(raw)))
+            except ValueError:
+                pass
+        return 0        # keep the original; the send-time clamp still applies
+
+    @app.route("/api/images/upload", methods=["POST"])
+    def api_images_upload():
+        """Body: multipart/form-data with a repeated ``files`` field (+ optional
+        ``max_dim``). One bad file contributes an error string rather than failing
+        the whole drop."""
+        files = request.files.getlist("files")
+        if not files:
+            return jsonify({"error": "No files in the request."}), 400
+        max_dim = _upload_max_dim()
+        records, errors = [], []
+        for f in files:
+            name = f.filename or "pasted-image"
+            try:
+                data = f.read()
+                if not data:
+                    raise images_mod.ImageError("file is empty")
+                prep = images_mod.prepare(data, f.mimetype or "", max_dim)
+                rec = images_mod.store_prepared(prep, name=name)
+                if prep.get("note"):
+                    rec["note"] = prep["note"]
+                records.append(rec)
+            except images_mod.ImageError as e:
+                errors.append(f"{name}: {e}")
+            except Exception as e:
+                errors.append(f"{name}: {e}")
+        return jsonify({"images": records, "errors": errors})
+
+    @app.route("/api/images/pick", methods=["POST"])
+    def api_images_pick():
+        """SSE. Native multi-file picker + prepare/store, mirroring
+        /api/extract-files. Body: {max_dim} (optional)."""
+        body = request.get_json(silent=True) or {}
+        try:
+            max_dim = max(0, min(8192, int(body.get("max_dim") or 0)))
+        except (TypeError, ValueError):
+            max_dim = 0
+        paths = native_dialog.pick_files(
+            title="Attach image(s) to this chat", filetypes_key="images")
+        errors = []
+        wanted = []
+        for p in paths:
+            path = Path(p)
+            if not images_mod.is_supported(path):
+                errors.append(f"{path.name}: not an image type we can read")
+            else:
+                wanted.append(path)
+
+        def work(emit, stop_event):
+            emit("begin", {"total": len(wanted)})
+            records, errs = [], list(errors)
+            for n, path in enumerate(wanted, 1):
+                if stop_event and stop_event.is_set():
+                    break
+                emit("progress", {"phase": "images", "done": n, "total": len(wanted),
+                                  "unit": "images", "name": path.name})
+                try:
+                    records.append(images_mod.store_file(path, max_dim=max_dim))
+                except Exception as e:
+                    errs.append(f"{path.name}: {e}")
+            emit("complete", {"images": records, "errors": errs})
+
+        return _compile_sse(work, f"pick-images-{uuid.uuid4().hex[:8]}")
+
+    @app.route("/api/images/<image_id>", methods=["GET"])
+    def api_image_get(image_id):
+        """Raw image bytes (``?thumb=1`` for a small PNG).
+
+        Reads through core.read_bytes so the stored file is decrypted on the way
+        out — send_file would hand the browser ciphertext."""
+        try:
+            if request.args.get("thumb"):
+                data, media_type = images_mod.thumb(image_id)
+            else:
+                data, media_type = images_mod.load(image_id)
+        except images_mod.ImageError as e:
+            return jsonify({"error": str(e)}), 404
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        resp = Response(data, mimetype=media_type)
+        # Ids are minted per stored image and never reused, so the bytes behind one
+        # can't change. Private, because this is somebody's photo.
+        resp.headers["Cache-Control"] = "private, max-age=31536000, immutable"
+        return resp
+
+    @app.route("/api/images/<image_id>/save", methods=["POST"])
+    def api_image_save(image_id):
+        """Write an image to a user-chosen path via the native Save dialog."""
+        data = request.get_json(silent=True) or {}
+        try:
+            _bytes, media_type = images_mod.load(image_id)
+        except images_mod.ImageError as e:
+            return jsonify({"ok": False, "error": str(e)}), 404
+        default_name = (data.get("default_name") or "image").strip()
+        ext = images_mod.ext_for(media_type)
+        if not default_name.lower().endswith(ext):
+            default_name = Path(default_name).stem + ext
+        dest = native_dialog.save_file(title="Save image as", default_name=default_name)
+        if not dest:
+            return jsonify({"ok": False, "cancelled": True})
+        if not Path(dest).suffix:
+            dest = dest + ext
+        try:
+            path = images_mod.write_out(image_id, dest)
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": True, "path": str(path)})
 
     # ----------------------------- Batch ------------------------------------
     @app.route("/api/batch/start", methods=["POST"])
@@ -2286,6 +3355,12 @@ def create_app():
                         messages = logic.build_batch_messages(prompt, history, snap, lib_block="")
                     else:
                         messages = logic.build_batch_messages(prompt, history, snap)
+                    # build_batch_messages knows nothing about attachments, so without
+                    # this a batch run saw the chat's pinned material only when the
+                    # parallel branch (which goes through generate_one) happened to be
+                    # active — the same run, two different contexts.
+                    messages = logic.inject_attachments(
+                        messages, logic.resolve_attachments(chat, use_rag))
 
                     breakdown = context_tracker.breakdown_from_messages(messages)
                     yield sse("context", {
@@ -2379,6 +3454,248 @@ def create_app():
         return Response(stream_with_context(batch_gen()), mimetype="text/event-stream",
                         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
+    # ----------------------------- Batch tab --------------------------------
+    # Distinct from /api/batch/start above, which is the chat composer's older
+    # "every file IS a prompt" button. Here an input item is CONTENT and one prompt
+    # template runs against each item. Source resolution, naming and export live in
+    # app/batch.py; generation reuses generate_one through the parallel engine.
+    @app.route("/api/batch/projects", methods=["GET"])
+    def api_batch_projects_get():
+        return jsonify({"projects": store.batch_project_summaries()})
+
+    @app.route("/api/batch/projects", methods=["POST"])
+    def api_batch_projects_post():
+        proj = request.get_json(force=True) or {}
+        if not proj.get("id"):
+            proj["id"] = uuid.uuid4().hex[:12]
+        proj["updated"] = datetime.now().isoformat(timespec="seconds")
+        proj.setdefault("created", proj["updated"])
+        store.upsert_batch_project(proj)
+        return jsonify({"project": proj, "projects": store.batch_project_summaries()})
+
+    @app.route("/api/batch/projects/<project_id>", methods=["GET"])
+    def api_batch_project_get(project_id):
+        proj = store.get_batch_project(project_id)
+        if proj is None:
+            return jsonify({"error": "not found"}), 404
+        return jsonify({"project": proj})
+
+    @app.route("/api/batch/projects/<project_id>", methods=["DELETE"])
+    def api_batch_project_delete(project_id):
+        store.delete_batch_project(project_id)
+        return jsonify({"ok": True, "projects": store.batch_project_summaries()})
+
+    def _batch_lanes(project):
+        """Lanes for a batch run: the saved multi-server lanes when parallel processing
+        is on, otherwise ONE synthetic lane pinned to the project's own server/model.
+        A single-lane run_parallel is the sequential case, so both paths share one
+        generation loop."""
+        if store.config.get("parallel_enabled") and _parallel_lanes():
+            return _parallel_lanes(), store.config.get("parallel_mode", "balanced")
+        server_url = project.get("server_url") or DEFAULT_LOCAL_URL
+        srv = store.resolve_server(server_url)
+        return ([{"base_url": srv["base_url"], "model": project.get("model") or "",
+                  "name": srv.get("name") or srv["base_url"]}], "balanced")
+
+    def _batch_item_chat(project, item, run_id):
+        """One item's chat dict. The prompt template is already rendered into the user
+        turn, so pre_on is forced off — leaving it on would inject the template twice.
+
+        The project's reference images come first and this item's own image (if the
+        source was a folder of pictures) last, so the reference reads as background
+        and the item as the thing being asked about."""
+        turn = {"role": "user",
+                "content": batch_mod.render_prompt(project.get("pre_prompt"), item)}
+        refs = [{"id": r["id"]} for r in (project.get("reference_images") or [])
+                if isinstance(r, dict) and r.get("id")]
+        refs += [{"id": i} for i in (item.get("image_ids") or [])]
+        if refs:
+            turn["images"] = refs
+        return {
+            "id": f"batch-{run_id}",
+            "private": True,
+            "isolated": True,
+            "messages": [turn],
+            "image_full_res": bool(project.get("image_full_res")),
+            "server_url": project.get("server_url") or DEFAULT_LOCAL_URL,
+            "model": project.get("model") or "",
+            "num_ctx": project.get("num_ctx") or store.config.get("default_num_ctx", 4096),
+            "system_prompt": project.get("system_prompt") or "",
+            "system_on": bool(project.get("system_on")),
+            "pre_prompt": "",
+            "pre_on": False,
+            "library_ids": list(project.get("library_ids") or []),
+            "library_strict": bool(project.get("library_strict")),
+            "multi_pass": bool(project.get("multi_pass")),
+            "passes": int(project.get("passes") or 0),
+            "pass_use_system": bool(project.get("pass_use_system", True)),
+            "eval_prompt": project.get("eval_prompt") or "",
+            "web_search": False,
+            "hide_thinking": True,
+        }
+
+    # Naming only needs enough of the document to describe it; sending a whole
+    # transcript to pick six words wastes a full context window per item.
+    _BATCH_TITLE_CHARS = 4000
+
+    def _batch_llm_title(project, item, response, stop_event):
+        """Ask the model for a filename based on what it just wrote. Falls back to the
+        item's own title on any failure — a naming hiccup must not lose the response."""
+        server_url = project.get("server_url") or DEFAULT_LOCAL_URL
+        prompt = batch_mod.render_prompt(
+            project.get("name_prompt") or batch_mod.DEFAULT_FILENAME_PROMPT,
+            {**item, "content": (response or item.get("content") or "")[:_BATCH_TITLE_CHARS]})
+        try:
+            out = ""
+            for kind, text in adapter_for(server_url).chat_stream(
+                project.get("model"), [{"role": "user", "content": prompt}],
+                {"num_ctx": project.get("num_ctx") or store.config.get("default_num_ctx", 4096),
+                 "max_output_tokens": 200},
+                stop_event, think=False, tools=None, tool_executor=None,
+            ):
+                if kind == "content":
+                    out += text
+            # Models like to explain themselves; take the first non-empty line only.
+            for line in (out or "").splitlines():
+                if line.strip():
+                    return line.strip()
+        except Exception:
+            pass
+        return item.get("title") or ""
+
+    @app.route("/api/batch/reference-images", methods=["POST"])
+    def api_batch_reference_images():
+        """Native picker for a project's reference images (sent with every item).
+        Synchronous rather than SSE: this is a handful of files, not a folder walk."""
+        paths = native_dialog.pick_files(
+            title="Choose reference image(s) for every item", filetypes_key="images")
+        records, errors = [], []
+        for p in paths:
+            path = Path(p)
+            if not images_mod.is_supported(path):
+                errors.append(f"{path.name}: not an image type we can read")
+                continue
+            try:
+                records.append(images_mod.store_file(path))
+            except Exception as e:
+                errors.append(f"{path.name}: {e}")
+        return jsonify({"images": records, "errors": errors})
+
+    @app.route("/api/batch/preview", methods=["POST"])
+    def api_batch_preview():
+        """Resolve a project's sources WITHOUT generating, so the user can see exactly
+        what would run. Streams the same resolve progress frames as a real run."""
+        data = request.get_json(force=True) or {}
+        project = data.get("project") or {}
+        run_id = data.get("run_id") or uuid.uuid4().hex[:12]
+
+        def work(emit, stop_event):
+            items, errors = batch_mod.resolve_sources(
+                project, emit=emit, should_stop=lambda: stop_event and stop_event.is_set())
+            emit("items", {
+                "total": len(items),
+                "errors": errors,
+                # Titles and sizes only — the browser never needs the content.
+                "items": [{"item_id": i["item_id"], "title": i["title"], "kind": i["kind"],
+                           "chars": i["chars"], "source_path": i["source_path"],
+                           "source_url": i["source_url"],
+                           "image_ids": list(i.get("image_ids") or [])}
+                          for i in items],
+            })
+
+        return _compile_sse(work, run_id)
+
+    @app.route("/api/batch/run", methods=["POST"])
+    def api_batch_run():
+        """Body: {project, run_id}. Resolves sources, runs each item through
+        generate_one via the parallel engine, and exports per the project's settings.
+        Frames: resolve progress / plan / item_start / chunk / item_done / export."""
+        data = request.get_json(force=True) or {}
+        project = data.get("project") or {}
+        run_id = data.get("run_id") or uuid.uuid4().hex[:12]
+
+        problems = batch_mod.validate_project(project)
+        if problems:
+            return jsonify({"error": " ".join(problems)}), 400
+
+        def work(emit, stop_event):
+            stopped = lambda: bool(stop_event and stop_event.is_set())
+
+            items, errors = batch_mod.resolve_sources(
+                project, emit=emit, should_stop=stopped)
+            if not items:
+                raise batch_mod.BatchError(
+                    "No items could be read from the chosen sources."
+                    + (" " + errors[0] if errors else ""))
+
+            by_id = {i["item_id"]: i for i in items}
+            lanes, mode = _batch_lanes(project)
+            emit("plan", {
+                "total": len(items), "mode": mode, "resolve_errors": errors,
+                "lanes": [{"index": n, "name": l["name"], "server": l["base_url"],
+                           "model": l["model"]} for n, l in enumerate(lanes)],
+                "items": [{"item_id": i["item_id"], "title": i["title"],
+                           "chars": i["chars"]} for i in items],
+            })
+
+            write_files = (project.get("output_mode") or "both") in ("files", "both")
+            per_item = (project.get("export_mode") or "per_item") != "combined"
+            results = []
+            written = []
+
+            def on_frame(frame):
+                """run_parallel calls this from its worker threads. item_done is where
+                naming + the per-item file write happen, so the file is on disk before
+                the browser is told the item finished."""
+                if frame.get("event") != "item_done":
+                    emit(frame.pop("event", "message"), frame)
+                    return
+                item = by_id.get(frame.get("item_id")) or {}
+                prompt = batch_mod.render_prompt(project.get("pre_prompt"), item)
+                response = frame.get("content") or ""
+                results.append({"item": item, "prompt": prompt, "response": response})
+
+                if write_files and per_item and not stopped():
+                    title = ""
+                    if project.get("name_mode") == "llm":
+                        title = _batch_llm_title(project, item, response, stop_event)
+                    try:
+                        path = batch_mod.write_item(item, prompt, response, project, title)
+                        written.append(str(path))
+                        frame["out_path"] = str(path)
+                    except Exception as e:
+                        frame["export_error"] = str(e)
+                    # Pictures the model produced land beside the text, under the
+                    # same prefix/suffix/uniqueness rules.
+                    paths = batch_mod.write_item_images(
+                        item, frame.get("images") or [], project, title)
+                    if paths:
+                        written.extend(str(p) for p in paths)
+                        frame["out_image_paths"] = [str(p) for p in paths]
+                frame["title"] = item.get("title") or frame.get("title") or ""
+                emit(frame.pop("event", "message"), frame)
+
+            parallel.run_parallel(
+                [{"item_id": i["item_id"], "title": i["title"], "search_query": "",
+                  "chat": _batch_item_chat(project, i, run_id)} for i in items],
+                lanes, mode, stop_event, generate_one, on_frame)
+
+            # on_frame appends from the lane worker threads, so `results` is in
+            # completion order. Restore the source order before exporting.
+            order = {i["item_id"]: n for n, i in enumerate(items)}
+            results.sort(key=lambda r: order.get((r["item"] or {}).get("item_id"), 0))
+
+            combined_path = ""
+            if write_files and not per_item and results:
+                combined_path = str(batch_mod.write_combined(results, project))
+                written.append(combined_path)
+
+            emit("export", {"files": written, "combined": combined_path,
+                            "count": len(results), "stopped": stopped(),
+                            "resolve_errors": errors})
+
+        return _compile_sse(work, run_id)
+
     # ---------------- Prompt Validation & Evaluation ----------------
     @app.route("/api/evals", methods=["GET"])
     def api_evals_get():
@@ -2393,7 +3710,7 @@ def create_app():
             # Drop a blank id so the freshly generated one isn't overwritten.
             project.pop("id", None)
             project = {**evals.create_eval_dict(), **project}
-        project["updated"] = datetime.utcnow().isoformat()
+        project["updated"] = datetime.now(timezone.utc).isoformat()
         store.upsert_eval(project)
         return jsonify({"eval": project, "evals": store.eval_summaries()})
 
@@ -2473,19 +3790,57 @@ def create_app():
         opts = {"num_ctx": num_ctx, "max_output_tokens": store.config.get("max_output_tokens", 16000)}
         filled = [evals.fill_prompt(template, r, input_cols) for r in rows]
 
+        # One model-list lookup per server for the whole run — lane selection asks the
+        # same question once per batch model, never once per row.
+        _models_on = {}
+
+        def _hosts_model(url, model):
+            """Does this server actually have `model` installed? Unknown/unreachable
+            servers answer False so work is never sent somewhere it can only fail."""
+            if url not in _models_on:
+                try:
+                    _models_on[url] = set(adapter_for(url).list_models() or [])
+                except Exception:
+                    _models_on[url] = set()
+            return model in _models_on[url]
+
+        def _lanes_for(g_url, g_model):
+            """The lanes that may run `g_model`, with the model under test forced onto
+            each. Only servers that actually host the model qualify — the model's own
+            server always leads the list — so a batch entry's server choice is honoured
+            instead of being replaced by whatever the global parallel list happens to
+            hold. Returns [] when parallel processing shouldn't be used."""
+            if not store.config.get("parallel_enabled"):
+                return []
+            picked, seen = [], set()
+            for ln in ([{"base_url": g_url, "name": g_url}] + _parallel_lanes()):
+                url = ln.get("base_url")
+                if not url or url in seen or not _hosts_model(url, g_model):
+                    continue
+                seen.add(url)
+                picked.append({**ln, "model": g_model})
+            # A single lane is just the sequential loop with extra machinery.
+            return picked if len(picked) > 1 else []
+
         def _generate_all(g_url, g_model, stop_event):
-            """Return a list of response strings (one per row), streaming gen_progress
-            frames. Uses the parallel lanes when enabled, else a sequential loop."""
+            """Stream gen_progress frames, then yield ("__responses__", responses,
+            errors, servers) — the per-row response strings, the per-row generation
+            error messages (empty string when the row succeeded), and the servers that
+            actually did the work. Fans across the qualifying parallel lanes when there
+            is more than one, else runs a sequential loop against g_url."""
             responses = [""] * len(rows)
+            errors = [""] * len(rows)
 
             def base_chat(i):
                 return {"server_url": g_url, "model": g_model, "num_ctx": num_ctx,
                         "isolated": True, "hide_thinking": True,
                         "messages": [{"role": "user", "content": filled[i]}]}
 
-            if store.config.get("parallel_enabled") and _parallel_lanes():
-                # Fan rows across every lane, forcing the model under test on each.
-                lanes = [{**ln, "model": g_model} for ln in _parallel_lanes()]
+            lanes = _lanes_for(g_url, g_model)
+            if lanes:
+                servers = [ln.get("base_url") for ln in lanes]
+                yield sse("status", {"message": f"⚡ {g_model} across "
+                                                f"{len(lanes)} server(s): {', '.join(servers)}"})
                 items = [{"item_id": i, "title": f"Row {i + 1}", "search_query": "",
                           "chat": base_chat(i)} for i in range(len(rows))]
                 frames = queue.Queue()
@@ -2505,13 +3860,17 @@ def create_app():
                     fr = frames.get()
                     if fr is sentinel:
                         break
-                    if fr.get("event") == "item_done":
-                        idx = fr.get("item_id")
-                        if isinstance(idx, int) and 0 <= idx < len(responses):
+                    idx = fr.get("item_id")
+                    in_range = isinstance(idx, int) and 0 <= idx < len(responses)
+                    if fr.get("event") == "error" and in_range:
+                        errors[idx] = fr.get("message", "") or "generation failed"
+                    elif fr.get("event") == "item_done":
+                        if in_range:
                             responses[idx] = fr.get("content", "") or ""
                         done += 1
                         yield sse("gen_progress", {"done": done, "total": len(rows)})
             else:
+                servers = [g_url]
                 for i in range(len(rows)):
                     if stop_event.is_set():
                         break
@@ -2522,10 +3881,12 @@ def create_app():
                         elif kind == "pass_end":
                             content = (d or {}).get("content", content)
                         elif kind == "error":
-                            content = content or f"[Generation error: {(d or {}).get('message', '')}]"
+                            # Kept out of `content`: a failure is an ungraded row, not a
+                            # response for the grader to score.
+                            errors[i] = (d or {}).get("message", "") or "generation failed"
                     responses[i] = content
                     yield sse("gen_progress", {"done": i + 1, "total": len(rows)})
-            yield ("__responses__", responses)
+            yield ("__responses__", responses, errors, servers)
 
         def eval_gen():
             stop_event = runs.new(run_id)
@@ -2550,9 +3911,11 @@ def create_app():
 
                     # ---- generation stage ----
                     responses = [""] * len(rows)
+                    errors = [""] * len(rows)
+                    servers = [g_url]
                     for frame in _generate_all(g_url, g_model, stop_event):
                         if isinstance(frame, tuple) and frame[0] == "__responses__":
-                            responses = frame[1]
+                            _, responses, errors, servers = frame
                         else:
                             yield frame
 
@@ -2563,11 +3926,14 @@ def create_app():
                             break
                         resp = responses[i]
                         if not (resp or "").strip():
+                            # Nothing to grade — an empty or failed generation must not
+                            # be handed to the grader, or its complaint about the error
+                            # text would land in the average as a real score.
                             grades = evals.normalize_grades({}, criteria)
                             row_grades.append(grades)
                             yield sse("row_result", {"model_index": mi, "index": i,
                                                      "response": resp, "grades": grades,
-                                                     "ungraded": True})
+                                                     "ungraded": True, "error": errors[i]})
                             continue
                         gmsgs = evals.build_grader_messages(project, filled[i], resp)
                         gtext = ""
@@ -2585,15 +3951,22 @@ def create_app():
                                                  "response": resp, "grades": grades})
 
                     agg = evals.aggregate(row_grades, criteria)
-                    per_model.append({"server": g_url, "model": g_model, "aggregate": agg})
-                    yield sse("model_done", {"index": mi, "server": g_url, "model": g_model,
-                                             "aggregate": agg})
+                    # `servers` is where the work really ran, which is not always g_url:
+                    # a parallel run fans across every lane that hosts this model.
+                    label = ", ".join(servers) if servers else g_url
+                    per_model.append({"server": label, "servers": servers,
+                                      "model": g_model, "aggregate": agg})
+                    yield sse("model_done", {"index": mi, "server": label, "servers": servers,
+                                             "model": g_model, "aggregate": agg})
 
                 yield sse("summary", {"batch": batch, "models": per_model,
                                       "criteria": [c.get("label") for c in criteria]})
                 yield sse("done", {"stopped": stop_event.is_set()})
             except Exception as e:
                 yield sse("error", {"message": str(e)})
+                # The client re-enables its buttons off `done`; without this an error
+                # would leave the tab wedged until a page reload.
+                yield sse("done", {"stopped": True, "error": True})
             finally:
                 runs.done(run_id)
 
@@ -2640,14 +4013,41 @@ def create_app():
             return {"server_url": g_url, "model": g_model, "num_ctx": num_ctx,
                     "isolated": True, "hide_thinking": True, "messages": msgs}
 
+        def _row_has_content(row):
+            """False when a row came back with every cell empty — the generation failed
+            or its JSON didn't parse, and appending it would just add a blank line."""
+            return any((v or "").strip() for v in (row or {}).values())
+
+        def _gen_lanes(url, model):
+            """Lanes that may generate rows: only servers that actually host the model,
+            the chosen server first. [] means run sequentially."""
+            if not store.config.get("parallel_enabled"):
+                return []
+            picked, seen = [], set()
+            for ln in ([{"base_url": url, "name": url}] + _parallel_lanes()):
+                base = ln.get("base_url")
+                if not base or base in seen:
+                    continue
+                try:
+                    installed = set(adapter_for(base).list_models() or [])
+                except Exception:
+                    installed = set()
+                if model not in installed:
+                    continue
+                seen.add(base)
+                picked.append({**ln, "base_url": base, "model": model})
+            return picked if len(picked) > 1 else []
+
         def gen_gen():
             stop_event = runs.new(run_id)
             try:
                 yield sse("start", {"run_id": run_id, "total": num_rows,
                                     "columns": targets, "server": g_url, "model": g_model})
 
-                if store.config.get("parallel_enabled") and _parallel_lanes():
-                    lanes = [{**ln, "model": g_model} for ln in _parallel_lanes()]
+                lanes = _gen_lanes(g_url, g_model)
+                if lanes:
+                    yield sse("status", {"message": f"⚡ {g_model} across {len(lanes)} "
+                                         f"server(s): {', '.join(ln['base_url'] for ln in lanes)}"})
                     items = [{"item_id": i, "title": f"Row {i + 1}", "search_query": "",
                               "chat": base_chat(i)} for i in range(num_rows)]
                     frames = queue.Queue()
@@ -2671,7 +4071,8 @@ def create_app():
                             idx = fr.get("item_id")
                             row = evals.parse_gen_row(fr.get("content", "") or "", targets)
                             done += 1
-                            yield sse("row_result", {"index": idx, "row": row})
+                            yield sse("row_result", {"index": idx, "row": row,
+                                                     "ok": _row_has_content(row)})
                             yield sse("gen_progress", {"done": done, "total": num_rows})
                 else:
                     for i in range(num_rows):
@@ -2687,12 +4088,14 @@ def create_app():
                                 yield sse("status", {"message": f"Row {i + 1}: "
                                                      f"{(d or {}).get('message', '')}"})
                         row = evals.parse_gen_row(content, targets)
-                        yield sse("row_result", {"index": i, "row": row})
+                        yield sse("row_result", {"index": i, "row": row,
+                                                 "ok": _row_has_content(row)})
                         yield sse("gen_progress", {"done": i + 1, "total": num_rows})
 
                 yield sse("done", {"stopped": stop_event.is_set()})
             except Exception as e:
                 yield sse("error", {"message": str(e)})
+                yield sse("done", {"stopped": True, "error": True})
             finally:
                 runs.done(run_id)
 

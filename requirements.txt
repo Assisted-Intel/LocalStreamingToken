@@ -17,6 +17,15 @@ ebooklib>=0.18            # EPUB reading
 beautifulsoup4>=4.12      # EPUB HTML → text; also web-crawl boilerplate pre-clean
 python-docx>=1.1          # DOCX reading
 
+# --------------------------------------------------------------------------
+# Image attachments for chat + batch (app/images.py). Imported lazily, so every
+# text-only feature still works without these. Pillow does the sniffing, EXIF
+# orientation, transcoding of formats no model accepts (TIFF/BMP/ICO/...) and the
+# downscale; pillow-heif adds the iPhone HEIC/HEIF/AVIF formats on top of it.
+# --------------------------------------------------------------------------
+Pillow>=10.3              # image decode, EXIF transpose, transcode, downscale
+pillow-heif>=0.16         # optional: HEIC / HEIF / AVIF
+
 # Readable article extraction for the Resources tab's URL / Brave-search crawls (and chat
 # web-search): isolates the main article text and drops nav menus, headers/footers, sidebars,
 # related rails, infoboxes, and tables. Imported lazily in app/core.py (_extract_page_text) —
@@ -59,6 +68,16 @@ numpy>=1.24               # required by lancedb/pyarrow
 #     playwright install chromium
 # --------------------------------------------------------------------------
 playwright>=1.40          # optional: JS-rendering local crawl fallback
+
+# --------------------------------------------------------------------------
+# Last-resort fallback for the "Add YouTube video" source (Resources tab and the
+# chat composer). Transcripts and comments are normally read straight off the
+# watch page — via Bright Data if a token is set, otherwise a plain requests GET.
+# yt-dlp is only reached when both of those are blocked or rate-limited; it keeps
+# its own workarounds for YouTube's consent and signature changes. Imported lazily
+# in app/youtube.py, so the feature works without it.
+# --------------------------------------------------------------------------
+yt-dlp>=2024.1            # optional: YouTube transcript/comment fallback
 
 # --------------------------------------------------------------------------
 # Database Processing tab (import → isolated DuckDB staging → safe write-back).

@@ -16,10 +16,12 @@
     </div>
     <nav class="tabs">
       <button class="tab active" data-tab="chat">💬 Chat</button>
+      <button class="tab" data-tab="batch">🗂 Batch</button>
       <button class="tab" data-tab="evals">🧪 Evaluate</button>
       <button class="tab" data-tab="database">🗄 Database</button>
       <button class="tab" data-tab="resources">📚 Resources</button>
       <button class="tab" data-tab="personas">🎭 Personas</button>
+      <button class="tab" data-tab="memory">🧠 Memory</button>
       <button class="tab" data-tab="settings">⚙ Settings</button>
     </nav>
   </header>
@@ -137,7 +139,11 @@
         <label class="chk" title="Answer through a persona's chain-of-thought pipeline (knowledge, memories, speaking style)"><input type="checkbox" id="chk-persona" /> 🎭 Use Persona</label>
         <select id="persona-select" class="hidden" title="Active persona"></select>
         <select id="persona-variant" class="hidden" title="Speaking-style variant"></select>
+        <label class="chk" title="Tailor replies using what the assistant has learned about you, and keep learning from this chat (Memory tab)"><input type="checkbox" id="chk-memory" /> 🧠 Memory</label>
+        <select id="memory-core-select" class="hidden" title="Which memory core this chat uses"></select>
+        <button id="btn-memory-extract" class="small hidden" title="Learn from this conversation now">🧠 Extract</button>
         <span id="tools-status" class="tools-status"></span>
+        <span id="vision-status" class="tools-status"></span>
         <label>Pages to crawl:
           <input type="number" id="crawl-pages" min="1" max="20" value="7" />
         </label>
@@ -175,6 +181,47 @@
       </div>
 
       <!-- Input -->
+      <!-- Chat-scoped sources: the same menu as the Resources tab, but the result is
+           attached to this conversation instead of a reusable library. -->
+      <div id="composer-add-row" class="lib-inline-panel hidden">
+        <button id="btn-add-write" class="small">➕ Write-in</button>
+        <button id="btn-add-files" class="small">📎 Text/PDF file(s)</button>
+        <button id="btn-add-image" class="small" title="Attach image(s) — you can also drag them onto the box below, or paste with Ctrl+V">🖼 Image(s)</button>
+        <button id="btn-add-url" class="small">🔗 By URL</button>
+        <button id="btn-add-youtube" class="small">▶ YouTube</button>
+        <button id="btn-add-search" class="small">🔍 Brave search</button>
+      </div>
+      <div id="add-url-panel" class="lib-inline-panel hidden">
+        <input type="text" id="add-url-input" placeholder="https://example.com/article" />
+        <button id="btn-add-url-fetch" class="small primary">Fetch</button>
+        <button id="btn-add-url-cancel" class="small ghost">Cancel</button>
+      </div>
+      <div id="add-yt-panel" class="lib-inline-panel hidden">
+        <div class="lib-search-fields">
+          <input type="text" id="add-yt-input" placeholder="https://www.youtube.com/watch?v=…" />
+          <label class="chk" title="Also collect the video's comments"><input type="checkbox" id="add-yt-comments" checked /> Include comments</label>
+          <label class="lib-search-max">Max comments
+            <input type="number" id="add-yt-max" value="100" min="5" max="2000" />
+          </label>
+          <button id="btn-add-yt-fetch" class="small primary">Fetch</button>
+          <button id="btn-add-yt-cancel" class="small ghost">Cancel</button>
+        </div>
+        <div id="add-yt-progress" class="compile-progress hidden"></div>
+      </div>
+      <div id="add-search-panel" class="lib-inline-panel hidden">
+        <div class="lib-search-fields">
+          <input type="text" id="add-search-query" placeholder="Search term…" />
+          <input type="text" id="add-search-sites" placeholder="Limit to sites (comma-separated, optional)" />
+          <label class="lib-search-max">Max pages
+            <input type="number" id="add-search-max" value="5" min="1" max="20" />
+          </label>
+          <button id="btn-add-search-go" class="small primary">Search &amp; crawl</button>
+          <button id="btn-add-search-cancel" class="small ghost">Cancel</button>
+        </div>
+        <div id="add-search-progress" class="compile-progress hidden"></div>
+      </div>
+      <div id="add-files-progress" class="compile-progress hidden"></div>
+      <div id="add-image-progress" class="compile-progress hidden"></div>
       <div id="data-chips" class="data-chips hidden"></div>
       <div id="data-entry-row" class="hidden">
         <input id="data-label" placeholder="Data type (e.g. Reviews)" />
@@ -186,6 +233,8 @@
           <button id="btn-send" class="primary">Send</button>
           <button id="btn-rewrite" class="ghost" title="Rewrite your message into a clearer, more effective prompt">✨ Rewrite</button>
           <button id="btn-rewrite-undo" class="ghost hidden" title="Undo rewrite — restore your original message">↶ Undo</button>
+          <button id="btn-composer-add" class="ghost" title="Attach a file, page, video or search to this chat">＋ Add</button>
+          <button id="btn-image-res" class="ghost" title="How attached images are sent to the model">🖼 Scaled</button>
           <button id="btn-data-mode" class="ghost" title="Classify content into labeled data blocks">🏷 Data</button>
           <button id="btn-queue-add" class="ghost" title="Add this prompt to the queue (each queued prompt becomes its own chat)">＋ Queue</button>
           <button id="btn-queue-run" class="primary hidden" title="Process every queued prompt">▶ Run Queue (0)</button>
@@ -225,7 +274,8 @@
         <h3>1. Data</h3>
         <p class="muted">Each row is one test case. Enter data by hand, or import a file. Import from a
           <b>CSV</b> (header row → columns) or a <b>text file</b> split into cells (blank lines by default,
-          or your own delimiter) that fill a column you choose.</p>
+          or your own delimiter — optionally a regular expression) that fill a column you choose.
+          A single-model run writes each response back into the response column.</p>
         <div class="eval-grid-actions">
           <button id="btn-eval-addrow" class="small">＋ Row</button>
           <button id="btn-eval-addcol" class="small">＋ Column</button>
@@ -239,8 +289,8 @@
         <details id="eval-gen-block" class="eval-gen-block">
           <summary>✨ Generate test data with the LLM</summary>
           <p class="muted">Describe how to fill each column and the model (from step 2) invents dummy rows to
-            test against. The response column is left blank so an evaluation run fills it. Turn on ⚡ Parallel
-            Processing (Settings) to fan rows across your servers.</p>
+            test against. The response column is left blank so an evaluation run fills it. With ⚡ Parallel
+            Processing (Settings) on, rows fan across every server that has the chosen model installed.</p>
           <div class="eval-grid-wrap">
             <table id="eval-gen-instr"></table>
           </div>
@@ -299,8 +349,9 @@
       <section class="settings-card">
         <h3>4. Batch model testing <span class="muted">(optional)</span></h3>
         <p class="muted">Add models to compare. The same prompt + grader run against each; results show a
-          per-model score and a breakdown of how each criterion did per model. Turn on ⚡ Parallel Processing
-          (Settings) to fan rows across your servers.</p>
+          per-model score and a breakdown of how each criterion did per model. With ⚡ Parallel Processing
+          (Settings) on, each model's rows fan across its own server plus any parallel server that also has
+          that model installed — servers without it are skipped rather than sent work that would fail.</p>
         <div id="eval-batch-models"></div>
         <button id="btn-eval-addmodel" class="small">＋ Add model</button>
       </section>
@@ -315,6 +366,194 @@
           <span id="eval-progress" class="status-line"></span>
         </div>
         <div id="eval-results" class="eval-results"></div>
+      </section>
+    </main>
+  </div>
+
+  <!-- ============================ BATCH TAB ============================ -->
+  <div id="tab-batch" class="tab-page">
+    <main id="batch-main">
+      <h2 class="settings-title">Batch Processing</h2>
+
+      <!-- Project bar -->
+      <section class="settings-card eval-projectbar">
+        <label>Project:
+          <select id="batch-project-select"></select>
+        </label>
+        <input type="text" id="batch-name" placeholder="Batch name" />
+        <button id="btn-batch-new" class="small">＋ New</button>
+        <button id="btn-batch-save" class="primary">💾 Save</button>
+        <button id="btn-batch-delete" class="small">🗑 Delete</button>
+      </section>
+
+      <!-- 1. Inputs -->
+      <section class="settings-card">
+        <h3>1. Inputs</h3>
+        <p class="muted">Each input becomes one item that your prompt runs against. Mix as many sources as
+          you like — YouTube videos or a whole playlist, the pages behind a web search, a folder of
+          documents (<span id="batch-exts"></span>), or a folder of images, where each picture is
+          the item your prompt describes, reads or compares.</p>
+        <div id="batch-sources"></div>
+        <div class="control-row">
+          <button id="btn-batch-addsource" class="small">＋ Add input</button>
+          <button id="btn-batch-preview" class="ghost small">👁 Preview items</button>
+          <button id="btn-batch-preview-stop" class="stop small hidden">Stop</button>
+          <span id="batch-preview-status" class="status-line"></span>
+        </div>
+        <div id="batch-preview-progress" class="compile-progress hidden"></div>
+        <div id="batch-items" class="batch-items"></div>
+        <div class="control-row">
+          <label title="Longer items are cut off before they reach the model, so one huge transcript can't blow the context window.">Max characters per item:
+            <input type="number" id="batch-max-chars" min="1000" max="2000000" step="1000" style="width:8em" />
+          </label>
+          <label class="chk"><input type="checkbox" id="batch-yt-comments" /> Include YouTube comments</label>
+          <label>Max comments:
+            <input type="number" id="batch-yt-max" min="5" max="2000" style="width:6em" />
+          </label>
+        </div>
+        <h4 class="batch-subhead">Reference images</h4>
+        <p class="muted">Optional. These are sent with <em>every</em> item — a style guide, a
+          chart, or whatever each input should be compared against.</p>
+        <div class="control-row">
+          <button id="btn-batch-addrefimg" class="small">🖼 Add reference image(s)…</button>
+          <label class="chk" title="Send images at their original resolution instead of scaling them down (Settings → Images sets the cap)."><input type="checkbox" id="batch-image-fullres" /> Send images at full resolution</label>
+          <span id="batch-refimgs-note" class="muted"></span>
+        </div>
+        <div id="batch-refimgs" class="batch-refimgs"></div>
+      </section>
+
+      <!-- 2. Prompt -->
+      <section class="settings-card">
+        <h3>2. Prompt</h3>
+        <div class="control-row">
+          <label>Server:
+            <select id="batch-server"></select>
+          </label>
+          <label>Model:
+            <select id="batch-model"></select>
+          </label>
+          <label>Context length:
+            <select id="batch-ctx"></select>
+          </label>
+        </div>
+
+        <label class="chk"><input type="checkbox" id="batch-system-on" /> Use a system prompt</label>
+        <div class="control-row">
+          <button id="btn-batch-sys-browse" class="small">📚 Browse library…</button>
+          <button id="btn-batch-sys-save" class="small">💾 Save to library…</button>
+        </div>
+        <textarea id="batch-system-prompt" rows="3" placeholder="System prompt applied to every item…"></textarea>
+
+        <label class="chk" style="margin-top:8px"><input type="checkbox" id="batch-pre-on" /> Use a pre-prompt (the instruction run against each item)</label>
+        <div class="control-row">
+          <button id="btn-batch-pre-browse" class="small">📚 Browse library…</button>
+          <button id="btn-batch-pre-save" class="small">💾 Save to library…</button>
+        </div>
+        <p class="muted">Use <code>{{content}}</code> where the item's text should go, plus
+          <code>{{title}}</code>, <code>{{url}}</code> and <code>{{source}}</code>. Leave
+          <code>{{content}}</code> out and the item's text is simply added underneath.</p>
+        <textarea id="batch-pre-prompt" rows="5"
+                  placeholder="e.g. Summarise the following in five bullet points.&#10;&#10;{{content}}"></textarea>
+
+        <div class="control-row" style="margin-top:8px">
+          <button id="btn-batch-library" class="small">📚 Resource libraries…</button>
+          <span id="batch-library-state" class="muted"></span>
+          <label class="chk"><input type="checkbox" id="batch-strict" /> Answer only from these resources</label>
+        </div>
+
+        <label class="chk" style="margin-top:8px"><input type="checkbox" id="batch-multipass" /> Multi-Pass refinement</label>
+        <div id="batch-multipass-panel" class="lib-inline-panel hidden">
+          <label class="setting-row">Passes after the first answer
+            <input type="number" id="batch-passes" min="1" max="10" />
+          </label>
+          <label class="chk"><input type="checkbox" id="batch-mp-system" /> Include the system prompt in refinement passes</label>
+          <label class="mp-label">Evaluation prompt (uses <code>[input prompt]</code> and <code>[Response]</code>):</label>
+          <textarea id="batch-eval-prompt" rows="5"
+                    placeholder="Evaluation prompt template…"></textarea>
+        </div>
+      </section>
+
+      <!-- 3. Output -->
+      <section class="settings-card">
+        <h3>3. Output</h3>
+        <div class="control-row">
+          <label>Send results to:
+            <select id="batch-output-mode">
+              <option value="both">Batch chat and exported files</option>
+              <option value="chat">Batch chat only</option>
+              <option value="files">Exported files only</option>
+            </select>
+          </label>
+        </div>
+
+        <div id="batch-file-options">
+          <div class="radio-col">
+            <label class="chk"><input type="radio" name="batch-export-mode" value="per_item" /> One file per item</label>
+            <label class="chk"><input type="radio" name="batch-export-mode" value="combined" /> All items in a single file</label>
+            <label class="chk"><input type="radio" name="batch-export-mode" value="beside_source" /> Next to each processed file <span class="muted">(folder inputs only)</span></label>
+          </div>
+
+          <div id="batch-outdir-row" class="control-row">
+            <button id="btn-batch-outdir" class="small">📂 Output folder…</button>
+            <span id="batch-outdir" class="muted"></span>
+          </div>
+
+          <div id="batch-combined-row" class="control-row hidden">
+            <label>Combined file name:
+              <input type="text" id="batch-combined-name" style="width:16em" />
+            </label>
+          </div>
+
+          <div class="control-row">
+            <label>Name files from:
+              <select id="batch-name-mode">
+                <option value="source">The video / page / file title</option>
+                <option value="llm">A title the AI writes from the content</option>
+              </select>
+            </label>
+            <label>Prefix:
+              <input type="text" id="batch-name-prefix" style="width:9em" placeholder="(none)" />
+            </label>
+            <label>Append:
+              <input type="text" id="batch-name-suffix" style="width:9em" placeholder="(none)" />
+            </label>
+            <label>Extension:
+              <select id="batch-ext">
+                <option value=".md">.md</option>
+                <option value=".txt">.txt</option>
+              </select>
+            </label>
+          </div>
+          <div id="batch-beside-warn" class="warn-banner hidden">
+            Saving next to the originals needs a prefix or an append value, otherwise the AI output would
+            overwrite the files it just read.
+          </div>
+
+          <div id="batch-nameprompt-row" class="hidden">
+            <p class="muted">Prompt used to name each file. <code>{{content}}</code> is the response it just wrote.</p>
+            <textarea id="batch-name-prompt" rows="4"></textarea>
+          </div>
+
+          <div class="control-row">
+            <label class="chk"><input type="checkbox" id="batch-include-source" /> Include the source text in the file</label>
+            <label class="chk"><input type="checkbox" id="batch-include-prompt" /> Include the prompt in the file</label>
+            <label class="chk"><input type="checkbox" id="batch-strip-md" /> Strip markdown formatting</label>
+          </div>
+        </div>
+      </section>
+
+      <!-- 4. Run -->
+      <section class="settings-card">
+        <h3>4. Run</h3>
+        <div class="control-row">
+          <button id="btn-batch-run" class="primary">▶ Run batch</button>
+          <button id="btn-batch-stop" class="stop hidden">Stop</button>
+          <button id="btn-batch-tochat" class="ghost" disabled>💬 Save results to a chat</button>
+          <span id="batch-run-status" class="status-line"></span>
+        </div>
+        <div id="batch-progress" class="compile-progress hidden"></div>
+        <div id="batch-lanes" class="parallel-lanes hidden"></div>
+        <div id="batch-results" class="batch-results"></div>
       </section>
     </main>
   </div>
@@ -339,6 +578,18 @@
         <button id="btn-lib-url-fetch" class="small primary">Fetch</button>
         <button id="btn-lib-url-cancel" class="small ghost">Cancel</button>
       </div>
+      <div id="lib-yt-panel" class="lib-inline-panel hidden">
+        <div class="lib-search-fields">
+          <input type="text" id="lib-yt-input" placeholder="https://www.youtube.com/watch?v=…" />
+          <label class="chk" title="Also collect the video's comments"><input type="checkbox" id="lib-yt-comments" checked /> Include comments</label>
+          <label class="lib-search-max">Max comments
+            <input type="number" id="lib-yt-max" value="100" min="5" max="2000" />
+          </label>
+          <button id="btn-lib-yt-fetch" class="small primary">Fetch</button>
+          <button id="btn-lib-yt-cancel" class="small ghost">Cancel</button>
+        </div>
+        <div id="lib-yt-progress" class="compile-progress hidden"></div>
+      </div>
       <div id="lib-search-panel" class="lib-inline-panel hidden">
         <div class="lib-search-fields">
           <input type="text" id="lib-search-query" placeholder="Search term…" />
@@ -355,6 +606,7 @@
         <button id="btn-lib-add-write" class="small">➕ Add write-in section</button>
         <button id="btn-lib-add-files" class="small">📎 Add text file(s)</button>
         <button id="btn-lib-add-url" class="small">🔗 Add by URL</button>
+        <button id="btn-lib-add-youtube" class="small">▶ Add YouTube video</button>
         <button id="btn-lib-add-search" class="small">🔍 Brave search</button>
         <span class="spacer"></span>
         <span id="lib-compile-badge" class="compile-badge-slot"></span>
@@ -460,6 +712,65 @@
     </main>
   </div>
 
+  <!-- ============================ MEMORY TAB ============================ -->
+  <!-- What the assistant has learned about the USER, per memory core. Distinct from
+       the persona Memories sub-tab above (in-character recollections). -->
+  <div id="tab-memory" class="tab-page">
+    <aside id="memory-sidebar">
+      <div class="side-head">
+        <span>Memory cores</span>
+        <button id="btn-mc-new" class="small" title="New memory core">＋</button>
+      </div>
+      <div id="mc-list" class="side-list"></div>
+      <div class="mc-io">
+        <button id="btn-mc-import" class="ghost small" title="Import memory cores from a JSON file">⬇ Import</button>
+        <button id="btn-mc-export" class="ghost small" title="Export this memory core to a JSON file">⬆ Export</button>
+      </div>
+    </aside>
+    <main id="memory-main">
+      <!-- An incognito session never writes to disk, so anything edited here lives only
+           until the session ends unless it is saved into a data profile. -->
+      <div id="mc-incognito" class="mc-incognito hidden">
+        🕶 <b>Incognito session.</b> Memory cores edited here are not written to disk —
+        they are kept only if you save this session with <b>Save session…</b>
+      </div>
+      <div id="mc-empty" class="mc-empty">
+        <h2>🧠 Memory</h2>
+        <p class="muted">A memory core is what the assistant has learned about you — your
+          preferences, the way you like to be answered, what you're working on. Enable
+          <strong>🧠 Memory</strong> in a chat and it grows on its own as you talk; everything
+          it records is listed here for you to edit, add to, or delete.</p>
+        <button id="btn-mc-new-empty" class="primary">＋ Create a memory core</button>
+      </div>
+
+      <div id="mc-editor" class="hidden">
+        <div class="mc-header">
+          <input type="text" id="mc-name" placeholder="Memory core name" />
+          <span id="mc-stats" class="badge"></span>
+          <span class="spacer"></span>
+          <button id="btn-mc-delete" class="small danger" title="Delete this memory core">🗑 Delete core</button>
+        </div>
+
+        <section class="settings-card mc-settings">
+          <div class="control-row">
+            <label class="chk" title="Learn from a chat automatically as it goes"><input type="checkbox" id="mc-auto" /> Learn automatically</label>
+            <label>every <input type="number" id="mc-every" min="1" max="100" value="6" /> replies</label>
+            <label title="Only the most important memories are sent to the model, so a large core stays affordable">Inject top
+              <input type="number" id="mc-limit" min="1" max="500" value="40" /> memories</label>
+            <span class="spacer"></span>
+            <button id="btn-mc-add" class="small">＋ Add memory</button>
+            <button id="btn-mc-refine" class="small" title="Ask the model to merge overlapping memories and sharpen the wording">✨ Refine core</button>
+            <button id="btn-mc-build" class="small primary" title="Learn retroactively from your existing chats">📖 Build from chats…</button>
+            <button id="btn-mc-score" class="small" title="Score how well the extractor decides what is worth remembering">🧪 Score extraction…</button>
+          </div>
+          <div id="mc-build-progress" class="compile-progress hidden"></div>
+        </section>
+
+        <div id="mc-entries" class="mc-entries"></div>
+      </div>
+    </main>
+  </div>
+
   <!-- ============================ SETTINGS TAB ============================ -->
   <div id="tab-settings" class="tab-page">
     <main id="settings-main">
@@ -535,6 +846,16 @@
           <input type="number" id="set-ctx-anthropic" min="1024" max="2000000" step="1024" />
         </label>
         <label class="chk"><input type="checkbox" id="set-auto-reason" /> Auto-detect reasoning models</label>
+        <h3 style="margin-top:1em">Images</h3>
+        <div class="muted" style="font-size:12px; margin-bottom:6px">
+          Attached images are always stored at their original resolution. This only
+          caps the copy that is <em>sent</em> — an unscaled phone photo costs as much
+          context as several pages of text without giving the model more to work with.
+        </div>
+        <label class="setting-row" title="Longest edge of an image as sent to the model. 1568px suits Claude, GPT-4o and Gemini alike.">Scale images down to (longest edge, px)
+          <input type="number" id="set-image-max-dim" min="256" max="8192" step="64" />
+        </label>
+        <label class="chk" title="Start new chats and batch projects with 🖼 Full res selected. You can still flip it per chat."><input type="checkbox" id="set-image-full-res" /> Send images at full resolution by default</label>
         <h3 style="margin-top:1em">RAG (Retrieval Augmented Generation)</h3>
         <label class="setting-row" title="Which vector store holds your compiled data. The two stores are separate files, so switching never destroys the other's data.">Vector store
           <select id="set-rag-backend">
@@ -695,6 +1016,7 @@
           <label class="setting-row">Name <input type="text" id="dbi-name" placeholder="import name" /></label>
           <div class="settings-actions">
             <button id="dbi-import" class="primary">Import</button>
+            <button id="dbi-stop" class="small" disabled>⏹ Stop</button>
             <button id="dbi-cancel" class="ghost">Cancel</button>
             <span id="dbi-progress" class="muted"></span>
           </div>
@@ -733,6 +1055,7 @@
             </div>
             <div class="settings-actions">
               <button id="dbw-run" class="primary">Write back to source</button>
+              <button id="dbw-stop" class="small" disabled>⏹ Stop</button>
               <button id="dbw-audit" class="small">📜 View audit</button>
               <button id="dbw-close" class="ghost">Close</button>
               <span id="dbw-progress" class="muted"></span>
@@ -749,6 +1072,7 @@
             <div class="settings-actions">
               <button id="dbp-add" class="small">＋ Add AI column</button>
               <button id="dbp-run" class="primary">Run processing</button>
+              <button id="dbp-stop" class="small" disabled>⏹ Stop</button>
               <button id="dbp-close" class="ghost">Close</button>
               <span id="dbp-progress" class="muted"></span>
             </div>
@@ -861,12 +1185,105 @@
         <button class="ghost modal-close">Cancel</button>
       </div>
     </div>
+    <!-- Add / edit one entry in a user memory core (see the Memory tab) -->
+    <div id="modal-mc-entry" class="modal hidden">
+      <h3 id="mce-title">Add memory</h3>
+      <label class="setting-row">What the assistant should know
+        <textarea id="mce-text" rows="3" placeholder="e.g. Prefers concise answers with no preamble."></textarea>
+      </label>
+      <label class="setting-row">Category
+        <select id="mce-category"></select>
+      </label>
+      <label class="setting-row">Importance (1–10)
+        <input type="number" id="mce-importance" min="1" max="10" value="5" />
+      </label>
+      <label class="chk" title="Pinned memories are always sent to the model, even past the injection limit"><input type="checkbox" id="mce-pinned" /> Always include this one</label>
+      <div class="modal-btns">
+        <button id="btn-mce-save" class="primary">Save</button>
+        <button class="ghost modal-close">Cancel</button>
+      </div>
+    </div>
+    <!-- Pick which chats a memory core should learn from -->
+    <div id="modal-mc-build" class="modal hidden">
+      <h3>Build memories from chats</h3>
+      <p class="modal-hint">The assistant reads each chat in turn, oldest first, and refines
+        the core as it goes. Private chats are skipped. This makes one model call per chat.</p>
+      <div id="mcb-list" class="mcb-list"></div>
+      <label class="chk" title="Chats this core has already read are normally skipped, since re-reading them costs a model call each and teaches nothing new">
+        <input type="checkbox" id="mcb-reread" /> Re-read chats this core has already learned from
+      </label>
+      <div class="modal-btns">
+        <button id="btn-mcb-go" class="primary">Build</button>
+        <button id="btn-mcb-all" class="small">Select all</button>
+        <button id="btn-mcb-none" class="small">Select none</button>
+        <span class="spacer"></span>
+        <button class="ghost modal-close">Cancel</button>
+      </div>
+    </div>
+    <!-- Score the extractor: runs the real extraction over sample transcripts and has
+         a judge model grade what it chose to remember. Measures the decision, not the
+         plumbing — nothing here is written to a memory core. -->
+    <div id="modal-mc-score" class="modal modal-wide hidden">
+      <h3>Score memory extraction</h3>
+      <p class="modal-hint">Each transcript below is run through the real extractor, then a
+        second model grades what it chose to remember — is it durable, is it a duplicate of
+        what was already known, is it categorised sensibly, is it faithful to what was said?
+        Nothing is saved to a memory core. This makes two model calls per row.</p>
+      <div class="control-row">
+        <label>Extractor model
+          <select id="mcs-gen-model"></select>
+        </label>
+        <label>Judge model
+          <select id="mcs-grader-model"></select>
+        </label>
+      </div>
+      <div id="mcs-rows" class="mcb-list"></div>
+      <div id="mcs-progress" class="compile-progress hidden"></div>
+      <div id="mcs-results" class="mcs-results"></div>
+      <div class="modal-btns">
+        <button id="btn-mcs-go" class="primary">Run</button>
+        <span class="spacer"></span>
+        <button class="ghost modal-close">Close</button>
+      </div>
+    </div>
     <!-- Simple prompt modal (rename / preset name) -->
+    <!-- Read-only look at a fetched attachment (a scraped page, video or search) -->
+    <div id="modal-attachment" class="modal modal-wide hidden">
+      <h3 id="attachment-title">Attachment</h3>
+      <a id="attachment-source" class="item-source" target="_blank" rel="noopener noreferrer"></a>
+      <textarea id="attachment-text" rows="18" readonly></textarea>
+      <div class="modal-btns">
+        <button id="btn-attachment-remove" class="ghost">Remove</button>
+        <span class="spacer"></span>
+        <button class="primary modal-close">Close</button>
+      </div>
+    </div>
+    <div id="modal-image" class="modal modal-wide hidden">
+      <h3 id="image-modal-title">Image</h3>
+      <div id="image-modal-meta" class="muted" style="font-size:12px"></div>
+      <div class="image-modal-frame"><img id="image-modal-img" alt="" /></div>
+      <div class="modal-btns">
+        <button id="btn-image-remove" class="ghost">Remove</button>
+        <span class="spacer"></span>
+        <button id="btn-image-save" class="small">⬇ Save to disk…</button>
+        <button class="primary modal-close">Close</button>
+      </div>
+    </div>
     <div id="modal-prompt" class="modal hidden">
       <h3 id="prompt-title">Enter value</h3>
       <input type="text" id="prompt-input" />
+      <label id="prompt-check-row" class="hidden">
+        <input type="checkbox" id="prompt-check" /> <span id="prompt-check-label"></span>
+      </label>
       <div class="modal-btns">
         <button id="btn-prompt-ok" class="primary">OK</button>
+        <button class="ghost modal-close">Cancel</button>
+      </div>
+    </div>
+    <div id="modal-confirm" class="modal hidden">
+      <h3 id="confirm-title">Are you sure?</h3>
+      <div class="modal-btns">
+        <button id="btn-confirm-ok" class="primary">OK</button>
         <button class="ghost modal-close">Cancel</button>
       </div>
     </div>

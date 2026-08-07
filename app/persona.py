@@ -196,13 +196,17 @@ def to_xml(persona: dict) -> str:
     _text(me, "temperature", md.get("temperature", 0.7))
 
     st = persona.get("stores", {})
+    # ET rejects a non-str attribute value with a TypeError, so a None anywhere in
+    # ``stores`` would 500 the save instead of failing validation cleanly below.
+    def _attr(key, default):
+        return str(st.get(key) or default)
     ET.SubElement(root, "stores", {
-        "knowledge": st.get("knowledge", "knowledge/"),
-        "memories": st.get("memories", "memories/"),
-        "sources": st.get("sources", "sources/"),
-        "retrieval": st.get("retrieval", "hybrid"),
+        "knowledge": _attr("knowledge", "knowledge/"),
+        "memories": _attr("memories", "memories/"),
+        "sources": _attr("sources", "sources/"),
+        "retrieval": _attr("retrieval", "hybrid"),
         "prompt_reword": "true" if st.get("prompt_reword", True) else "false",
-        "embedding_model_used": st.get("embedding_model_used", ""),
+        "embedding_model_used": str(st.get("embedding_model_used") or ""),
     })
 
     pipe = ET.SubElement(root, "pipeline")
@@ -340,7 +344,12 @@ class PersonaService:
         return persona_path(persona_id)
 
     def list_all(self) -> list:
-        """Lightweight summaries for every persona folder that has a valid persona.xml."""
+        """Lightweight summaries for every persona folder that has a persona.xml.
+
+        A folder whose XML no longer parses is reported with ``broken`` set rather than
+        skipped. Hiding it made a corrupted persona unreachable from the UI — invisible,
+        but still holding its sources and memories, and still occupying its id. Listing
+        it keeps Delete (and a readable error) available."""
         out = []
         base = personas_dir()
         for child in sorted(base.iterdir()) if base.exists() else []:
@@ -349,7 +358,9 @@ class PersonaService:
                 continue
             try:
                 p = from_xml(core.read_text(xmlf))
-            except PersonaError:
+            except Exception as e:
+                out.append({"id": child.name, "name": child.name, "role": "",
+                            "variants": [], "broken": True, "error": str(e)})
                 continue
             p["id"] = child.name
             out.append({"id": child.name, "name": p["profile"]["name"],
@@ -371,15 +382,35 @@ class PersonaService:
     def save(self, persona: dict) -> dict:
         """Write persona.xml, scaffolding the standard subfolders. Derives the id from
         the name when absent, stamps ``updated``, and returns the persona with both
-        fields set. Overwrites an existing definition at the same id."""
+        fields set. Overwrites an existing definition at the same id.
+
+        The XML is validated by round-tripping it through ``from_xml`` BEFORE anything
+        touches disk. ``from_xml`` rejects an empty name, an unsafe store path, an
+        unknown step type, and a malformed schema — but ``save`` used to accept all of
+        them, so saving a persona with its name cleared wrote a file that could never be
+        read back: ``load`` raised and ``list_all`` skipped it, stranding the persona's
+        knowledge base in an invisible folder. A write the read path would reject now
+        raises PersonaError instead, leaving the previous definition intact."""
+        if not (persona.get("profile", {}).get("name") or "").strip():
+            raise PersonaError("Persona name is required.")
         pid = _safe_id(persona.get("id") or slugify(persona.get("profile", {}).get("name", "")))
         persona["id"] = pid
+        # We always write the current schema, so don't let a stale version field on the
+        # incoming dict produce a file from_xml would refuse.
+        persona["version"] = SCHEMA_VERSION
         persona["updated"] = datetime.utcnow().isoformat()
+        try:
+            xml = to_xml(persona)
+            from_xml(xml)
+        except PersonaError:
+            raise
+        except Exception as e:
+            raise PersonaError(f"Persona could not be serialized: {e}")
         d = self._dir(pid)
         # Scaffold the standard subfolders.
         for sub in ("sources", "memories/entries"):
             (d / sub).mkdir(parents=True, exist_ok=True)
-        core.write_text(d / "persona.xml", to_xml(persona))
+        core.write_text(d / "persona.xml", xml)
         return persona
 
     def _unique_id(self, base_slug: str) -> str:

@@ -16,6 +16,7 @@ from datetime import datetime
 from xml.sax.saxutils import escape as _xml_escape, quoteattr as _xml_attr
 
 from . import core
+from . import memory as mem_mod
 from .core import MIN_CRAWLED_PAGES, WEB_SEARCH_TOOL, web_search
 
 # Default Multi-Pass evaluation prompt. [input prompt] and [Response] are replaced
@@ -68,6 +69,16 @@ def create_chat_dict(title="New Chat", server_url=None, model=None, pre_prompt="
         "rag_enabled": False,      # retrieve top-k relevant chunks instead of dumping full context
         "rag_auto": False,         # auto-enable RAG when the message exceeds rag_threshold words
         "rag_threshold": 400,      # word count (question + staged data) that triggers auto-RAG
+        "memory_enabled": False,   # inject a user memory core, and grow it from this chat
+        "memory_core_id": "",      # which core (per-chat, see app/memory.py)
+        "memory_turns_since": 0,   # assistant turns since the last extraction pass
+        "persona_on": False,       # answer through a persona's pipeline (see app/persona.py)
+        "persona_id": "",          # which persona
+        "persona_variant": "",     # selected speaking variant ("" = the persona's default)
+        # Pinned composer sources: material that belongs to this conversation rather
+        # than a reusable library. [{id, type, label, content, source}] where type
+        # matches the library vocabulary (write|file|url|youtube|search).
+        "attachments": [],
     }
 
 
@@ -179,10 +190,20 @@ def _item_label_map(libraries: list) -> dict:
 # --------------------------- Interactive chat messages ---------------------------
 
 def _clean_msg(m):
-    """Strip a stored message down to what the model should see (role + content).
-    Drops app-only fields like ``reasoning`` so saved chain-of-thought is never
-    fed back into the model on later turns."""
-    return {"role": m.get("role"), "content": m.get("content", "")}
+    """Strip a stored message down to what the model should see (role + content,
+    plus any attached images). Drops app-only fields like ``reasoning`` so saved
+    chain-of-thought is never fed back into the model on later turns.
+
+    ``images`` survives as a *sibling* of ``content`` holding image records; it is
+    swapped for inline bytes by ``images.hydrate_messages`` at the last moment and
+    reshaped into each provider's wire format by the adapters. ``content`` therefore
+    stays a plain string all the way through, which the pre-prompt fold below and
+    the context tracker both depend on."""
+    out = {"role": m.get("role"), "content": m.get("content", "")}
+    imgs = m.get("images")
+    if imgs and out["role"] in ("user", "assistant"):
+        out["images"] = list(imgs)
+    return out
 
 
 def _resolve_prompts(chat: dict):
@@ -305,6 +326,131 @@ def inject_research(messages: list, query: str, research: str) -> list:
     return msgs
 
 
+ATTACHMENT_PREAMBLE = (
+    "The following <attached> block holds material the user pinned to this "
+    "conversation — documents, pages, videos or searches they added alongside their "
+    "messages. Treat it as reference the user expects you to have read, and use it "
+    "when relevant.\n\n"
+)
+
+
+def build_attachment_block(chat: dict) -> str:
+    """Render a chat's pinned attachments as an XML block, or '' when there are none.
+
+    Pinned attachments are re-sent on every turn, so they're emitted as a system
+    message rather than folded into the user's text — that way they don't accumulate
+    a fresh copy in the history with each message the way an inline <Data> block does.
+    """
+    items = (chat or {}).get("attachments") or []
+    els = []
+    for it in items:
+        content = (it.get("content") or "").strip()
+        if not content:
+            continue
+        attrs = [f"label={_xml_attr(it.get('label') or 'Attachment')}",
+                 f"type={_xml_attr(it.get('type') or 'write')}"]
+        if it.get("source"):
+            attrs.append(f"source={_xml_attr(it['source'])}")
+        els.append(f"  <item {' '.join(attrs)}>\n{_xml_escape(content)}\n  </item>")
+    if not els:
+        return ""
+    return ATTACHMENT_PREAMBLE + "<attached>\n" + "\n".join(els) + "\n</attached>"
+
+
+def attachment_text(chat: dict) -> str:
+    """Plain concatenation of the pinned attachments, for the RAG corpus."""
+    parts = []
+    for it in (chat or {}).get("attachments") or []:
+        content = (it.get("content") or "").strip()
+        if content:
+            label = it.get("label") or "Attachment"
+            parts.append(f"{label}\n{content}")
+    return "\n\n".join(parts)
+
+
+def resolve_attachments(chat: dict, rag_active: bool = False) -> str:
+    """The pinned-attachment block to inject for this generation, or ''.
+
+    Mirrors ``skip_library_dump``: when RAG is running, retrieval owns the pinned
+    material outright (``collect_rag_inputs`` puts it in the corpus) and the full block
+    is dropped. There used to be a size threshold below which the block was sent
+    *as well as* being retrieved, which spent the context twice on the same text for
+    no benefit.
+    """
+    if rag_active:
+        return ""
+    return build_attachment_block(chat)
+
+
+def attachment_images(chat: dict) -> list:
+    """Image refs (``[{"id": ...}]``) among a chat's pinned attachments.
+
+    Pinned images can't ride the ``<attached>`` XML block the way documents do —
+    ``build_attachment_block`` renders text, and an image has none. They travel as
+    real image parts on the user turn instead, which is why they need their own
+    collector and injector."""
+    out = []
+    for it in (chat or {}).get("attachments") or []:
+        if (it.get("type") == "image" or it.get("kind") == "image") and it.get("id"):
+            out.append({"id": it["id"]})
+    return out
+
+
+def inject_images(messages: list, refs: list) -> list:
+    """Append image refs to the last user turn (mirrors the other injectors' seam).
+
+    Appended rather than prepended so the images the user attached to *this* message
+    stay first — pinned material is background, the new attachment is the question.
+    An empty list is a no-op."""
+    if not refs:
+        return messages
+    msgs = list(messages)
+    for i in range(len(msgs) - 1, -1, -1):
+        if msgs[i].get("role") == "user":
+            m = dict(msgs[i])
+            m["images"] = list(m.get("images") or []) + list(refs)
+            msgs[i] = m
+            return msgs
+    return msgs
+
+
+def inject_attachments(messages: list, block: str) -> list:
+    """Insert the pinned-attachment block as a system message just before the final
+    user turn (mirrors ``inject_research``). An empty block is a no-op."""
+    if not block:
+        return messages
+    msgs = list(messages)
+    ctx = {"role": "system", "content": block}
+    last_user = -1
+    for i, m in enumerate(msgs):
+        if m.get("role") == "user":
+            last_user = i
+    if last_user >= 0:
+        msgs.insert(last_user, ctx)
+    else:
+        msgs.append(ctx)
+    return msgs
+
+
+def inject_memory(messages: list, block: str) -> list:
+    """Insert the user's memory core as a system message just before the final user
+    turn (mirrors ``inject_research``). ``block`` is built by ``memory.render_core``;
+    an empty block is a no-op so the caller doesn't have to check twice."""
+    if not block:
+        return messages
+    msgs = list(messages)
+    ctx = {"role": "system", "content": mem_mod.MEMORY_PREAMBLE + block}
+    last_user = -1
+    for i, m in enumerate(msgs):
+        if m.get("role") == "user":
+            last_user = i
+    if last_user >= 0:
+        msgs.insert(last_user, ctx)
+    else:
+        msgs.append(ctx)
+    return msgs
+
+
 # --------------------------- RAG (Retrieval Augmented Generation) ---------------------------
 
 # The inline data wrapper emitted by the frontend (``buildDataXml`` in app.js):
@@ -327,16 +473,19 @@ def collect_rag_inputs(chat: dict):
 
     Returns (question, data_text). Isolated chats scope the data to the current
     turn only; non-isolated chats concatenate the data blocks of every user turn
-    in the thread (matching how ``build_messages`` scopes history).
+    in the thread (matching how ``build_messages`` scopes history). Pinned
+    attachments join the corpus in both cases — they belong to the chat, not to a
+    turn, so isolation doesn't hide them.
     """
     msgs = [m for m in (chat or {}).get("messages", []) if not m.get("intermediate")]
     isolated = bool((chat or {}).get("isolated", False))
+    pinned = attachment_text(chat)
     last_user = None
     for m in msgs:
         if m.get("role") == "user":
             last_user = m
     if last_user is None:
-        return "", ""
+        return "", pinned
     last_data, question = split_inline_data(last_user.get("content", ""))
     if isolated:
         data_text = last_data
@@ -348,6 +497,8 @@ def collect_rag_inputs(chat: dict):
                 if d:
                     parts.append(d)
         data_text = "\n\n".join(parts).strip()
+    if pinned:
+        data_text = (data_text + "\n\n" + pinned).strip() if data_text else pinned
     return question, data_text
 
 

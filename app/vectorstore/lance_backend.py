@@ -41,9 +41,21 @@ def _sql_str(value) -> str:
     return "'" + str(value if value is not None else "").replace("'", "''") + "'"
 
 
-def _scope_predicate(source_type: str, ids: list) -> str:
+def _scope_predicate(source_type: str, ids: list, model: str = None) -> str:
+    """Filter predicate for a retrieval scope.
+
+    ``model`` is required for VECTOR search and must be omitted for keyword search
+    (BM25 is model-independent). Tables are keyed by vector WIDTH, so two different
+    embedding models of the same width — 768 covers nomic-embed-text, bge-base and
+    gte-base — share one table. Without the model filter a scope still holding vectors
+    from the previous model gets ranked against the new model's query vector, which
+    returns confident nonsense instead of nothing. The DuckDB backend has always
+    filtered on model; this keeps the two stores in agreement."""
     inner = ", ".join(_sql_str(i) for i in ids)
-    return f"source_type = {_sql_str(source_type)} AND source_id IN ({inner})"
+    pred = f"source_type = {_sql_str(source_type)} AND source_id IN ({inner})"
+    if model is not None:
+        pred += f" AND model = {_sql_str(model)}"
+    return pred
 
 
 class LanceBackend:
@@ -171,7 +183,13 @@ class LanceBackend:
                 n = 0
             if n > best_n:
                 best, best_n = d, n
-        return best, self._table(best) if best else (None, None)
+        # Parenthesised deliberately: `return best, x if best else (None, None)` binds
+        # the conditional to the second element only, so a falsy `best` returned a
+        # TUPLE as the table handle — truthy, so it sailed past every `if tbl is None`
+        # guard and blew up on the first `.search()`.
+        if best is None:
+            return None, None
+        return best, self._table(best)
 
     # -- writes ------------------------------------------------------------
     def replace_wave(self, source_type: str, source_id: str, delete_item_ids: list,
@@ -412,7 +430,7 @@ class LanceBackend:
             # DuckDB backend) uses, so omitting it silently changes retrieval results.
             res = (tbl.search([float(x) for x in qv])
                    .metric("cosine")
-                   .where(_scope_predicate(source_type, ids))
+                   .where(_scope_predicate(source_type, ids, model))
                    .limit(int(top_k)).to_arrow())
         except Exception:
             return []
@@ -420,12 +438,43 @@ class LanceBackend:
         # DuckDB backend's orientation (higher = better).
         return self._rows_from(res, "_distance", invert=True)
 
+    def _has_fts(self, dim: int, tbl) -> bool:
+        """Whether ``tbl`` has a usable full-text index on ``content``.
+
+        ``_fts_ready`` is only ever populated by ``optimize()``, i.e. by a compile in
+        THIS process. The index itself is durable, so trusting the in-memory set alone
+        meant that after a restart with no recompile every keyword and hybrid search
+        silently fell back to the Python BM25 full scan — the slow path this backend
+        exists to avoid. So ask the table once and remember the answer."""
+        if dim in self._fts_ready:
+            return True
+        lister = getattr(tbl, "list_indices", None)
+        if lister is None:
+            return False
+        try:
+            found = False
+            for idx in (lister() or []):
+                cols = (getattr(idx, "columns", None)
+                        or (idx.get("columns") if isinstance(idx, dict) else None) or [])
+                kind = str(getattr(idx, "index_type", "")
+                           or (idx.get("index_type") if isinstance(idx, dict) else "")).upper()
+                if "content" in cols and "FTS" in kind:
+                    found = True
+                    break
+            if found:
+                self._fts_ready.add(dim)
+            return found
+        except Exception:
+            return False
+
     def search_keyword(self, source_type: str, ids: list, query: str, top_k: int) -> list:
         dim, tbl = self._any_table()
         if tbl is None:
             return []
+        # No model filter: BM25 scores text, and chunk text does not depend on which
+        # embedding model produced the vectors alongside it.
         pred = _scope_predicate(source_type, ids)
-        if dim in self._fts_ready:
+        if self._has_fts(dim, tbl):
             try:
                 res = (tbl.search(query, query_type="fts")
                        .where(pred).limit(int(top_k)).to_arrow())

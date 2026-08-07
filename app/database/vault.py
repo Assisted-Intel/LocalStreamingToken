@@ -21,6 +21,7 @@ if the optional DB dependencies are not yet installed.
 from __future__ import annotations
 
 import base64
+import hmac
 import json
 import os
 import threading
@@ -65,6 +66,12 @@ class Vault:
         self._path = path
         self._lock = threading.RLock()
         self._key: Optional[bytes] = None
+        self._salt: bytes = b""
+        # KDF cost of the CURRENTLY loaded blob. An old vault keeps deriving with the
+        # parameters it was written with; only change_password re-encrypts at the
+        # module defaults. Without this, raising _SCRYPT_N would make every existing
+        # vault permanently undecryptable with no migration path.
+        self._kdf: tuple = (_SCRYPT_N, _SCRYPT_R, _SCRYPT_P)
         self._profiles: dict = {}   # id -> profile dict (with secrets), in-memory only
 
     # ------------------------------ status ------------------------------
@@ -82,18 +89,22 @@ class Vault:
 
     # ------------------------------ crypto ------------------------------
     @staticmethod
-    def _derive(password: str, salt: bytes) -> bytes:
+    def _derive(password: str, salt: bytes, kdf_params: tuple = None) -> bytes:
         from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-        kdf = Scrypt(salt=salt, length=_KEY_LEN, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P)
+        n, r, p = kdf_params or (_SCRYPT_N, _SCRYPT_R, _SCRYPT_P)
+        kdf = Scrypt(salt=salt, length=_KEY_LEN, n=n, r=r, p=p)
         return kdf.derive((password or "").encode("utf-8"))
 
     def _encrypt(self, key: bytes, plaintext: bytes) -> dict:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
         salt = self._salt  # reuse the salt bound to this key
+        n, r, p = self._kdf
         nonce = os.urandom(12)
         ct = AESGCM(key).encrypt(nonce, plaintext, _AAD)
-        return {"version": 1, "kdf": "scrypt", "n": _SCRYPT_N, "r": _SCRYPT_R,
-                "p": _SCRYPT_P, "salt": _b64e(salt), "nonce": _b64e(nonce), "ct": _b64e(ct)}
+        # Record the cost this blob was actually written with, so unlock can
+        # reproduce the key even after the module defaults move on.
+        return {"version": 1, "kdf": "scrypt", "n": n, "r": r,
+                "p": p, "salt": _b64e(salt), "nonce": _b64e(nonce), "ct": _b64e(ct)}
 
     # ------------------------------ unlock/lock ------------------------------
     def unlock(self, password: str) -> dict:
@@ -106,20 +117,35 @@ class Vault:
             if not self.exists():
                 # First run: create an empty encrypted vault with a fresh salt.
                 self._salt = os.urandom(16)
-                self._key = self._derive(password, self._salt)
+                self._kdf = (_SCRYPT_N, _SCRYPT_R, _SCRYPT_P)
+                self._key = self._derive(password, self._salt, self._kdf)
                 self._profiles = {}
                 self._persist_locked()
                 return self.status()
 
-            blob = json.loads(open(self._path, "r", encoding="utf-8").read())
-            self._salt = _b64d(blob["salt"])
-            key = self._derive(password, self._salt)
+            # A truncated or hand-edited blob raises JSONDecodeError/KeyError/binascii
+            # errors, none of which are VaultError — the route would 500 instead of
+            # telling the user their vault file is damaged.
             try:
-                pt = AESGCM(key).decrypt(_b64d(blob["nonce"]), _b64d(blob["ct"]), _AAD)
+                blob = json.loads(open(self._path, "r", encoding="utf-8").read())
+                salt = _b64d(blob["salt"])
+                nonce, ct = _b64d(blob["nonce"]), _b64d(blob["ct"])
+                kdf = (int(blob.get("n", _SCRYPT_N)), int(blob.get("r", _SCRYPT_R)),
+                       int(blob.get("p", _SCRYPT_P)))
+            except VaultError:
+                raise
+            except Exception as e:
+                raise VaultError(f"The vault file is unreadable or corrupt: {e}")
+            key = self._derive(password, salt, kdf)
+            try:
+                pt = AESGCM(key).decrypt(nonce, ct, _AAD)
             except Exception:
                 raise VaultError("Incorrect master password.")
-            data = json.loads(pt.decode("utf-8"))
-            self._key = key
+            try:
+                data = json.loads(pt.decode("utf-8"))
+            except Exception as e:
+                raise VaultError(f"The vault decrypted but its contents are corrupt: {e}")
+            self._salt, self._kdf, self._key = salt, kdf, key
             self._profiles = {p["id"]: p for p in data.get("profiles", []) if p.get("id")}
             return self.status()
 
@@ -128,6 +154,7 @@ class Vault:
             self._key = None
             self._profiles = {}
             self._salt = b""
+            self._kdf = (_SCRYPT_N, _SCRYPT_R, _SCRYPT_P)
             return self.status()
 
     def set_path(self, path) -> dict:
@@ -142,12 +169,16 @@ class Vault:
     def change_password(self, old_password: str, new_password: str) -> dict:
         with self._lock:
             self._require_unlocked()
-            # Verify old password by re-deriving against the stored salt.
-            if self._derive(old_password, self._salt) != self._key:
+            # Verify old password by re-deriving against the stored salt AND the cost
+            # this blob was written with (which may predate the current defaults).
+            if not hmac.compare_digest(self._derive(old_password, self._salt, self._kdf),
+                                       self._key):
                 raise VaultError("Current password is incorrect.")
-            # New salt + key, then re-encrypt the same profiles.
+            # New salt + key at the CURRENT cost, then re-encrypt the same profiles.
+            # This doubles as the upgrade path for a vault written at an older cost.
             self._salt = os.urandom(16)
-            self._key = self._derive(new_password, self._salt)
+            self._kdf = (_SCRYPT_N, _SCRYPT_R, _SCRYPT_P)
+            self._key = self._derive(new_password, self._salt, self._kdf)
             self._persist_locked()
             return self.status()
 

@@ -9,10 +9,18 @@ Provider abstraction. Every chat backend implements the same tiny interface:
     chat_stream(model, messages, options, stop_event, think=False,
                 tools=None, tool_executor=None) -> generator of (kind, payload)
 
-`chat_stream` yields three kinds of frame:
+`chat_stream` yields four kinds of frame:
     ("content",   str)   the answer text
     ("reasoning", str)   chain-of-thought, when ``think`` is set
+    ("image",     dict)  {b64, media_type, index} — an image the model produced
     ("usage",     dict)  {prompt_tokens, completion_tokens}, at most once, at the end
+
+Image *input* is accepted by all three adapters: a message may carry an ``images``
+list of {media_type, b64} beside its string ``content``, and each adapter reshapes it
+into that provider's wire format (see the shapers below). Image *output* is only ever
+emitted by OpenAIAdapter, and only by the handful of models that return image parts
+through the chat-completions endpoint (Gemini's *-image models, OpenRouter proxies of
+them). Ollama and Anthropic have no way to return one, so they never yield the frame.
 
 `get_client(server)` returns the right adapter for server["type"]:
     ollama    -> OllamaAdapter  (local/remote Ollama)
@@ -100,9 +108,21 @@ class ThinkSplitter:
 
 # --------------------------- message shaping ---------------------------
 
+# Internally a message carries images as a sibling of its text:
+#     {"role": "user", "content": "<text>",
+#      "images": [{"media_type": "image/png", "b64": "…"}]}
+# `content` stays a string everywhere in the app (the pre-prompt fold, the context
+# tracker and the batch templates all rely on it). Each shaper below converts that
+# into its provider's own multi-part format, which is the only place those shapes
+# should exist. A message with no images produces exactly what it did before images
+# were a feature.
+
 def _split_system(messages):
     """Return (system_text, chat_messages) — hoist all system-role entries into a
-    single system string and keep only user/assistant turns (for Anthropic)."""
+    single system string and keep only user/assistant turns (for Anthropic).
+
+    Images become ``image`` content blocks placed *before* the text, which is what
+    Anthropic recommends when a turn is a question about a picture."""
     system_parts = []
     chat = []
     for m in messages:
@@ -112,18 +132,64 @@ def _split_system(messages):
             if content:
                 system_parts.append(content)
         elif role in ("user", "assistant"):
-            chat.append({"role": role, "content": content})
+            imgs = m.get("images")
+            if imgs:
+                parts = [{"type": "image",
+                          "source": {"type": "base64",
+                                     "media_type": im.get("media_type", "image/png"),
+                                     "data": im.get("b64", "")}}
+                         for im in imgs if im.get("b64")]
+                parts.append({"type": "text", "text": content})
+                chat.append({"role": role, "content": parts})
+            else:
+                chat.append({"role": role, "content": content})
         # tool / tool_calls roles are dropped (cloud path never has them)
     return ("\n\n".join(system_parts), chat)
 
 
 def _openai_messages(messages):
-    """Keep only role+content for system/user/assistant (OpenAI takes system inline)."""
+    """Keep only role+content for system/user/assistant (OpenAI takes system inline).
+
+    Images become ``image_url`` parts carrying a base64 data URL, the form every
+    OpenAI-compatible server understands."""
     out = []
     for m in messages:
         role = m.get("role")
-        if role in ("system", "user", "assistant"):
-            out.append({"role": role, "content": m.get("content", "")})
+        if role not in ("system", "user", "assistant"):
+            continue
+        content = m.get("content", "")
+        imgs = m.get("images") if role in ("user", "assistant") else None
+        if not imgs:
+            out.append({"role": role, "content": content})
+            continue
+        parts = [{"type": "text", "text": content}]
+        for im in imgs:
+            if not im.get("b64"):
+                continue
+            parts.append({"type": "image_url", "image_url": {
+                "url": f"data:{im.get('media_type', 'image/png')};base64,{im['b64']}"}})
+        out.append({"role": role, "content": parts})
+    return out
+
+
+def _ollama_messages(messages):
+    """Ollama's /api/chat wants images as a bare list of base64 strings alongside the
+    text, not as content parts. Messages without images are handed through unchanged
+    (same object), so the text-only path costs nothing."""
+    out = []
+    for m in messages:
+        imgs = m.get("images")
+        if not imgs:
+            out.append(m)
+            continue
+        msg = dict(m)
+        if m.get("role") in ("user", "assistant"):
+            msg["images"] = [im["b64"] for im in imgs if im.get("b64")]
+            if not msg["images"]:
+                msg.pop("images")
+        else:
+            msg.pop("images", None)
+        out.append(msg)
     return out
 
 
@@ -148,14 +214,17 @@ class OllamaAdapter:
 
     def chat_stream(self, model, messages, options, stop_event, think=False,
                     tools=None, tool_executor=None):
-        """Stream a completion. ``options["num_ctx"]`` sets the context window."""
+        """Stream a completion. ``options["num_ctx"]`` sets the context window.
+
+        Never yields ``("image", …)``: Ollama's chat endpoint reads images but has no
+        way to return one."""
         num_ctx = options.get("num_ctx") or 4096
         # Ollama's think mode returns reasoning in message.thinking (already tagged
         # by OllamaClient). The splitter is a safety net for models that instead
         # inline <think>…</think> in the content stream.
         splitter = ThinkSplitter() if think else None
         for kind, text in self.client.chat_stream(
-            model, messages, num_ctx, stop_event,
+            model, _ollama_messages(messages), num_ctx, stop_event,
             think=think, tools=tools, tool_executor=tool_executor,
         ):
             if kind == "usage":
@@ -202,7 +271,9 @@ class AnthropicAdapter:
                     tools=None, tool_executor=None):
         """Stream a completion, negotiating the thinking config down through
         ``think_attempts`` because the accepted shape varies by SDK and model
-        version. Raises RuntimeError on failure."""
+        version. Raises RuntimeError on failure.
+
+        Never yields ``("image", …)``: Claude reads images but does not produce them."""
         system, msgs = _split_system(messages)
         if not msgs:
             msgs = [{"role": "user", "content": system or "Hello"}]
@@ -272,6 +343,49 @@ class AnthropicAdapter:
 
 # --------------------------- OpenAI-compatible ---------------------------
 
+_DATA_URL = re.compile(r"^data:([\w.+/-]+);base64,(.*)$", re.DOTALL)
+
+
+def _parse_image_part(part):
+    """Pull (b64, media_type) out of one returned image part, or (None, None).
+
+    There is no standard for this: image-returning models bolt their own shape onto
+    the chat-completions response. Handle the three seen in the wild — a data URL
+    under ``image_url`` (Gemini's OpenAI-compat layer, OpenRouter), and raw base64
+    under ``b64_json`` or ``data`` (the images-API shape, reused by some proxies).
+    """
+    if not isinstance(part, dict):
+        return None, None
+    url = part.get("image_url")
+    if isinstance(url, dict):
+        url = url.get("url")
+    if isinstance(url, str):
+        m = _DATA_URL.match(url.strip())
+        if m:
+            return m.group(2), m.group(1)
+        return None, None
+    b64 = part.get("b64_json") or part.get("data")
+    if isinstance(b64, str) and b64:
+        return b64, (part.get("media_type") or part.get("mime_type") or "image/png")
+    return None, None
+
+
+def _extract_images(obj):
+    """Image parts hanging off a delta or message. The `openai` SDK types these
+    objects strictly, so a non-standard ``images`` field never becomes an attribute —
+    it lands in ``model_extra``. Check both, since local servers return plain dicts."""
+    if obj is None:
+        return []
+    extra = getattr(obj, "model_extra", None)
+    parts = None
+    if isinstance(extra, dict):
+        parts = extra.get("images")
+    if parts is None:
+        parts = getattr(obj, "images", None)
+    if parts is None and isinstance(obj, dict):
+        parts = obj.get("images")
+    return parts if isinstance(parts, list) else []
+
 class OpenAIAdapter:
     """Any OpenAI-compatible endpoint — OpenAI itself plus xAI/Grok, Gemini,
     DeepSeek, Groq, Mistral, OpenRouter, LM Studio, and custom servers. The api_key
@@ -328,6 +442,7 @@ class OpenAIAdapter:
                 else:
                     raise
             usage_seen = None
+            image_index = 0
             for chunk in stream:
                 if stop_event.is_set():
                     break
@@ -341,6 +456,15 @@ class OpenAIAdapter:
                 if not choices:
                     continue
                 delta = choices[0].delta
+                # Image-returning models attach their picture to the delta (streaming)
+                # or to a final message object, depending on the server.
+                for src in (delta, getattr(choices[0], "message", None)):
+                    for part in _extract_images(src):
+                        b64, media_type = _parse_image_part(part)
+                        if b64:
+                            yield ("image", {"b64": b64, "media_type": media_type,
+                                             "index": image_index})
+                            image_index += 1
                 # DeepSeek-R1 and similar expose reasoning in a separate field.
                 rc = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
                 if rc:

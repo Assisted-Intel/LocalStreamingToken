@@ -110,6 +110,24 @@ class ProfileManager:
     def settings_dir(self, profile_id):
         return core.SETTINGS_PROFILES_DIR / profile_id
 
+    @staticmethod
+    def _deletable_dir(root: Path, profile_id):
+        """The folder to ``rmtree`` for ``profile_id``, or raise.
+
+        Profile ids come straight off the URL path, and ``root / profile_id`` happily
+        accepts a relative segment: ``".."`` resolves to ``data/`` or ``settings/`` —
+        the latter holding ``app_key.enc``, without which every encrypted file is
+        unrecoverable. So the id must be a single plain segment AND the resolved path
+        must still sit directly under ``root``. Callers additionally check the id is a
+        registered profile; this is the second belt."""
+        pid = str(profile_id or "")
+        if not pid or pid in (".", "..") or "/" in pid or "\\" in pid:
+            raise ValueError("Invalid profile id.")
+        target = (root / pid).resolve()
+        if target.parent != Path(root).resolve():
+            raise ValueError("Invalid profile id.")
+        return target
+
     def active_data_id(self):
         return self.data_reg["active"]
 
@@ -182,23 +200,31 @@ class ProfileManager:
 
     def delete_data(self, profile_id):
         """Delete a data profile and its folder. Can't delete the active one or the last."""
+        if profile_id not in {p["id"] for p in self.data_reg["profiles"]}:
+            raise ValueError("No such data profile.")
         if self._incognito or profile_id == self.active_data_id():
             raise ValueError("Switch to another profile before deleting this one.")
         if len(self.data_reg["profiles"]) <= 1:
             raise ValueError("You can't delete the last profile.")
+        # Resolve (and validate) the folder BEFORE dropping the registry entry, so a
+        # rejected id leaves the registry untouched.
+        target = self._deletable_dir(core.DATA_PROFILES_DIR, profile_id)
         self.data_reg["profiles"] = [p for p in self.data_reg["profiles"] if p["id"] != profile_id]
         self._save_data()
-        shutil.rmtree(self.data_dir(profile_id), ignore_errors=True)
+        shutil.rmtree(target, ignore_errors=True)
         return True
 
     def delete_settings(self, profile_id):
+        if profile_id not in {p["id"] for p in self.settings_reg["profiles"]}:
+            raise ValueError("No such settings profile.")
         if profile_id == self.active_settings_id():
             raise ValueError("Switch to another settings profile before deleting this one.")
         if len(self.settings_reg["profiles"]) <= 1:
             raise ValueError("You can't delete the last settings profile.")
+        target = self._deletable_dir(core.SETTINGS_PROFILES_DIR, profile_id)
         self.settings_reg["profiles"] = [p for p in self.settings_reg["profiles"] if p["id"] != profile_id]
         self._save_settings()
-        shutil.rmtree(self.settings_dir(profile_id), ignore_errors=True)
+        shutil.rmtree(target, ignore_errors=True)
         return True
 
     # ------------------------------ activation ------------------------------

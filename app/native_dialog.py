@@ -57,6 +57,14 @@ def _run_dialog(mode, title=None, default_name=None, filetypes_key=None):
         ("All files", "*.*"),
     ]
 
+    image_types = [
+        ("Images", "*.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff "
+                   "*.heic *.heif *.avif *.ico"),
+        ("PNG / JPEG", "*.png *.jpg *.jpeg"),
+        ("Camera photos (HEIC/HEIF)", "*.heic *.heif"),
+        ("All files", "*.*"),
+    ]
+
     def _open_ftypes():
         if filetypes_key == "xml":
             return xml_types
@@ -64,6 +72,8 @@ def _run_dialog(mode, title=None, default_name=None, filetypes_key=None):
             return json_types
         if filetypes_key == "documents":
             return doc_types
+        if filetypes_key == "images":
+            return image_types
         return text_types
 
     result = ""

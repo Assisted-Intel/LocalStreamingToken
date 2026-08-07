@@ -102,7 +102,7 @@ def run_parallel(items, lanes, mode, stop_event, generate_one, emit):
                   "server": lane.get("base_url"), "server_name": lane.get("name"),
                   "model": chat.get("model"), "title": item.get("title", "")})
 
-            content, reasoning = "", ""
+            content, reasoning, item_images = "", "", []
             try:
                 # The item's title (a filename in batch, or prompt label) tags the
                 # context-usage frames + history entry for this lane's current item.
@@ -115,11 +115,13 @@ def run_parallel(items, lanes, mode, stop_event, generate_one, emit):
                     frame.update(data or {})
                     emit(frame)
                     if kind == "pass_start":
-                        content, reasoning = "", ""
+                        content, reasoning, item_images = "", "", []
                     elif kind == "chunk":
                         content += (data or {}).get("content", "")
                     elif kind == "reasoning":
                         reasoning += (data or {}).get("content", "")
+                    elif kind == "image":
+                        item_images.append(data or {})
                     elif kind == "pass_end":
                         content = (data or {}).get("content", content)
                         reasoning = (data or {}).get("reasoning", reasoning)
@@ -128,7 +130,8 @@ def run_parallel(items, lanes, mode, stop_event, generate_one, emit):
 
             emit({"event": "item_done", "lane": lane_idx, "item_id": item_id,
                   "title": item.get("title", ""), "content": content,
-                  "reasoning": reasoning, "stopped": stop_event.is_set()})
+                  "reasoning": reasoning, "images": item_images,
+                  "stopped": stop_event.is_set()})
 
     threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(L)]
     for t in threads:

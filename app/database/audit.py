@@ -15,6 +15,26 @@ import threading
 from .. import core
 from .models import AuditEntry
 
+# Process-wide path -> RLock registry. The lock MUST be shared by every AuditLog
+# for the same file, not held per instance: each call site builds its own
+# AuditLog(session_id) (the write-back engine, the audit route), and an append is
+# a read-decrypt-modify-encrypt-write of the WHOLE file. A per-instance lock
+# guards nothing across instances, so two concurrent appends — or a "View audit"
+# landing mid-write-back — silently drop entries from the one record of what
+# touched the user's real data. Mirrors staging._CONNS/_REG_LOCK.
+_LOCKS: dict = {}
+_REG_LOCK = threading.Lock()
+
+
+def _lock_for(path) -> threading.RLock:
+    key = str(path)
+    with _REG_LOCK:
+        lock = _LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _LOCKS[key] = lock
+        return lock
+
 
 class AuditLog:
     """One log file per import session. Thread-safe appends."""
@@ -22,7 +42,7 @@ class AuditLog:
     def __init__(self, session_id: str):
         self.session_id = session_id
         self._path = core.DB_AUDIT_DIR / f"{session_id}.jsonl"
-        self._lock = threading.Lock()
+        self._lock = _lock_for(self._path)
 
     # The log is encrypted at rest (AES-GCM), which is not append-friendly, so each
     # append rewrites the whole file. Audit logs are small (one line per written-back

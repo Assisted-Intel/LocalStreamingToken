@@ -29,8 +29,10 @@ import json
 import queue as _queue
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from pathlib import Path
 
 from . import core
 from . import vectorstore
@@ -47,6 +49,7 @@ def reset_connection():
     profile. Called when the active profile changes — otherwise RAG would keep
     reading/writing the previous profile's vector store."""
     vectorstore.reset()
+    _clear_inline_cache()
 
 
 def set_backend(name) -> str:
@@ -347,6 +350,12 @@ class EmbedPool:
                 except Exception:
                     pass
 
+        # Batches still owed a result. A worker may only exit on an empty queue once
+        # nothing is in flight — otherwise the last worker standing can drain the queue,
+        # see Empty, and leave while another thread is about to requeue a failed batch,
+        # which then gets written off as failed with healthy lanes sitting idle.
+        inflight = [0]
+
         def worker(lane):
             while True:
                 # A down lane must stop pulling work entirely. Letting it keep grabbing
@@ -359,7 +368,14 @@ class EmbedPool:
                 try:
                     idx, batch, attempts = pending.get_nowait()
                 except _queue.Empty:
-                    return
+                    with state_lock:
+                        busy = inflight[0]
+                    if not busy:
+                        return
+                    time.sleep(0.01)    # a peer may still hand work back
+                    continue
+                with state_lock:
+                    inflight[0] += 1
                 try:
                     results[idx] = lane.embed(batch)
                     tick(len(batch))
@@ -377,6 +393,8 @@ class EmbedPool:
                             failed[0] += len(batch)
                         tick(len(batch))
                 finally:
+                    with state_lock:
+                        inflight[0] -= 1
                     pending.task_done()
 
         threads = []
@@ -538,11 +556,51 @@ def retrieve_libraries(query_vecs, lib_ids: list, model: str, top_k: int,
     return retrieve("library", lib_ids, query_vecs, model, top_k, mode=mode, queries=queries)
 
 
+# Chunks+vectors for the transient corpus, keyed by (embed model, sha1 of the text).
+# The inline corpus now includes a chat's PINNED ATTACHMENTS, which are re-sent every
+# turn and can be 200k characters each (a YouTube transcript). Embedding that from
+# scratch on every send made each message in such a chat pay the full cost again, so
+# an unchanged corpus is embedded once and reused. Small and bounded: this is a cache,
+# never a store — nothing here is persisted.
+_INLINE_CACHE_MAX = 8
+_INLINE_LOCK = threading.Lock()
+_INLINE_CACHE = OrderedDict()
+
+
+def _clear_inline_cache():
+    with _INLINE_LOCK:
+        _INLINE_CACHE.clear()
+
+
+def _inline_vectors(chunks: list, data_text: str, embed_fn, embed_model: str):
+    """Embed the transient chunks, reusing the last few corpora. Returns None when the
+    embedder is unavailable or fails, which the caller treats as "no vector half"."""
+    key = (embed_model or "", _hash(data_text))
+    with _INLINE_LOCK:
+        hit = _INLINE_CACHE.get(key)
+        if hit is not None and len(hit) == len(chunks):
+            _INLINE_CACHE.move_to_end(key)
+            return hit
+    try:
+        cvecs = embed_fn(chunks)
+    except Exception:
+        return None
+    if cvecs:
+        with _INLINE_LOCK:
+            _INLINE_CACHE[key] = cvecs
+            _INLINE_CACHE.move_to_end(key)
+            while len(_INLINE_CACHE) > _INLINE_CACHE_MAX:
+                _INLINE_CACHE.popitem(last=False)
+    return cvecs
+
+
 def retrieve_inline(query_vecs, data_text: str, embed_fn, top_k: int,
-                    mode: str = "hybrid", queries=None, label: str = "Data") -> list:
+                    mode: str = "hybrid", queries=None, label: str = "Data",
+                    embed_model: str = "") -> list:
     """Chunk the transient inline ``<Data>`` block and rank it under ``mode``. Nothing
     is persisted. Vector scoring embeds the chunks on the fly (skipped in keyword mode
-    or when no embedder is available)."""
+    or when no embedder is available); an unchanged corpus reuses the previous
+    embedding rather than paying for it again — see ``_inline_vectors``."""
     chunks = chunk_text(data_text or "")
     if not chunks:
         return []
@@ -552,10 +610,7 @@ def retrieve_inline(query_vecs, data_text: str, embed_fn, top_k: int,
 
     vec_lists = []
     if mode in ("vector", "hybrid") and vecs and embed_fn is not None:
-        try:
-            cvecs = embed_fn(chunks)
-        except Exception:
-            cvecs = None
+        cvecs = _inline_vectors(chunks, data_text or "", embed_fn, embed_model)
         if cvecs:
             for qv in vecs:
                 qv = [float(x) for x in qv]
@@ -764,9 +819,14 @@ def upsert_items(source_type: str, source_id: str, items: list, embed_fn, model:
     # Build/refresh the store's indexes once per run rather than per wave — index
     # maintenance is the expensive part, and mid-compile the index would only be
     # rebuilt again by the next wave. No-op on backends without durable indexes.
+    #
+    # This runs even when the user stopped the compile. Whatever waves DID land are
+    # already in the store and are searched from now on; skipping the index rebuild
+    # left them reachable only through the slow full-scan fallback until some later
+    # compile happened to finish.
     try:
         optimize = getattr(be, "optimize", None)
-        if optimize is not None and not stopped:
+        if optimize is not None:
             optimize()
     except Exception:
         pass
@@ -800,9 +860,34 @@ def delete_item(source_type: str, source_id: str, item_id: str) -> None:
     _backend().delete_items(source_type, source_id, [item_id])
 
 
+def _backend_has_store(name: str) -> bool:
+    """Does this backend's store already exist on disk? Guards the sweep below so
+    deleting a library never *creates* an empty store for a backend never used."""
+    target = core.RAG_LANCE_DIR if name == vectorstore.LANCE else core.RAG_DB_FILE
+    try:
+        return Path(target).exists()
+    except Exception:
+        return False
+
+
 def delete_source(source_id: str) -> None:
-    """Remove every chunk for a source id across all source types (persona deletion)."""
-    _backend().delete_source(source_id)
+    """Remove every chunk for a source id across all source types and BOTH vector-store
+    backends (library / persona deletion).
+
+    Both backends can hold vectors at once, so deleting while LanceDB was active used to
+    leave the DuckDB copy of the user's content on disk indefinitely — and vice versa.
+    A backend that has never been opened (no store file) is skipped rather than created.
+    """
+    active = vectorstore.active_name()
+    for name in vectorstore.BACKENDS:
+        if name != active and not _backend_has_store(name):
+            continue
+        try:
+            vectorstore.get_backend(name).delete_source(source_id)
+        except Exception:
+            pass          # a store we cannot open has nothing to leak
+    if vectorstore.active_name() != active:
+        vectorstore.get_backend(active)   # restore the cached instance
 
 
 def list_items(source_type: str, source_id: str) -> list:

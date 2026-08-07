@@ -28,18 +28,30 @@ import threading
 # --------------------------- one-shot completion over a streaming adapter ---------------------------
 
 def run_completion(adapter, model: str, messages: list,
-                   num_ctx: int = 4096, max_tokens: int = 1024, fmt=None) -> str:
+                   num_ctx: int = 4096, max_tokens: int = 1024, fmt=None,
+                   temperature=None, stop=None) -> str:
     """Collect a full (non-streamed) assistant answer from a provider adapter's
     ``chat_stream``. ``fmt`` (a JSON schema or "json") is forwarded to Ollama for
-    structured output when the adapter supports it; other adapters ignore it."""
-    stop = threading.Event()
+    structured output when the adapter supports it; other adapters ignore it.
+
+    ``stop`` is an optional caller-owned threading.Event. Without one this allocated a
+    private Event that nothing could reach, which is why Stop did nothing during a
+    persona pipeline's structured steps — every one of them ran to completion. The
+    one-shot ``client.complete`` path can't be interrupted once it starts, so a stop
+    already set short-circuits it instead."""
+    stop = stop if stop is not None else threading.Event()
+    if stop.is_set():
+        return ""
     options = {"num_ctx": num_ctx, "max_output_tokens": max_tokens}
+    if temperature is not None:
+        options["temperature"] = float(temperature)
     parts = []
     # Prefer a real one-shot when the adapter exposes one (OllamaAdapter.client.complete).
     client = getattr(adapter, "client", None)
     if fmt is not None and hasattr(client, "complete"):
         try:
-            return client.complete(model, messages, num_ctx=num_ctx, fmt=fmt, timeout=120)
+            return client.complete(model, messages, num_ctx=num_ctx, fmt=fmt,
+                                   temperature=temperature, timeout=120)
         except Exception:
             pass
     for kind, text in adapter.chat_stream(model, messages, options, stop,

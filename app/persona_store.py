@@ -102,10 +102,16 @@ class KnowledgeService:
 
 # --------------------------- Memories ---------------------------
 
-def _entries_dir(persona_id: str) -> Path:
-    """One JSON file per memory — the portable source of truth. Created if missing."""
+def _entries_dir(persona_id: str, create: bool = True) -> Path:
+    """One JSON file per memory — the portable source of truth.
+
+    Created if missing only when ``create`` is set. Read paths pass create=False: this
+    used to mkdir unconditionally, so merely LISTING the memories of a persona id that
+    doesn't exist scaffolded a folder for it, leaving empty orphan persona directories
+    behind."""
     d = persona_path(persona_id) / "memories" / "entries"
-    d.mkdir(parents=True, exist_ok=True)
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
     return d
 
 
@@ -150,7 +156,9 @@ class MemoryService:
         """All memories, newest first. Unreadable entries are skipped rather than
         failing the whole listing."""
         out = []
-        d = _entries_dir(persona_id)
+        d = _entries_dir(persona_id, create=False)
+        if not d.is_dir():
+            return out
         for f in sorted(d.glob("*.json")):
             try:
                 out.append(json.loads(core.read_text(f)))
@@ -161,13 +169,13 @@ class MemoryService:
 
     def get_memory(self, persona_id: str, mem_id: str) -> dict:
         """One memory by id, or None if there's no entry for it."""
-        f = _entries_dir(persona_id) / f"{mem_id}.json"
+        f = _entries_dir(persona_id, create=False) / f"{mem_id}.json"
         return json.loads(core.read_text(f)) if f.is_file() else None
 
     def delete_memory(self, persona_id: str, mem_id: str) -> None:
         """Remove a memory from both the store and disk."""
         rag.delete_item(ST_MEMORY, persona_id, mem_id)
-        f = _entries_dir(persona_id) / f"{mem_id}.json"
+        f = _entries_dir(persona_id, create=False) / f"{mem_id}.json"
         try:
             if f.is_file():
                 f.unlink()
@@ -179,7 +187,12 @@ class MemoryService:
         """Retrieve memories, then blend the retrieval score with emotional weight:
         blended = base * (1 + influence*(weight-5)/5). High-weight memories rise, very
         low-weight memories are gently demoted. Over-fetch before blending so weighting
-        can reorder the final top-k."""
+        can reorder the final top-k.
+
+        The multiplier is applied to a non-negative base. In ``vector`` mode the base is
+        a raw cosine, which can be negative — and scaling a negative number UP pushes it
+        further down the ranking, exactly inverting the intent. (Hybrid mode fuses with
+        RRF, whose scores are always positive, so it was never affected.)"""
         raw = rag.retrieve(ST_MEMORY, [persona_id], query_vecs, model, max(top_k * 3, top_k),
                            mode=mode, queries=queries)
         for r in raw:
@@ -191,6 +204,6 @@ class MemoryService:
             base = r.get("score", 0.0)
             r["base_score"] = base
             r["weight"] = weight
-            r["score"] = base * (1 + weight_influence * (weight - 5) / 5.0)
+            r["score"] = max(base, 0.0) * (1 + weight_influence * (weight - 5) / 5.0)
         raw.sort(key=lambda d: d.get("score", 0.0), reverse=True)
         return raw[:int(top_k)]

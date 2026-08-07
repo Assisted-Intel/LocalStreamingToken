@@ -192,7 +192,7 @@ def _extract_one(path_str: str) -> dict:
         return {"ok": False, "path": path_str, "error": str(e)}
 
 
-def extract_many(paths, workers: int = None, on_progress=None) -> list:
+def extract_many(paths, workers: int = None, on_progress=None, should_stop=None) -> list:
     """Parse many documents at once. Returns ``[{ok, path, ...}]`` in INPUT order.
 
     Uses a process pool: pypdf/ebooklib text extraction is almost entirely pure-Python,
@@ -204,10 +204,23 @@ def extract_many(paths, workers: int = None, on_progress=None) -> list:
     ``on_progress(done, total, name)`` fires as each file lands, in completion order.
     A file that fails to parse yields ``{"ok": False, "error": …}`` rather than
     aborting the batch — one broken PDF must not cost the user the other nine.
+
+    ``should_stop()`` is polled as each file lands; when it goes true the remaining
+    work is cancelled and those entries come back ``{"ok": False, "error": "cancelled"}``.
+    Without it the Stop button on the file-parse progress bar was decorative — a shelf
+    of ebooks kept parsing for minutes after the user called it off.
     """
     paths = [str(p) for p in (paths or [])]
     if not paths:
         return []
+    stopped = False
+
+    def halt():
+        nonlocal stopped
+        if not stopped and should_stop is not None and should_stop():
+            stopped = True
+        return stopped
+
     total = len(paths)
     results = [None] * total
     index = {p: i for i, p in enumerate(paths)}
@@ -229,22 +242,37 @@ def extract_many(paths, workers: int = None, on_progress=None) -> list:
         workers = min(os.cpu_count() or 2, total, 8)
     workers = max(1, int(workers))
 
-    if workers > 1 and total > 1:
+    if halt():
+        pass
+    elif workers > 1 and total > 1:
         try:
             with ProcessPoolExecutor(max_workers=workers) as ex:
                 futures = [ex.submit(_extract_one, p) for p in paths]
                 for fut in as_completed(futures):
                     land(fut.result())
+                    if halt():
+                        # Kills queued tasks; the ones already running still finish,
+                        # which is why the caller sees the stop within ~one file.
+                        ex.shutdown(wait=False, cancel_futures=True)
+                        break
         except Exception:
             # Process pool unavailable — redo whatever is still missing on threads.
-            todo = [p for p in paths if results[index[p]] is None]
+            # Not if we stopped on purpose, though: retrying there would defeat Stop.
+            todo = [] if stopped else [p for p in paths if results[index[p]] is None]
             done = total - len(todo)
             with ThreadPoolExecutor(max_workers=min(workers, len(todo) or 1)) as ex:
-                for res in ex.map(_extract_one, todo):
-                    land(res)
+                futures = [ex.submit(_extract_one, p) for p in todo]
+                for fut in as_completed(futures):
+                    land(fut.result())
+                    if halt():
+                        ex.shutdown(wait=False, cancel_futures=True)
+                        break
     else:
         for p in paths:
+            if halt():
+                break
             land(_extract_one(p))
 
-    return [r if r is not None else {"ok": False, "path": p, "error": "not parsed"}
+    filler = "cancelled" if stopped else "not parsed"
+    return [r if r is not None else {"ok": False, "path": p, "error": filler}
             for p, r in zip(paths, results)]
