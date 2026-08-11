@@ -37,6 +37,17 @@ DUCKDB = "duckdb"
 LANCE = "lance"
 BACKENDS = (LANCE, DUCKDB)
 
+
+class VectorStoreError(RuntimeError):
+    """A store-level failure the user can actually act on.
+
+    Both engines report low-level trouble in their own vocabulary — LanceDB surfaces a
+    Rust panic site from whatever machine built the wheel
+    (``LanceError(IO): file size is too small, C:\\Users\\runneradmin\\.cargo\\…``), which
+    is meaningless to the person reading it and unsearchable. Backends translate those
+    into this, with a sentence naming the store and what to do about it. The store is a
+    rebuildable cache, so "delete it and recompile" is nearly always the answer."""
+
 _LOCK = threading.RLock()
 _ACTIVE = None                  # cached backend instance
 _ACTIVE_NAME = None             # which backend that instance is

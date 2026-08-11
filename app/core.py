@@ -106,7 +106,7 @@ BROKEN_OPTIONAL_IMPORTS = _neutralize_broken_optional_imports()
 # --------------------------- Branding ---------------------------
 APP_NAME = "Local Streaming Token"
 APP_AUTHOR = "Assisted Intel"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 # --------------------------- Provider presets ---------------------------
 # Each preset maps a user-facing provider choice to an adapter `type`
@@ -186,6 +186,16 @@ PERSONAS_DIR = DATA_DIR / "personas"           # one <persona_id>/ folder each (
 # inlined into chats.json: that file is rewritten and re-encrypted in full on every
 # settings keystroke, which a few megabytes of base64 would make unusable.
 IMAGES_DIR = DATA_DIR / "images"
+# Fetched YouTube videos, one encrypted <video_id>.json each — see app/youtube_cache.py.
+# A rebuildable cache that never expires, so it is user-cleared from Settings. One file
+# per video rather than one shared blob, for the same reason IMAGES_DIR exists.
+YOUTUBE_CACHE_DIR = DATA_DIR / "youtube_cache"
+# Fetched RSS/podcast material — see app/rss_cache.py. Two subdirectories inside:
+# ``feeds/<feed_id>.json`` (listings, refreshed by conditional GET) and
+# ``episodes/<episode_id>.json`` (one encrypted entry each, never expires). Same
+# one-file-per-item reasoning as YOUTUBE_CACHE_DIR, and doubly so here: an episode
+# transcript that cost GPU-minutes to produce must not ride in a shared blob.
+RSS_CACHE_DIR = DATA_DIR / "rss_cache"
 
 # --- Database Processing tab ------------------------------------------------
 # Non-secret session/project metadata lives with the data profile (like the other
@@ -204,7 +214,7 @@ def set_active_data_profile(profile_dir):
     global EVALS_FILE, BATCH_PROJECTS_FILE, CONTEXT_HISTORY_FILE, DB_PROJECTS_FILE
     global RAG_DB_FILE, RAG_LANCE_DIR
     global MEMORY_CORES_FILE
-    global COMPILED_FILE, PERSONAS_DIR, IMAGES_DIR
+    global COMPILED_FILE, PERSONAS_DIR, IMAGES_DIR, YOUTUBE_CACHE_DIR, RSS_CACHE_DIR
     global DB_DIR, DB_STAGING_DIR, DB_AUDIT_DIR, VAULT_FILE
     d = Path(profile_dir)
     d.mkdir(parents=True, exist_ok=True)
@@ -223,11 +233,14 @@ def set_active_data_profile(profile_dir):
     COMPILED_FILE = d / "compiled.json"
     PERSONAS_DIR = d / "personas"
     IMAGES_DIR = d / "images"
+    YOUTUBE_CACHE_DIR = d / "youtube_cache"
+    RSS_CACHE_DIR = d / "rss_cache"
     DB_DIR = d / "db"
     DB_STAGING_DIR = DB_DIR / "staging"
     DB_AUDIT_DIR = DB_DIR / "audit"
     VAULT_FILE = d / "db_vault.enc"
-    for _d in (DB_DIR, DB_STAGING_DIR, DB_AUDIT_DIR, IMAGES_DIR):
+    for _d in (DB_DIR, DB_STAGING_DIR, DB_AUDIT_DIR, IMAGES_DIR, YOUTUBE_CACHE_DIR,
+               RSS_CACHE_DIR):
         _d.mkdir(parents=True, exist_ok=True)
 
 

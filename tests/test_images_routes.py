@@ -248,8 +248,12 @@ def test_image_output_is_reported_only_for_the_models_that_do_it(cloud):
     assert caps(cloud, "gpt-4o")["image_output"] is False
 
 
-def test_ollama_never_claims_image_output(client):
+def test_ollama_never_claims_image_output(client, monkeypatch):
     """Its chat endpoint reads images but has no way to return one."""
+    # Same StubAdapter the other two Ollama capability tests use. Without it the real
+    # adapter runs and asks a live Ollama for /api/show, which is not what this asserts:
+    # "no image output" is a fact about the provider, not about the model's tags.
+    use_adapter(monkeypatch, StubAdapter())
     assert caps(client, "gemini-2.5-flash-image", server=OLLAMA_URL)["image_output"] is False
 
 

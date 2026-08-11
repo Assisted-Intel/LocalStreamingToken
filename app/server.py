@@ -15,12 +15,14 @@ import json
 import queue
 import shutil
 import threading
+import traceback
 import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import unquote, urlparse
 
 import requests
 from flask import (Flask, request, jsonify, Response, send_from_directory,
@@ -29,7 +31,8 @@ from flask import (Flask, request, jsonify, Response, send_from_directory,
 from . import (batch as batch_mod, compile as compile_mod, context_tracker, core, crypto,
                evals, images as images_mod, ingest, logic, memory, migrate, native_dialog,
                parallel, persona as persona_mod, persona_io, persona_store,
-               pipeline as pipeline_mod, profiles, providers, rag, rewrite, youtube)
+               pipeline as pipeline_mod, profiles, providers, rag, rewrite, rss,
+               rss_cache, transcribe, youtube, youtube_cache)
 from .database import staging as db_staging
 from .database.routes import register_db_routes
 from .database.vault import Vault
@@ -232,6 +235,10 @@ def create_app():
         store.reload_settings()
         _apply_rag_backend()
         caps_cache.clear()
+        # The whisper_* keys live in the settings profile, so the loaded model may now be
+        # the wrong one. (The weights themselves are not user data — see the note in
+        # app/transcribe.py about why a DATA-profile switch deliberately does not do this.)
+        transcribe.reset_model()
 
     def sse(event, data):
         """Format one Server-Sent-Events frame."""
@@ -459,6 +466,10 @@ def create_app():
             "default_batch_project": batch_mod.new_project(),
             "batch_source_kinds": batch_mod.SOURCE_KINDS,
             "batch_exts": sorted(ingest.SUPPORTED_EXTS),
+            # Kept SEPARATE from batch_exts on purpose: merging them would make a
+            # folder-of-documents source advertise .mp3, which ingest.extract correctly
+            # refuses to read.
+            "batch_media_exts": sorted(transcribe.SUPPORTED_EXTS),
             "memory_cores": memory.decorate_all(store.memory_cores_snapshot()),
             "memory_categories": memory.CATEGORIES,
         })
@@ -684,6 +695,7 @@ def create_app():
         allowed = ("brave_token", "brightdata_token", "brightdata_zone",
                    "default_num_ctx", "auto_detect_reasoning", "max_output_tokens",
                    "rag_embed_server_url", "rag_embed_model", "rag_top_k",
+                   "rag_thread_window",
                    "rag_retrieval_mode", "rag_contextual_chunking", "rag_context_model",
                    "rag_query_rewrite", "rewrite_model",
                    "rag_chunker", "rag_chunk_size", "rag_chunk_overlap",
@@ -692,7 +704,12 @@ def create_app():
                    "rag_backend",
                    "memory_weight_influence", "pipeline_max_retries",
                    "provider_context_windows",
-                   "image_max_dim", "image_full_res_default")
+                   "image_max_dim", "image_full_res_default",
+                   "whisper_model", "whisper_device", "whisper_compute_type",
+                   "whisper_batch_size", "whisper_language", "whisper_vad",
+                   "whisper_beam_size", "whisper_cpu_threads",
+                   "rss_notes_min_chars", "rss_fetch_pages", "rss_max_episodes",
+                   "chat_settings_collapsed")
         patch = {k: data[k] for k in allowed if k in data}
         if "provider_context_windows" in patch:
             raw = patch["provider_context_windows"]
@@ -709,11 +726,28 @@ def create_app():
         if "rag_retrieval_mode" in patch and patch["rag_retrieval_mode"] not in (
                 "vector", "keyword", "hybrid"):
             patch.pop("rag_retrieval_mode")
+        if "whisper_device" in patch and patch["whisper_device"] not in (
+                "auto", "cuda", "cpu"):
+            patch.pop("whisper_device")
+        if "whisper_compute_type" in patch and patch["whisper_compute_type"] not in (
+                "float16", "int8_float16", "bfloat16", "int8", "float32"):
+            patch.pop("whisper_compute_type")
         for boolk in ("rag_contextual_chunking", "rag_query_rewrite",
                       "rag_embed_parallel", "rag_ann_enabled",
-                      "image_full_res_default"):
+                      "image_full_res_default", "whisper_vad", "rss_fetch_pages",
+                      "chat_settings_collapsed"):
             if boolk in patch:
                 patch[boolk] = bool(patch[boolk])
+        for numk, lo, hi in (("whisper_batch_size", 1, 32),
+                             ("whisper_beam_size", 1, 10),
+                             ("whisper_cpu_threads", 0, 64),
+                             ("rss_notes_min_chars", 0, 20000),
+                             ("rss_max_episodes", 0, 500)):
+            if numk in patch:
+                try:
+                    patch[numk] = max(lo, min(hi, int(patch[numk])))
+                except Exception:
+                    patch.pop(numk)
         if "image_max_dim" in patch:
             try:
                 # Below ~256 an image carries no usable detail; above 8192 nothing
@@ -743,6 +777,13 @@ def create_app():
                 patch["memory_weight_influence"] = max(0.0, min(1.0, float(patch["memory_weight_influence"])))
             except Exception:
                 patch.pop("memory_weight_influence")
+        if "rag_thread_window" in patch:
+            # At least 1: windowing away the final user turn would leave nothing to
+            # answer. Above ~200 the window stops meaning anything.
+            try:
+                patch["rag_thread_window"] = max(1, min(200, int(patch["rag_thread_window"])))
+            except Exception:
+                patch.pop("rag_thread_window")
         for numk in ("default_num_ctx", "max_output_tokens", "rag_top_k",
                      "rag_chunk_size", "rag_chunk_overlap"):
             if numk in patch:
@@ -765,6 +806,12 @@ def create_app():
             # Turning the ANN index off drops it immediately so the RAM comes back
             # without needing a restart.
             rag.set_ann_enabled(store.config.get("rag_ann_enabled", True))
+        if any(k.startswith("whisper_") for k in patch):
+            # The loaded model is keyed by model/device/compute_type, so a change here
+            # must drop it — otherwise editing the model in Settings appears to do
+            # nothing until the app restarts. Also clears a remembered CUDA failure, so
+            # "upgrade ctranslate2, then save" re-enables the GPU without a restart.
+            transcribe.reset_model()
         return jsonify({"config": store.masked_config()})
 
     # ----------------------------- Prompt rewrite ---------------------------
@@ -881,9 +928,23 @@ def create_app():
         store.upsert_chat(chat)
         return jsonify({"chat": chat})
 
+    def _forget_chat_rag(chat_id):
+        """Drop a chat's indexed corpus (thread + attachments) and its manifest. Best
+        effort: failing to tidy up must never break the delete that triggered it."""
+        if not chat_id:
+            return
+        try:
+            rag.delete_source(chat_id)          # sweeps both chat source types, both backends
+            compile_mod.forget_chat(chat_id)
+        except Exception:
+            pass
+
     @app.route("/api/chats/<chat_id>", methods=["DELETE"])
     def api_chat_delete(chat_id):
         store.delete_chat(chat_id)
+        # Thread/attachment vectors outlive the chat otherwise — nothing else references
+        # them, and no later sweep would ever find them.
+        _forget_chat_rag(chat_id)
         # Its images are now unreferenced. The age guard in images.gc keeps this from
         # touching anything a still-open chat is using.
         _gc_images()
@@ -959,8 +1020,13 @@ def create_app():
 
     @app.route("/api/chat-groups/<group_id>", methods=["DELETE"])
     def api_chat_group_delete(group_id):
-        if not store.delete_group(group_id):
+        # An empty tab deletes successfully and returns [], so this tests for None.
+        deleted = store.delete_group(group_id)
+        if deleted is None:
             return jsonify({"error": "not found or not deletable"}), 400
+        for chat_id in deleted:
+            _forget_chat_rag(chat_id)
+        _gc_images()
         return jsonify({"ok": True, "chats": store.chat_summaries(),
                         "chat_groups": store.groups()})
 
@@ -1046,13 +1112,26 @@ def create_app():
         return batch, workers
 
     def _rag_retrieve(chat):
+        """Non-streaming driver for callers that can't yield — see
+        ``_rag_retrieve_frames`` for the contract."""
+        gen = _rag_retrieve_frames(chat)
+        while True:
+            try:
+                next(gen)
+            except StopIteration as done:
+                return done.value
+
+    def _rag_retrieve_frames(chat):
         """Resolve + run RAG for one generation, shared by interactive/queue
-        (generate_one) and sequential batch. Returns (rag_plan, rag_retrieved,
-        status_msg): rag_plan is None when RAG is inactive OR degraded to full
-        context; a plan with ``blocked=True`` means a selected library isn't
-        compiled — the caller must inject NO library context (no full dump) and
-        surface status_msg prompting the user to Compile. Indexing is NOT done here:
-        libraries/personas must be compiled explicitly via the Compile Data button."""
+        (generate_one) and sequential batch. Yields ("status", {...}) frames while
+        indexing and RETURNS (rag_plan, rag_retrieved, status_msg): rag_plan is None when
+        RAG is inactive OR degraded to full context; a plan with ``blocked=True`` means a
+        selected library isn't compiled — the caller must inject NO library context (no
+        full dump) and surface status_msg prompting the user to Compile.
+
+        Libraries and personas are NOT indexed here: they must be compiled explicitly via
+        the Compile Data button. A chat's own corpus is the exception — it changes every
+        turn, so ``compile.sync_chat`` keeps it fresh incrementally on this path."""
         rag_plan = logic.resolve_rag(chat, store.config)
         if not (rag_plan and rag_plan.get("active")):
             return None, None, None
@@ -1079,6 +1158,21 @@ def create_app():
                         msg += (" Strict mode is NOT in effect for this message — the "
                                 "answer may come from the model's own knowledge.")
                     return ({"active": True, "blocked": True}, None, msg)
+            # The chat's OWN corpus is indexed here, after the library gate so a blocked
+            # library short-circuits without paying for an embed. Best effort: a dead
+            # embed server must not cost the user retrieval over what is already stored.
+            scope = rag_plan["scope"]
+            transient = logic.rag_is_transient(chat)
+            if not transient and (rag_plan["use_thread"] or rag_plan["use_attachments"]):
+                notes = []
+                try:
+                    pool, _sync_model, _sync_url = _compile_embedder()
+                    compile_mod.sync_chat(chat, pool, embed_model,
+                                          on_status=notes.append)
+                except Exception:
+                    notes = []
+                for note in notes:
+                    yield ("status", {"message": note})
             mode = rag_plan.get("mode", "hybrid")
             queries = rag_plan.get("queries") or ([rag_plan["query"]] if rag_plan["query"] else [])
             # Prompt Reword: expand the message into 2-3 retrieval queries (+ keywords),
@@ -1104,19 +1198,50 @@ def create_app():
             qvecs = []
             if wants_vectors and queries:
                 qvecs = embed_fn(queries)
-            retrieved = []
+            per_k = rag_plan["top_k"]
+            # Each corpus is retrieved into its OWN ranked list and the lists are
+            # RRF-fused below. They used to be concatenated and sorted by raw score,
+            # which compares numbers from different spaces (a Lance distance, a cosine,
+            # an RRF score) and let one corpus crowd out the others.
+            lists = []
             if rag_plan["use_libraries"]:
-                retrieved += rag.retrieve_libraries(
-                    qvecs, lib_ids, embed_model, rag_plan["top_k"],
-                    mode=mode, queries=queries)
-            if rag_plan["data_text"]:
-                retrieved += rag.retrieve_inline(
-                    qvecs, rag_plan["data_text"], embed_fn if wants_vectors else None,
-                    rag_plan["top_k"], mode=mode, queries=queries,
-                    embed_model=embed_model)
-            retrieved.sort(key=lambda d: d.get("score", -1.0), reverse=True)
-            rag_retrieved = retrieved[:rag_plan["top_k"]]
-            return rag_plan, rag_retrieved, f"📚 RAG ({mode}): injected {len(rag_retrieved)} relevant chunk(s)"
+                lists.append(rag.retrieve_libraries(
+                    qvecs, lib_ids, embed_model, per_k, mode=mode, queries=queries))
+            if not transient:
+                if rag_plan["use_attachments"]:
+                    lists.append(rag.retrieve(
+                        compile_mod.CHAT_ATTACH, [chat["id"]], qvecs, embed_model,
+                        per_k, mode=mode, queries=queries))
+                if rag_plan["use_thread"]:
+                    lists.append(rag.retrieve(
+                        compile_mod.CHAT_THREAD, [chat["id"]], qvecs, embed_model,
+                        per_k, mode=mode, queries=queries))
+            else:
+                # Private/synthetic: chunked in memory per send, nothing persisted.
+                if rag_plan["use_attachments"] and rag_plan["data_text"]:
+                    lists.append(rag.retrieve_inline(
+                        qvecs, rag_plan["data_text"],
+                        embed_fn if wants_vectors else None, per_k, mode=mode,
+                        queries=queries, label="Attached data",
+                        embed_model=embed_model))
+                if rag_plan["use_thread"]:
+                    lists.append(rag.retrieve_inline(
+                        qvecs, logic.thread_text(chat),
+                        embed_fn if wants_vectors else None, per_k, mode=mode,
+                        queries=queries, label="Conversation",
+                        embed_model=embed_model))
+            # Budget: a couple of extra slots per additional corpus so a third source
+            # doesn't simply squeeze the other two out of the configured top_k, capped so
+            # the context spend stays in the same neighbourhood the user asked for.
+            n_active = len([lst for lst in lists if lst])
+            final_k = (per_k if n_active <= 1
+                       else min(per_k + 2 * (n_active - 1), 3 * per_k))
+            rag_retrieved = rag.fuse(lists, final_k)
+            status = (f"📚 RAG ({mode}, {scope}): injected "
+                      f"{len(rag_retrieved)} relevant chunk(s)")
+            if transient and (rag_plan["use_thread"] or rag_plan["use_attachments"]):
+                status += " — private chat: retrieved in memory, not indexed"
+            return rag_plan, rag_retrieved, status
         except Exception as e:
             # Degrade to full-context: caller falls back to the full library dump.
             return None, None, f"📚 RAG unavailable ({e}); using full context"
@@ -1172,13 +1297,18 @@ def create_app():
         # across every Multi-Pass round (a selected library is always served via RAG).
         # use_rag is only true when chunks actually came back — otherwise we fall back
         # to the full library dump so the library never silently vanishes.
-        rag_plan, rag_retrieved, rag_status = _rag_retrieve(chat)
+        rag_plan, rag_retrieved, rag_status = yield from _rag_retrieve_frames(chat)
         use_rag = bool(rag_plan and rag_plan.get("active") and rag_retrieved)
         # Uncompiled library: drop it from the turn so no full-text dump leaks in; the
         # rag_status line tells the user to Compile first.
         if rag_plan and rag_plan.get("blocked"):
             chat = dict(chat)
             chat["library_ids"] = []
+        # Scope decides two things beyond retrieval: whether the pinned-attachment block
+        # still has to be sent in full (it does under thread scope, where attachments are
+        # not in the corpus) and whether the <Data> block may be stripped.
+        rag_scope = logic.rag_scope(chat)
+        strip_data = rag_scope != "thread"
         pass_use_system = bool(chat.get("pass_use_system", True))
 
         last_answer = ""
@@ -1201,16 +1331,23 @@ def create_app():
                     if rag_status:
                         yield ("status", {"message": rag_status})
                     if use_rag:
-                        messages = logic.build_messages(chat, store.libraries, skip_library_dump=True)
+                        # What RAG actually picked, for the Sources panel. Pass 0 only:
+                        # the refinement rounds re-inject these very same chunks.
+                        yield ("sources", {"items": logic.describe_sources(
+                            rag_retrieved, store.libraries)})
+                        messages = logic.build_messages(
+                            chat, store.libraries, skip_library_dump=True,
+                            history_window=rag_plan.get("history_window"))
                         # Pinned attachments go in first so the RAG excerpts stay the
                         # message closest to the question.
                         messages = logic.inject_attachments(
-                            messages, logic.resolve_attachments(chat, use_rag))
-                        messages = logic.inject_rag(messages, rag_retrieved, store.libraries)
+                            messages, logic.resolve_attachments(chat, use_rag, rag_scope))
+                        messages = logic.inject_rag(messages, rag_retrieved, store.libraries,
+                                                    strip_data=strip_data)
                     else:
                         messages = logic.build_messages(chat, store.libraries)
                         messages = logic.inject_attachments(
-                            messages, logic.resolve_attachments(chat, use_rag))
+                            messages, logic.resolve_attachments(chat, use_rag, rag_scope))
                     ws = logic.resolve_web_search(chat, store.config, search_query, tools_supported)
                     if ws["worker_query"]:
                         yield ("status", {"message":
@@ -1239,7 +1376,8 @@ def create_app():
                         messages = logic.build_eval_messages(
                             chat, input_prompt, last_answer, store.libraries,
                             pass_use_system, skip_library_dump=True)
-                        messages = logic.inject_rag(messages, rag_retrieved, store.libraries)
+                        messages = logic.inject_rag(messages, rag_retrieved, store.libraries,
+                                                    strip_data=strip_data)
                     else:
                         messages = logic.build_eval_messages(
                             chat, input_prompt, last_answer, store.libraries, pass_use_system)
@@ -1249,7 +1387,7 @@ def create_app():
                     # (Memory is deliberately pass-0 only — see above — because the
                     # answer being refined was already written with it in view.)
                     messages = logic.inject_attachments(
-                        messages, logic.resolve_attachments(chat, use_rag))
+                        messages, logic.resolve_attachments(chat, use_rag, rag_scope))
                     pass_tools, tool_executor = None, None
 
                 # Pinned images follow into every pass, like the attachment block:
@@ -1384,6 +1522,17 @@ def create_app():
             return jsonify({"ok": True, "skipped": "private"})
         chat["updated"] = datetime.utcnow().isoformat()
         store.upsert_chat(chat)
+        return jsonify({"ok": True})
+
+    @app.route("/api/chats/<chat_id>/rag/forget", methods=["DELETE"])
+    def api_chat_rag_forget(chat_id):
+        """Drop this chat's indexed thread + attachment chunks.
+
+        ``sync_chat`` prunes on the next send, which self-heals an edit or a regenerate.
+        Clearing a chat and never sending again would leave the rows behind, though, so
+        the client calls this from Clear messages — and it gives the user an explicit
+        lever for 'forget what you indexed about this conversation'."""
+        _forget_chat_rag(chat_id)
         return jsonify({"ok": True})
 
     # -------------------- Context-usage history (per chat) ------------------
@@ -1551,7 +1700,13 @@ def create_app():
             try:
                 work_fn(lambda ev, data: frames.put((ev, data)), stop_event)
             except Exception as e:
-                frames.put(("error", {"message": str(e)}))
+                # The class name earns its place in the message: `str(e)` alone turned
+                # an AttributeError and a corrupt vector store into indistinguishable
+                # one-liners in a toast that vanishes after 3.5 seconds. The traceback
+                # goes to stderr because it is the only durable record — the app keeps
+                # no log — and it is what makes the next unexplained failure solvable.
+                traceback.print_exc()
+                frames.put(("error", {"message": f"{type(e).__name__}: {e}"}))
             finally:
                 frames.put(sentinel)
 
@@ -1594,12 +1749,16 @@ def create_app():
         want_ctx = body.get("contextual")
         if want_ctx is None:
             want_ctx = bool(store.config.get("rag_contextual_chunking"))
-        pool, embed_model, embed_url = _compile_embedder()
-        contextualize = _compile_contextualizer(embed_url, want_ctx)
-        batch_size, max_workers = _compile_tuning()
         run_id = body.get("run_id") or f"compile-library-{lib_id}"
 
         def work(emit, stop_event):
+            # Resolved INSIDE the worker so a failure here becomes a legible SSE `error`
+            # frame. Building them in the request thread meant any exception escaped as a
+            # Flask HTML 500, which the client could only render as the contentless
+            # "Compile error: INTERNAL SERVER ERROR".
+            pool, embed_model, embed_url = _compile_embedder()
+            contextualize = _compile_contextualizer(embed_url, want_ctx)
+            batch_size, max_workers = _compile_tuning()
             compile_mod.compile_library(lib, pool, embed_model,
                                         contextualize=contextualize, force=force, emit=emit,
                                         batch_size=batch_size, max_workers=max_workers,
@@ -1626,12 +1785,14 @@ def create_app():
         want_ctx = body.get("contextual")
         if want_ctx is None:
             want_ctx = bool(store.config.get("rag_contextual_chunking"))
-        pool, embed_model, embed_url = _compile_embedder(persona)
-        contextualize = _compile_contextualizer(embed_url, want_ctx)
-        batch_size, max_workers = _compile_tuning()
         run_id = body.get("run_id") or f"compile-persona-{pid}-{uuid.uuid4().hex[:8]}"
 
         def work(emit, stop_event):
+            # Inside the worker, so a failure is a legible error frame — see the library
+            # compile route above.
+            pool, embed_model, embed_url = _compile_embedder(persona)
+            contextualize = _compile_contextualizer(embed_url, want_ctx)
+            batch_size, max_workers = _compile_tuning()
             compile_mod.compile_persona(persona, pool, embed_model,
                                         contextualize=contextualize, force=force, emit=emit,
                                         batch_size=batch_size, max_workers=max_workers,
@@ -1872,38 +2033,54 @@ def create_app():
         memsvc.delete_memory(pid, mem_id)
         return jsonify({"ok": True, "memories": memsvc.list_memories(pid)})
 
+    def _draft_memory_from_text(text, server_url="", model=""):
+        """Ask the model for {title, description, emotional_weight} from a block of text.
+
+        Lifted out of the draft-memory route so the RSS importer reuses it verbatim — a
+        second copy of this prompt would drift, which is exactly how /api/batch/start's
+        sequential branch drifted out of sync with generate_one over attachments.
+
+        Never throws: a failed or absent model yields a truncated-text draft, because the
+        user is going to edit it anyway and an error dialog helps nobody.
+        """
+        text = (text or "")[:6000]
+        server_url = server_url or store.config.get("last_server_url") or DEFAULT_LOCAL_URL
+        model = store.config.get("rewrite_model") or model or ""
+        draft = {"title": "", "description": text[:400], "emotional_weight": 5}
+        if not model:
+            return draft
+        try:
+            adapter = adapter_for(server_url)
+            sys = ("Summarize the following exchange as a personal MEMORY for a character. "
+                   "Return JSON {title, description, emotional_weight} where description is a "
+                   "1-3 sentence first-person recollection and emotional_weight is 1-10.")
+            raw = rewrite.run_completion(adapter, model,
+                [{"role": "system", "content": sys},
+                 {"role": "user", "content": text + "\n\nJSON:"}],
+                num_ctx=4096, max_tokens=400, fmt=_DRAFT_MEMORY_SCHEMA)
+            parsed = rewrite._extract_json(raw) or {}
+            if parsed.get("title"):
+                draft["title"] = str(parsed["title"])
+            if parsed.get("description"):
+                draft["description"] = str(parsed["description"])
+            try:
+                draft["emotional_weight"] = max(1, min(10, int(parsed.get("emotional_weight", 5))))
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return draft
+
     @app.route("/api/personas/<pid>/draft-memory", methods=["POST"])
     def api_persona_draft_memory(pid):
         """Ask the model to draft {title, description, emotional_weight} from selected
         chat messages, for the user to edit before saving. Never throws."""
         data = request.get_json(force=True) or {}
         messages = data.get("messages") or []
-        transcript = "\n".join(f"{m.get('role')}: {m.get('content','')}" for m in messages)[:6000]
-        server_url = data.get("server_url") or store.config.get("last_server_url") or DEFAULT_LOCAL_URL
-        model = store.config.get("rewrite_model") or data.get("model") or ""
-        draft = {"title": "", "description": transcript[:400], "emotional_weight": 5}
-        if model:
-            try:
-                adapter = adapter_for(server_url)
-                sys = ("Summarize the following exchange as a personal MEMORY for a character. "
-                       "Return JSON {title, description, emotional_weight} where description is a "
-                       "1-3 sentence first-person recollection and emotional_weight is 1-10.")
-                raw = rewrite.run_completion(adapter, model,
-                    [{"role": "system", "content": sys},
-                     {"role": "user", "content": transcript + "\n\nJSON:"}],
-                    num_ctx=4096, max_tokens=400, fmt=_DRAFT_MEMORY_SCHEMA)
-                parsed = rewrite._extract_json(raw) or {}
-                if parsed.get("title"):
-                    draft["title"] = str(parsed["title"])
-                if parsed.get("description"):
-                    draft["description"] = str(parsed["description"])
-                try:
-                    draft["emotional_weight"] = max(1, min(10, int(parsed.get("emotional_weight", 5))))
-                except Exception:
-                    pass
-            except Exception:
-                pass
-        return jsonify({"draft": draft})
+        transcript = "\n".join(f"{m.get('role')}: {m.get('content','')}"
+                               for m in messages)
+        return jsonify({"draft": _draft_memory_from_text(
+            transcript, data.get("server_url") or "", data.get("model") or "")})
 
     # ----------------------------- Persona knowledge ------------------------
     @app.route("/api/personas/<pid>/knowledge", methods=["GET"])
@@ -1965,6 +2142,119 @@ def create_app():
                               "added": added, "errors": errors})
 
         return _compile_sse(work, run_id)
+
+    @app.route("/api/personas/<pid>/knowledge/add-rss", methods=["POST"])
+    def api_persona_kb_add_rss(pid):
+        """SSE. Body: {url, limit, whisper, notes, refresh}. Import a feed's episodes
+        into the persona's knowledge base, one document each.
+
+        ``add_text`` rather than ``ingest_file``: it writes the text into ``sources/``
+        AND embeds it in one call, which is what makes an episode survive a persona
+        export. ``ingest_file`` needs an original file to copy, and the only original
+        here is audio that was deleted the moment it was transcribed.
+        """
+        data = request.get_json(force=True) or {}
+        try:
+            persona = psvc.load(pid)
+        except persona_mod.PersonaError as e:
+            return jsonify({"error": str(e)}), 404
+        url = (data.get("url") or "").strip()
+        if not url:
+            return jsonify({"error": "no url"}), 400
+        try:
+            limit = max(0, int(data.get("limit") or 0))
+        except (TypeError, ValueError):
+            limit = 0
+        want_whisper = bool(data.get("whisper"))
+        include_notes = data.get("notes", True) is not False
+        refresh = bool(data.get("refresh"))
+
+        embed_url = store.config.get("rag_embed_server_url") or DEFAULT_LOCAL_URL
+        embed_fn, embed_model = _persona_embed(persona)
+        wants_vectors = persona.get("stores", {}).get("retrieval", "hybrid") in (
+            "vector", "hybrid")
+        want_ctx = bool(store.config.get("rag_contextual_chunking"))
+        ctx_model = ((store.config.get("rag_context_model")
+                      or persona.get("models", {}).get("chat_model", "")) if want_ctx else "")
+        contextualize = _contextualizer_for(ctx_model, embed_url)
+        run_id = f"addrss-persona-{pid}-{uuid.uuid4().hex[:8]}"
+
+        added, errors = [], []
+
+        def on_episode(emit, feed, result):
+            # A stable doc name makes a re-import REPLACE this episode's chunks rather
+            # than duplicate the document — see rss.episode_doc_name.
+            name = rss.episode_doc_name(feed, result)
+            try:
+                r = kbsvc.add_text(pid, name, result["text"],
+                                   embed_fn if wants_vectors else None, embed_model,
+                                   contextualize=contextualize)
+            except Exception as e:
+                errors.append(f"{result.get('title') or name}: {e}")
+                return
+            added.append(r)
+            emit("document", {"doc_id": r["doc_id"], "name": r["name"],
+                              "chunks": r["chunks"], "title": result.get("title") or ""})
+
+        def on_done(emit, payload):
+            if added and wants_vectors:
+                persona.setdefault("stores", {})["embedding_model_used"] = embed_model
+                try:
+                    psvc.save(persona)
+                except Exception:
+                    pass
+            emit("complete", {**payload,
+                              "documents": kbsvc.list_documents(pid),
+                              "added": added,
+                              "errors": (payload.get("errors") or []) + errors})
+
+        return _compile_sse(
+            _rss_feed_work(url, limit, want_whisper, include_notes, refresh,
+                           on_episode=on_episode, on_done=on_done),
+            run_id)
+
+    @app.route("/api/personas/<pid>/draft-memories-from-rss", methods=["POST"])
+    def api_persona_draft_memories_from_rss(pid):
+        """SSE. Body: {url, limit, whisper, server_url, model}. One drafted memory per
+        episode, streamed as `draft` frames.
+
+        Drafts are RETURNED, never saved. ``save_memory`` embeds, and auto-saving a
+        couple of hundred machine-written "recollections" would irreversibly poison the
+        persona's memory retrieval — the weight-blended scoring in persona_store.search
+        assumes memories a human vouched for. The user reviews each in the existing
+        memory editor and saves through POST /api/personas/<pid>/memories.
+        """
+        data = request.get_json(force=True) or {}
+        _p, err = _persona_or_404(pid)
+        if err:
+            return err
+        url = (data.get("url") or "").strip()
+        if not url:
+            return jsonify({"error": "no url"}), 400
+        try:
+            limit = max(0, int(data.get("limit") or 0))
+        except (TypeError, ValueError):
+            limit = 0
+        server_url = data.get("server_url") or ""
+        model = data.get("model") or ""
+        drafts = []
+
+        def on_episode(emit, _feed, result):
+            draft = _draft_memory_from_text(result.get("text") or "", server_url, model)
+            draft.setdefault("tags", [])
+            draft["narrative_time"] = result.get("published") or ""
+            if not draft.get("title"):
+                draft["title"] = result.get("title") or ""
+            drafts.append(draft)
+            emit("draft", {"draft": draft, "episode": result.get("title") or ""})
+
+        def on_done(emit, payload):
+            emit("complete", {**payload, "drafts": drafts})
+
+        return _compile_sse(
+            _rss_feed_work(url, limit, bool(data.get("whisper")), True, False,
+                           on_episode=on_episode, on_done=on_done),
+            f"rssmem-persona-{pid}-{uuid.uuid4().hex[:8]}")
 
     @app.route("/api/personas/<pid>/knowledge/add-text", methods=["POST"])
     def api_persona_kb_add_text(pid):
@@ -2901,17 +3191,18 @@ def create_app():
 
     # ----------------------------- YouTube ----------------------------------
     def _youtube_params():
-        """Read the shared query params for both YouTube routes.
-        Returns (url, include_comments, max_comments)."""
+        """Read the shared query params for the YouTube routes.
+        Returns (url, include_comments, max_comments, refresh)."""
         url = (request.args.get("url") or "").strip()
         include_comments = (request.args.get("comments") or "1") not in ("0", "false", "")
         try:
             max_comments = int(request.args.get("max") or youtube.DEFAULT_MAX_COMMENTS)
         except ValueError:
             max_comments = youtube.DEFAULT_MAX_COMMENTS
-        return url, include_comments, max_comments
+        refresh = (request.args.get("refresh") or "0") in ("1", "true", "yes")
+        return url, include_comments, max_comments, refresh
 
-    def _youtube_fetch_work(url, include_comments, max_comments, on_complete):
+    def _youtube_fetch_work(url, include_comments, max_comments, refresh, on_complete):
         """Build the SSE worker shared by the library and chat YouTube routes.
 
         ``on_complete(emit, result)`` decides what happens with the fetched video —
@@ -2919,7 +3210,7 @@ def create_app():
         """
         def work(emit, stop_event):
             emit("begin", {"url": url, "comments": include_comments,
-                           "max": max_comments})
+                           "max": max_comments, "refresh": refresh})
             result = youtube.fetch_video(
                 url,
                 include_comments=include_comments,
@@ -2927,8 +3218,78 @@ def create_app():
                 on_progress=lambda phase, **fields: emit(
                     "progress", {"phase": phase, **fields}),
                 should_stop=lambda: bool(stop_event and stop_event.is_set()),
+                refresh=refresh,
             )
             on_complete(emit, result)
+        return work
+
+    def _youtube_playlist_work(url, include_comments, max_comments, limit, refresh,
+                               on_video=None, on_done=None):
+        """SSE worker for a whole playlist: enumerate once, then fetch each video and
+        emit it as its OWN frame, so the composer can stage a chip as each lands and
+        Cancel stops the rest. One dead video contributes a `video_error` and the run
+        continues — it must not cost the user the other thirty-nine.
+
+        ``on_video(emit, index, total, result)`` and ``on_done(emit, payload)`` are the
+        seams that let a library route append each video as an item instead of shipping
+        the text to the composer (mirroring ``_youtube_fetch_work``'s ``on_complete``
+        and ``_rss_feed_work``'s ``on_episode``/``on_done``). Their defaults emit the
+        chat frames, so /api/youtube/fetch-playlist is unchanged on the wire.
+        """
+        def default_video(emit, n, total, result):
+            emit("video", {"index": n, "total": total,
+                           "video_id": result["video_id"], "title": result["title"],
+                           "url": result["url"], "text": result["text"],
+                           "via": result.get("via"),
+                           "errors": result.get("errors") or [],
+                           "comment_count": len(result.get("comments") or []),
+                           "transcript_chars": len(result.get("transcript") or "")})
+
+        def default_done(emit, payload):
+            emit("complete", payload)
+
+        video_cb = on_video or default_video
+        done_cb = on_done or default_done
+
+        def work(emit, stop_event):
+            def stopped():
+                return bool(stop_event and stop_event.is_set())
+
+            emit("begin", {"url": url, "comments": include_comments,
+                           "max": max_comments, "limit": limit, "refresh": refresh})
+            videos = youtube.fetch_playlist(
+                url, limit=limit,
+                on_progress=lambda phase, **fields: emit(
+                    "progress", {"phase": phase, **fields}),
+                should_stop=stopped)
+            total = len(videos)
+            emit("playlist", {"total": total, "videos": videos})
+
+            ok, errors = 0, []
+            for n, vid in enumerate(videos, 1):
+                if stopped():
+                    break
+                title = vid.get("title") or vid.get("url") or ""
+                try:
+                    result = youtube.fetch_video(
+                        vid.get("url") or "",
+                        include_comments=include_comments,
+                        max_comments=max_comments,
+                        # Default args bind this iteration's values; a bare closure would
+                        # report whatever n/title happened to be when the lambda ran.
+                        on_progress=(lambda phase, _n=n, _t=title, **fields: emit(
+                            "progress", {"phase": phase, "index": _n, "total": total,
+                                         "title": _t, **fields})),
+                        should_stop=stopped, refresh=refresh)
+                except Exception as e:
+                    errors.append(f"{title}: {e}")
+                    emit("video_error", {"index": n, "total": total, "title": title,
+                                         "url": vid.get("url") or "", "message": str(e)})
+                    continue
+                ok += 1
+                video_cb(emit, n, total, result)
+            done_cb(emit, {"total": total, "ok": ok, "failed": len(errors),
+                           "errors": errors, "stopped": stopped()})
         return work
 
     @app.route("/api/libraries/<lib_id>/add-youtube", methods=["GET"])
@@ -2942,7 +3303,7 @@ def create_app():
         lib = store.get_library(lib_id)
         if not lib:
             return jsonify({"error": "not found"}), 404
-        url, include_comments, max_comments = _youtube_params()
+        url, include_comments, max_comments, refresh = _youtube_params()
         if not url:
             return jsonify({"error": "no url"}), 400
 
@@ -2957,6 +3318,7 @@ def create_app():
             emit("complete", {"library": saved, "added": [result["title"]],
                               "added_items": [item],
                               "via": result.get("via"), "errors": result.get("errors") or [],
+                              "from_cache": "cache" in (result.get("via") or ""),
                               "comment_count": len(result.get("comments") or []),
                               "transcript_chars": len(result.get("transcript") or "")})
 
@@ -2964,14 +3326,71 @@ def create_app():
         # the `start` frame rather than composing it from the library id, which it could
         # only do from whichever library happened to be selected when Cancel was pressed.
         return _compile_sse(
-            _youtube_fetch_work(url, include_comments, max_comments, on_complete),
+            _youtube_fetch_work(url, include_comments, max_comments, refresh, on_complete),
             f"youtube-library-{lib_id}-{uuid.uuid4().hex[:8]}")
+
+    @app.route("/api/libraries/<lib_id>/add-youtube-playlist", methods=["GET"])
+    def api_library_add_youtube_playlist(lib_id):
+        """SSE. Params: url, comments (0/1), max, limit (0 = every video), refresh.
+
+        Appends ONE 'youtube' item per video, as each lands — same discipline as the
+        RSS route: a forty-video playlist that dies at video 38 must not throw away the
+        first 37, and ``_append_items`` re-reads under the store lock so this is safe
+        against a concurrent autosave.
+        """
+        lib = store.get_library(lib_id)
+        if not lib:
+            return jsonify({"error": "not found"}), 404
+        url, include_comments, max_comments, refresh = _youtube_params()
+        if not url:
+            return jsonify({"error": "no url"}), 400
+        if not youtube.parse_playlist_id(url):
+            return jsonify({"error": "That URL carries no playlist id."}), 400
+        try:
+            limit = max(0, int(request.args.get("limit") or 0))
+        except ValueError:
+            limit = 0
+
+        added, items, lost = [], [], []
+
+        def on_video(emit, n, total, result):
+            item = _new_library_item(item_type="youtube", label=result["title"],
+                                     content=result["text"], filename=result["url"])
+            if _append_items(lib_id, [item]) is None:
+                lost.append(True)
+                return
+            items.append(item)
+            added.append(item["label"])
+            # Progress only — deliberately NOT the item itself. A transcript runs to
+            # LIBRARY_PAGE_CHARS (200k), and `added_items` already carries every item on
+            # the `complete` frame; sending it twice put tens of megabytes on the wire
+            # for a 40-video playlist. The client just needs to know one more landed.
+            emit("video", {"index": n, "total": total, "title": result["title"],
+                           "url": result["url"], "via": result.get("via"),
+                           "comment_count": len(result.get("comments") or []),
+                           "transcript_chars": len(result.get("transcript") or "")})
+
+        def on_done(emit, payload):
+            if lost:
+                emit("error", {"message": "That library was deleted while the playlist "
+                                          "was being fetched."})
+                return
+            # No "library" key: it would be the ENTIRE library (already megabytes before
+            # this import) on one `data:` line, and no client handler reads it — the UI
+            # renders the new rows from `added_items`, which must keep its content
+            # because makeLibItem puts it straight into an editable textarea.
+            emit("complete", {**payload, "added": added, "added_items": items})
+
+        return _compile_sse(
+            _youtube_playlist_work(url, include_comments, max_comments, limit, refresh,
+                                   on_video=on_video, on_done=on_done),
+            f"youtube-libplaylist-{lib_id}-{uuid.uuid4().hex[:8]}")
 
     @app.route("/api/youtube/fetch", methods=["GET"])
     def api_youtube_fetch():
         """SSE. Same params as the library route, but writes nothing — the composer
         stages the returned text as a chat attachment instead."""
-        url, include_comments, max_comments = _youtube_params()
+        url, include_comments, max_comments, refresh = _youtube_params()
         if not url:
             return jsonify({"error": "no url"}), 400
 
@@ -2979,12 +3398,396 @@ def create_app():
             emit("complete", {"title": result["title"], "url": result["url"],
                               "text": result["text"], "via": result.get("via"),
                               "errors": result.get("errors") or [],
+                              "from_cache": "cache" in (result.get("via") or ""),
                               "comment_count": len(result.get("comments") or []),
                               "transcript_chars": len(result.get("transcript") or "")})
 
         return _compile_sse(
-            _youtube_fetch_work(url, include_comments, max_comments, on_complete),
+            _youtube_fetch_work(url, include_comments, max_comments, refresh, on_complete),
             f"youtube-chat-{uuid.uuid4().hex[:8]}")
+
+    @app.route("/api/youtube/fetch-playlist", methods=["GET"])
+    def api_youtube_fetch_playlist():
+        """SSE. Params: url, comments (0/1), max, limit (0 = every video), refresh.
+
+        Emits one `video` frame per video so the composer stages one attachment each,
+        rather than a single blob the user can't take apart.
+        """
+        url, include_comments, max_comments, refresh = _youtube_params()
+        if not url:
+            return jsonify({"error": "no url"}), 400
+        if not youtube.parse_playlist_id(url):
+            return jsonify({"error": "That URL carries no playlist id."}), 400
+        try:
+            limit = max(0, int(request.args.get("limit") or 0))
+        except ValueError:
+            limit = 0
+
+        return _compile_sse(
+            _youtube_playlist_work(url, include_comments, max_comments, limit, refresh),
+            f"youtube-playlist-{uuid.uuid4().hex[:8]}")
+
+    @app.route("/api/youtube/cache", methods=["GET"])
+    def api_youtube_cache_stats():
+        """{entries, bytes, dir} for the Settings card. Reads file sizes only — nothing
+        is decrypted, so it stays cheap with a thousand cached videos."""
+        return jsonify(youtube_cache.stats())
+
+    @app.route("/api/youtube/cache", methods=["DELETE"])
+    def api_youtube_cache_clear():
+        """Drop every cached video for the active profile. Rebuildable by definition,
+        so there is no confirmation gate here — the UI asks."""
+        return jsonify(youtube_cache.clear())
+
+    # ------------------------------ RSS / Podcast ---------------------------
+    def _rss_params():
+        """Shared query params for the RSS routes.
+        Returns (url, limit, want_whisper, include_notes, refresh)."""
+        url = (request.args.get("url") or "").strip()
+        try:
+            limit = max(0, int(request.args.get("limit") or 0))
+        except ValueError:
+            limit = 0
+        # Whisper defaults OFF. It is minutes of GPU and a 100 MB download per episode;
+        # nobody may opt into that by omitting a parameter.
+        want_whisper = (request.args.get("whisper") or "0") in ("1", "true", "yes")
+        include_notes = (request.args.get("notes") or "1") not in ("0", "false", "")
+        refresh = (request.args.get("refresh") or "0") in ("1", "true", "yes")
+        return url, limit, want_whisper, include_notes, refresh
+
+    def _rss_feed_work(url, limit, want_whisper, include_notes, refresh, guid="",
+                       on_episode=None, on_done=None):
+        """SSE worker for a feed: read it once, then fetch each episode and emit it as
+        its OWN frame, so the composer stages a chip as each lands and Cancel stops the
+        rest. One dead episode contributes an `episode_error` and the run continues.
+
+        ``guid`` narrows the run to a single episode — the same worker serves both, the
+        way _youtube_fetch_work and _youtube_playlist_work would if a playlist could
+        address one video.
+
+        ``on_episode(emit, feed, result)`` and ``on_done(emit, payload)`` are the seams
+        each caller fills in: append to a library, write a persona document, or draft a
+        memory. They get ``emit`` so a caller can add frames of its own.
+        """
+        def work(emit, stop_event):
+            def stopped():
+                return bool(stop_event and stop_event.is_set())
+
+            emit("begin", {"url": url, "limit": limit, "whisper": want_whisper,
+                           "notes": include_notes, "refresh": refresh})
+            feed = rss.fetch_feed(
+                url, limit=limit, refresh=refresh, should_stop=stopped,
+                on_progress=lambda phase, **fields: emit("progress",
+                                                         {"phase": phase, **fields}))
+            items = feed["items"]
+            if guid:
+                items = [i for i in items if (i.get("guid") or "") == guid
+                         or (i.get("link") or "") == guid]
+                if not items:
+                    raise rss.RSSError("That episode isn't in the feed's current window. "
+                                       "Raise the episode limit and try again.")
+            total = len(items)
+            emit("feed", {"title": feed["title"], "total": total,
+                          "total_available": feed["total_available"],
+                          "from_cache": feed["from_cache"], "url": feed["url"]})
+            for warning in feed["warnings"]:
+                emit("warning", {"message": warning})
+
+            ok, errors = 0, []
+            for n, item in enumerate(items, 1):
+                if stopped():
+                    break
+                title = item.get("title") or item.get("guid") or ""
+                try:
+                    result = rss.fetch_episode(
+                        feed, item,
+                        want_whisper=want_whisper, include_notes=include_notes,
+                        settings=store.config,
+                        # Default args bind this iteration's values; a bare closure would
+                        # report whichever episode happened to be current when it ran.
+                        # "count" not "total" — a whisper frame's own total is SECONDS.
+                        on_progress=(lambda phase, _n=n, _t=title, **fields: emit(
+                            "progress", {"phase": phase, "index": _n, "count": total,
+                                         "name": _t, **fields})),
+                        should_stop=stopped, refresh=refresh)
+                except Exception as e:
+                    errors.append(f"{title}: {e}")
+                    emit("episode_error", {"index": n, "count": total, "title": title,
+                                           "message": str(e)})
+                    continue
+                ok += 1
+                if on_episode:
+                    on_episode(emit, feed, result)
+                emit("episode", {
+                    "index": n, "count": total,
+                    "episode_id": result["episode_id"], "guid": result["episode_key"],
+                    "title": result["title"], "url": result["link"] or result["enclosure_url"],
+                    "text": result["text"], "via": result.get("via"),
+                    "transcript_chars": len(result.get("transcript") or ""),
+                    "transcript_source": result.get("transcript_source") or "",
+                    "speakers": bool(result.get("transcript_speakers")),
+                    "truncated": bool(result.get("truncated")),
+                    "full_chars": result.get("full_chars") or 0,
+                    "from_cache": bool(result.get("from_cache")),
+                    "errors": result.get("errors") or []})
+            payload = {"total": total, "ok": ok, "failed": len(errors),
+                       "errors": errors, "stopped": stopped(),
+                       "feed_title": feed["title"]}
+            if on_done:
+                on_done(emit, payload)
+            else:
+                emit("complete", payload)
+        return work
+
+    @app.route("/api/rss/feed", methods=["GET"])
+    def api_rss_feed():
+        """Params: url, limit, refresh. The episode LISTING only — one conditional GET
+        and no per-episode work, so plain JSON rather than SSE. Lets the UI show what a
+        feed holds before committing to fetching any of it."""
+        url, limit, _w, _n, refresh = _rss_params()
+        if not url:
+            return jsonify({"error": "no url"}), 400
+        try:
+            feed = rss.fetch_feed(url, limit=limit, refresh=refresh)
+        except rss.RSSError as e:
+            return jsonify({"error": str(e)}), 400
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        # Bodies and transcript link lists are megabytes across 226 items and the caller
+        # only wants a manifest.
+        slim = [{"guid": i["guid"], "title": i["title"], "link": i["link"],
+                 "published": i["published"], "duration": i["duration"],
+                 "episode": i["episode"], "has_media": bool(i["enclosure_url"]),
+                 "has_transcript": bool(i["transcripts"])} for i in feed["items"]]
+        return jsonify({**{k: v for k, v in feed.items() if k != "items"},
+                        "items": slim})
+
+    @app.route("/api/rss/fetch-feed", methods=["GET"])
+    def api_rss_fetch_feed():
+        """SSE. Params: url, limit (0 = every item), whisper, notes, refresh.
+
+        Emits one `episode` frame per item so the composer stages one attachment each,
+        rather than a single blob the user can't take apart."""
+        url, limit, want_whisper, include_notes, refresh = _rss_params()
+        if not url:
+            return jsonify({"error": "no url"}), 400
+        return _compile_sse(
+            _rss_feed_work(url, limit, want_whisper, include_notes, refresh),
+            f"rss-feed-{uuid.uuid4().hex[:8]}")
+
+    @app.route("/api/rss/fetch", methods=["GET"])
+    def api_rss_fetch():
+        """SSE. Same params plus `guid` — one episode, returned un-stored."""
+        url, limit, want_whisper, include_notes, refresh = _rss_params()
+        guid = (request.args.get("guid") or "").strip()
+        if not url:
+            return jsonify({"error": "no url"}), 400
+        if not guid:
+            return jsonify({"error": "no episode guid"}), 400
+        return _compile_sse(
+            _rss_feed_work(url, limit or 0, want_whisper, include_notes, refresh,
+                           guid=guid),
+            f"rss-chat-{uuid.uuid4().hex[:8]}")
+
+    @app.route("/api/libraries/<lib_id>/add-rss", methods=["GET"])
+    def api_library_add_rss(lib_id):
+        """SSE. Fetch a feed's episodes and append each as an 'rss' library item.
+
+        Items are appended as they land rather than in one batch at the end: a 40-episode
+        import with Whisper on runs for hours, and a crash at episode 38 must not throw
+        away the first 37. ``_append_items`` re-reads under the store lock each time, so
+        this is safe against a concurrent autosave.
+        """
+        lib = store.get_library(lib_id)
+        if not lib:
+            return jsonify({"error": "not found"}), 404
+        url, limit, want_whisper, include_notes, refresh = _rss_params()
+        if not url:
+            return jsonify({"error": "no url"}), 400
+
+        added, items, lost = [], [], []
+
+        def on_episode(_emit, _feed, result):
+            item = _new_library_item(
+                item_type="rss", label=result["title"] or result["episode_key"],
+                content=result["text"],
+                filename=result["link"] or result["enclosure_url"])
+            if _append_items(lib_id, [item]) is None:
+                lost.append(True)
+                return
+            items.append(item)
+            added.append(item["label"])
+
+        def on_done(emit, payload):
+            if lost:
+                emit("error", {"message": "That library was deleted while the feed was "
+                                          "being fetched."})
+                return
+            emit("complete", {**payload, "library": store.get_library(lib_id),
+                              "added": added, "added_items": items})
+
+        return _compile_sse(
+            _rss_feed_work(url, limit, want_whisper, include_notes, refresh,
+                           on_episode=on_episode, on_done=on_done),
+            f"rss-library-{lib_id}-{uuid.uuid4().hex[:8]}")
+
+    @app.route("/api/rss/cache", methods=["GET"])
+    def api_rss_cache_stats():
+        """{episodes, feeds, transcribed, bytes, dir} for the Settings card.
+
+        ``transcribed`` is what the destructive Clear button quotes back: those entries
+        cost GPU-minutes each and throwing them away silently would be a nasty surprise.
+        """
+        return jsonify(rss_cache.stats())
+
+    @app.route("/api/rss/cache", methods=["DELETE"])
+    def api_rss_cache_clear():
+        """Param: what=all|feeds|episodes. ``feeds`` is the cheap one — it forces every
+        listing to be re-read while keeping every transcript, which is what "check for
+        new episodes properly" actually means."""
+        what = (request.args.get("what") or "all").strip().lower()
+        if what not in ("all", "feeds", "episodes"):
+            what = "all"
+        return jsonify(rss_cache.clear(what))
+
+    # -------------------------- Local transcription -------------------------
+    # faster-whisper, used directly here for media files and URLs, and by the RSS
+    # source for episodes whose feed publishes no transcript. See app/transcribe.py.
+
+    def _transcribe_work(items, on_complete):
+        """SSE worker shared by the media-file and media-URL routes.
+
+        ``items`` is ``[(label, kind, target)]`` where kind is "file" or "url", so one
+        worker covers a multi-file pick and a single URL. ``on_complete(emit, results)``
+        decides whether the transcripts are appended to a library or handed back.
+        """
+        def work(emit, stop_event):
+            def stopped():
+                return bool(stop_event and stop_event.is_set())
+
+            emit("begin", {"total": len(items)})
+            results, errors = [], []
+            settings = store.config
+            for n, (label, kind, target) in enumerate(items, 1):
+                if stopped():
+                    break
+                # Default args bind this iteration's values; a bare closure would report
+                # whichever file happened to be current when the lambda ran.
+                #
+                # The position is "index"/"count", NOT "index"/"total": a whisper frame
+                # carries its own done/total in SECONDS of audio, and a `total` here
+                # would be overwritten by it — leaving the UI reading "3/60 files".
+                progress = (lambda phase, _n=n, _l=label, **fields: emit(
+                    "progress", {"phase": phase, "index": _n, "count": len(items),
+                                 "name": _l, **fields}))
+                try:
+                    fn = (transcribe.transcribe_file if kind == "file"
+                          else transcribe.transcribe_url)
+                    res = fn(target, settings=settings, on_progress=progress,
+                             should_stop=stopped)
+                except Exception as e:
+                    errors.append(f"{label}: {e}")
+                    emit("file_error", {"index": n, "total": len(items), "name": label,
+                                        "message": str(e)})
+                    continue
+                res["label"] = label
+                res["source"] = target
+                results.append(res)
+                emit("file", {"index": n, "total": len(items), "name": label,
+                              "source": target, "text": res["text"],
+                              "chars": res["chars"], "language": res.get("language"),
+                              "duration": res.get("duration"),
+                              "device": res.get("device"),
+                              "fallback": bool(res.get("fallback")),
+                              "stopped": bool(res.get("stopped"))})
+            on_complete(emit, results, errors, stopped())
+        return work
+
+    @app.route("/api/transcribe/status", methods=["GET"])
+    def api_transcribe_status():
+        """Whether local transcription is usable, and on what. Loads no model — the
+        RSS panels call this to decide whether to enable the Whisper checkbox."""
+        return jsonify(transcribe.status())
+
+    @app.route("/api/transcribe/reset", methods=["POST"])
+    def api_transcribe_reset():
+        """Unload the speech model, freeing its VRAM, and forget any observed CUDA
+        failure. The way to re-try the GPU after upgrading ctranslate2."""
+        transcribe.reset_model()
+        return jsonify(transcribe.status())
+
+    def _pick_media(title):
+        """Native multi-file picker filtered to media, split into (wanted, errors)."""
+        paths = native_dialog.pick_files(title=title, filetypes_key="media")
+        wanted, errors = [], []
+        for p in paths:
+            path = Path(p)
+            if transcribe.is_supported(path):
+                wanted.append((path.name, "file", str(path)))
+            else:
+                errors.append(f"{path.name}: not an audio or video file")
+        return wanted, errors
+
+    @app.route("/api/transcribe/files", methods=["POST"])
+    def api_transcribe_files():
+        """SSE. Pick audio/video files and transcribe them, returning the text
+        un-stored — the composer stages each as a chat attachment."""
+        wanted, errors = _pick_media("Transcribe audio/video file(s)")
+
+        def on_complete(emit, results, errs, was_stopped):
+            emit("complete", {"results": results, "errors": errors + errs,
+                              "total": len(wanted), "ok": len(results),
+                              "stopped": was_stopped})
+
+        return _compile_sse(_transcribe_work(wanted, on_complete),
+                            f"transcribe-chat-{uuid.uuid4().hex[:8]}")
+
+    @app.route("/api/libraries/<lib_id>/add-media-files", methods=["POST"])
+    def api_library_add_media_files(lib_id):
+        """SSE. Pick audio/video files, transcribe them and append one 'audio' item
+        each. The file path goes in ``filename`` like a document item's name does."""
+        lib = store.get_library(lib_id)
+        if not lib:
+            return jsonify({"error": "not found"}), 404
+        wanted, errors = _pick_media("Add audio/video to library")
+
+        def on_complete(emit, results, errs, was_stopped):
+            items = [_new_library_item(item_type="audio", label=r["label"],
+                                       content=r["text"], filename=r["source"])
+                     for r in results if r.get("text")]
+            saved = _append_items(lib_id, items)
+            if saved is None:
+                emit("error", {"message": "That library was deleted while the media "
+                                          "was being transcribed."})
+                return
+            emit("complete", {"library": saved, "added": [i["label"] for i in items],
+                              "added_items": items, "errors": errors + errs,
+                              "stopped": was_stopped})
+
+        return _compile_sse(_transcribe_work(wanted, on_complete),
+                            f"transcribe-library-{lib_id}-{uuid.uuid4().hex[:8]}")
+
+    @app.route("/api/transcribe/url", methods=["GET"])
+    def api_transcribe_url():
+        """SSE (EventSource is GET-only). Param: url. Download a direct audio/video
+        URL, transcribe it, delete the download, and hand back the text un-stored."""
+        url = (request.args.get("url") or "").strip()
+        if not url:
+            return jsonify({"error": "no url"}), 400
+        label = unquote(urlparse(url).path).rsplit("/", 1)[-1] or url
+
+        def on_complete(emit, results, errs, was_stopped):
+            r = results[0] if results else {}
+            emit("complete", {"title": label, "url": url, "text": r.get("text", ""),
+                              "chars": r.get("chars", 0),
+                              "language": r.get("language", ""),
+                              "duration": r.get("duration", 0),
+                              "device": r.get("device", ""),
+                              "fallback": bool(r.get("fallback")),
+                              "errors": errs, "stopped": was_stopped})
+
+        return _compile_sse(_transcribe_work([(label, "url", url)], on_complete),
+                            f"transcribe-url-{uuid.uuid4().hex[:8]}")
 
     # ------------------ Chat-scoped sources (no library write) --------------
     # The composer offers the same sources as the Resources tab, for material that
@@ -3250,6 +4053,10 @@ def create_app():
                 item_chat = dict(chat)
                 item_chat["messages"] = [{"role": "user", "content": prompt}]
                 item_chat["isolated"] = True   # each file is independent in parallel mode
+                # These carry the REAL chat's id with synthetic per-file messages, so
+                # indexing them would overwrite and then prune the actual chat's thread
+                # index once per file. Retrieve in memory instead.
+                item_chat["rag_ephemeral"] = True
                 items.append({"item_id": path.name, "title": path.name,
                               "search_query": "", "chat": item_chat})
             if not items:
@@ -3343,13 +4150,18 @@ def create_app():
                     item_chat["messages"] = (
                         ([] if snap["isolated"] else list(history))
                         + [{"role": "user", "content": prompt}])
+                    # Synthetic messages under the real chat's id — see the parallel
+                    # branch above for why this must not be indexed.
+                    item_chat["rag_ephemeral"] = True
                     rag_plan, rag_retrieved, _rag_status = _rag_retrieve(item_chat)
                     use_rag = bool(rag_plan and rag_plan.get("active") and rag_retrieved)
                     blocked = bool(rag_plan and rag_plan.get("blocked"))
                     if use_rag:
                         messages = logic.build_batch_messages(
                             prompt, history, snap, lib_block=snap["lib_manifest"])
-                        messages = logic.inject_rag(messages, rag_retrieved, store.libraries)
+                        messages = logic.inject_rag(
+                            messages, rag_retrieved, store.libraries,
+                            strip_data=logic.rag_scope(chat) != "thread")
                     elif blocked:
                         # Uncompiled library: inject no library context (no full dump).
                         messages = logic.build_batch_messages(prompt, history, snap, lib_block="")
@@ -3360,7 +4172,8 @@ def create_app():
                     # parallel branch (which goes through generate_one) happened to be
                     # active — the same run, two different contexts.
                     messages = logic.inject_attachments(
-                        messages, logic.resolve_attachments(chat, use_rag))
+                        messages, logic.resolve_attachments(
+                            chat, use_rag, logic.rag_scope(chat)))
 
                     breakdown = context_tracker.breakdown_from_messages(messages)
                     yield sse("context", {
@@ -3390,7 +4203,9 @@ def create_app():
                                 eval_msgs = logic.build_eval_messages(
                                     chat, prompt, raw, store.libraries,
                                     snap["pass_use_system"], skip_library_dump=True)
-                                eval_msgs = logic.inject_rag(eval_msgs, rag_retrieved, store.libraries)
+                                eval_msgs = logic.inject_rag(
+                                    eval_msgs, rag_retrieved, store.libraries,
+                                    strip_data=logic.rag_scope(chat) != "thread")
                             else:
                                 # When blocked (uncompiled library), drop the library so no
                                 # full-text dump leaks into the refinement pass.
@@ -3591,7 +4406,9 @@ def create_app():
 
         def work(emit, stop_event):
             items, errors = batch_mod.resolve_sources(
-                project, emit=emit, should_stop=lambda: stop_event and stop_event.is_set())
+                project, emit=emit,
+                should_stop=lambda: stop_event and stop_event.is_set(),
+                settings=store.config)
             emit("items", {
                 "total": len(items),
                 "errors": errors,
@@ -3622,7 +4439,7 @@ def create_app():
             stopped = lambda: bool(stop_event and stop_event.is_set())
 
             items, errors = batch_mod.resolve_sources(
-                project, emit=emit, should_stop=stopped)
+                project, emit=emit, should_stop=stopped, settings=store.config)
             if not items:
                 raise batch_mod.BatchError(
                     "No items could be read from the chosen sources."

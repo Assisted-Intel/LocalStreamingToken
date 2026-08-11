@@ -97,6 +97,19 @@
       <div id="messages-resizer" class="messages-resizer"
            title="Drag to resize the chat thread (double-click to reset)"></div>
 
+      <!-- Collapsible thread settings. Collapsed by default so the thread gets the room;
+           the summary strip keeps whatever is still active visible at a glance. -->
+      <div id="thread-settings-bar" class="thread-settings-bar">
+        <button id="btn-thread-settings" class="thread-settings-toggle"
+                aria-expanded="false" aria-controls="thread-settings"
+                title="Show or hide the system prompt, pre-prompt and chat options">
+          <span class="thread-settings-caret">▸</span> Settings
+        </button>
+        <div id="thread-settings-summary" class="thread-settings-summary"
+             title="Click to show the chat settings"></div>
+      </div>
+      <div id="thread-settings" class="thread-settings">
+
       <!-- System prompt -->
       <div class="prompt-field">
         <div class="control-row prompt-field-head">
@@ -135,6 +148,13 @@
         <label class="chk" title="Retrieve only the most relevant chunks of your selected libraries and attached data instead of sending them in full (uses the embedding server in Settings)"><input type="checkbox" id="chk-rag" /> 📚 RAG</label>
         <label class="chk" title="Automatically turn RAG on when a message (question + attached data) reaches the word threshold — ideal for prompts carrying large pasted data"><input type="checkbox" id="chk-rag-auto" /> Auto-RAG</label>
         <label>≥ <input type="number" id="rag-threshold" min="1" value="400" style="width:5em" /> words</label>
+        <label title="What RAG searches besides your selected libraries — the material you attached, the conversation itself, or both. Searching the conversation lets a long chat outlive its context window: older turns arrive as retrieved excerpts instead of being cut off.">Scope:
+          <select id="rag-scope">
+            <option value="attachments">Attachments + data</option>
+            <option value="thread">Conversation</option>
+            <option value="both">Both</option>
+          </select>
+        </label>
         <label class="chk" title="Global: run the queue and batch files across your selected servers at once (Settings → Multi-Server Processing)"><input type="checkbox" id="chk-parallel" /> ⚡ Enable Parallel Processing</label>
         <label class="chk" title="Answer through a persona's chain-of-thought pipeline (knowledge, memories, speaking style)"><input type="checkbox" id="chk-persona" /> 🎭 Use Persona</label>
         <select id="persona-select" class="hidden" title="Active persona"></select>
@@ -179,6 +199,7 @@
           </div>
         </div>
       </div>
+      </div><!-- /#thread-settings -->
 
       <!-- Input -->
       <!-- Chat-scoped sources: the same menu as the Resources tab, but the result is
@@ -189,8 +210,11 @@
         <button id="btn-add-image" class="small" title="Attach image(s) — you can also drag them onto the box below, or paste with Ctrl+V">🖼 Image(s)</button>
         <button id="btn-add-url" class="small">🔗 By URL</button>
         <button id="btn-add-youtube" class="small">▶ YouTube</button>
+        <button id="btn-add-rss" class="small" title="An RSS or Atom feed. Podcasts get their published transcripts.">📡 RSS / Podcast</button>
+        <button id="btn-add-media" class="small" title="Transcribe audio or video with local speech recognition">🎙 Audio/video</button>
         <button id="btn-add-search" class="small">🔍 Brave search</button>
       </div>
+      <div id="add-media-progress" class="compile-progress hidden"></div>
       <div id="add-url-panel" class="lib-inline-panel hidden">
         <input type="text" id="add-url-input" placeholder="https://example.com/article" />
         <button id="btn-add-url-fetch" class="small primary">Fetch</button>
@@ -198,15 +222,46 @@
       </div>
       <div id="add-yt-panel" class="lib-inline-panel hidden">
         <div class="lib-search-fields">
-          <input type="text" id="add-yt-input" placeholder="https://www.youtube.com/watch?v=…" />
+          <input type="text" id="add-yt-input" placeholder="https://www.youtube.com/watch?v=…  or  …/playlist?list=…" />
           <label class="chk" title="Also collect the video's comments"><input type="checkbox" id="add-yt-comments" checked /> Include comments</label>
           <label class="lib-search-max">Max comments
             <input type="number" id="add-yt-max" value="100" min="5" max="2000" />
           </label>
+          <label class="lib-search-max hidden" id="add-yt-limit-wrap" title="0 = every video in the playlist">Max videos
+            <input type="number" id="add-yt-limit" value="0" min="0" />
+          </label>
+          <label class="chk" title="Fetch fresh from YouTube instead of reusing anything already cached"><input type="checkbox" id="add-yt-refresh" /> Refresh (ignore cache)</label>
           <button id="btn-add-yt-fetch" class="small primary">Fetch</button>
           <button id="btn-add-yt-cancel" class="small ghost">Cancel</button>
         </div>
+        <!-- Shown only when the URL carries BOTH a video id and a list id, which is
+             genuinely ambiguous — YouTube's own share sheet produces it constantly.
+             Defaults to the single video, which is what this panel has always done. -->
+        <div id="add-yt-choice" class="lib-inline-choice hidden">
+          <span class="muted">That's a video inside a playlist —</span>
+          <label class="chk"><input type="radio" name="add-yt-kind" id="add-yt-kind-video" value="video" checked /> just this video</label>
+          <label class="chk"><input type="radio" name="add-yt-kind" id="add-yt-kind-playlist" value="playlist" /> the whole playlist</label>
+        </div>
         <div id="add-yt-progress" class="compile-progress hidden"></div>
+      </div>
+      <div id="add-rss-panel" class="lib-inline-panel hidden">
+        <div class="lib-search-fields">
+          <input type="text" id="add-rss-input" placeholder="https://feeds.example.com/show.xml  — RSS or Atom" />
+          <label class="lib-search-max" title="Newest first, in feed order. Already-fetched episodes are served from cache, so raising this is how you pick up what's new.">Max episodes
+            <input type="number" id="add-rss-limit" value="5" min="0" max="500" />
+          </label>
+          <label class="chk" title="Include the show notes or article body alongside the transcript"><input type="checkbox" id="add-rss-notes" checked /> Show notes</label>
+          <label class="chk"><input type="checkbox" id="add-rss-whisper" /> Transcribe missing episodes</label>
+          <label class="chk" title="Re-read the feed and re-fetch every episode instead of reusing the cache"><input type="checkbox" id="add-rss-refresh" /> Refresh (ignore cache)</label>
+          <button id="btn-add-rss-fetch" class="small primary">Fetch</button>
+          <button id="btn-add-rss-cancel" class="small ghost">Cancel</button>
+        </div>
+        <div class="muted" style="font-size:12px">
+          Published transcripts (Podcasting 2.0) are used when the feed offers them — that
+          costs one download per episode. Ticking “Transcribe missing episodes” downloads
+          the audio and runs local speech recognition for the rest: minutes of GPU each.
+        </div>
+        <div id="add-rss-progress" class="compile-progress hidden"></div>
       </div>
       <div id="add-search-panel" class="lib-inline-panel hidden">
         <div class="lib-search-fields">
@@ -227,10 +282,12 @@
         <input id="data-label" placeholder="Data type (e.g. Reviews)" />
         <button id="btn-add-data" class="primary">＋ Add Data</button>
       </div>
+      <!-- The actions sit in a wrapping row *under* the box: a vertical stack beside it
+           dictated the composer's height and squeezed the thread. Send/Stop come last in
+           DOM order so margin-left:auto pins them to the right edge. -->
       <div id="input-row">
         <textarea id="input-box" rows="3" placeholder="Type a message…  (Enter to send, Shift+Enter for newline)"></textarea>
         <div class="input-btns">
-          <button id="btn-send" class="primary">Send</button>
           <button id="btn-rewrite" class="ghost" title="Rewrite your message into a clearer, more effective prompt">✨ Rewrite</button>
           <button id="btn-rewrite-undo" class="ghost hidden" title="Undo rewrite — restore your original message">↶ Undo</button>
           <button id="btn-composer-add" class="ghost" title="Attach a file, page, video or search to this chat">＋ Add</button>
@@ -240,6 +297,7 @@
           <button id="btn-queue-run" class="primary hidden" title="Process every queued prompt">▶ Run Queue (0)</button>
           <button id="btn-queue-clear" class="ghost hidden" title="Empty the queue">Clear Queue</button>
           <button id="btn-batch" class="ghost" title="Batch process a folder of .txt/.md prompts">📂 Batch</button>
+          <button id="btn-send" class="primary">Send</button>
           <button id="btn-stop" class="stop hidden">Stop</button>
         </div>
       </div>
@@ -410,6 +468,13 @@
           <label>Max comments:
             <input type="number" id="batch-yt-max" min="5" max="2000" style="width:6em" />
           </label>
+          <label class="chk" title="Refetch every video instead of reusing the on-disk cache. Off means a Preview and the Run that follows it cost one crawl, not two."><input type="checkbox" id="batch-yt-refresh" /> Refresh (ignore cache)</label>
+        </div>
+        <div class="control-row">
+          <span class="muted">RSS / Podcast:</span>
+          <label class="chk" title="Include the show notes or article body alongside the transcript"><input type="checkbox" id="batch-rss-notes" /> Show notes</label>
+          <label class="chk"><input type="checkbox" id="batch-rss-whisper" /> Transcribe missing episodes</label>
+          <label class="chk" title="Re-read every feed and re-fetch every episode. Separate from the YouTube switch on purpose — always wanting fresh comments doesn't mean re-transcribing hours of audio."><input type="checkbox" id="batch-rss-refresh" /> Refresh (ignore cache)</label>
         </div>
         <h4 class="batch-subhead">Reference images</h4>
         <p class="muted">Optional. These are sent with <em>every</em> item — a style guide, a
@@ -580,15 +645,41 @@
       </div>
       <div id="lib-yt-panel" class="lib-inline-panel hidden">
         <div class="lib-search-fields">
-          <input type="text" id="lib-yt-input" placeholder="https://www.youtube.com/watch?v=…" />
+          <input type="text" id="lib-yt-input" placeholder="https://www.youtube.com/watch?v=…  or  …/playlist?list=…" />
           <label class="chk" title="Also collect the video's comments"><input type="checkbox" id="lib-yt-comments" checked /> Include comments</label>
           <label class="lib-search-max">Max comments
             <input type="number" id="lib-yt-max" value="100" min="5" max="2000" />
           </label>
+          <label class="lib-search-max hidden" id="lib-yt-limit-wrap" title="0 = every video in the playlist">Max videos
+            <input type="number" id="lib-yt-limit" value="0" min="0" />
+          </label>
+          <label class="chk" title="Fetch fresh from YouTube instead of reusing anything already cached"><input type="checkbox" id="lib-yt-refresh" /> Refresh (ignore cache)</label>
           <button id="btn-lib-yt-fetch" class="small primary">Fetch</button>
           <button id="btn-lib-yt-cancel" class="small ghost">Cancel</button>
         </div>
+        <!-- Shown only when the URL carries BOTH a video id and a list id, which is
+             genuinely ambiguous — YouTube's own share sheet produces it constantly.
+             Defaults to the single video, which is what this panel has always done. -->
+        <div id="lib-yt-choice" class="lib-inline-choice hidden">
+          <span class="muted">That's a video inside a playlist —</span>
+          <label class="chk"><input type="radio" name="lib-yt-kind" id="lib-yt-kind-video" value="video" checked /> just this video</label>
+          <label class="chk"><input type="radio" name="lib-yt-kind" id="lib-yt-kind-playlist" value="playlist" /> the whole playlist</label>
+        </div>
         <div id="lib-yt-progress" class="compile-progress hidden"></div>
+      </div>
+      <div id="lib-rss-panel" class="lib-inline-panel hidden">
+        <div class="lib-search-fields">
+          <input type="text" id="lib-rss-input" placeholder="https://feeds.example.com/show.xml  — RSS or Atom" />
+          <label class="lib-search-max" title="Newest first, in feed order. Already-fetched episodes are served from cache, so raising this is how you pick up what's new.">Max episodes
+            <input type="number" id="lib-rss-limit" value="5" min="0" max="500" />
+          </label>
+          <label class="chk" title="Include the show notes or article body alongside the transcript"><input type="checkbox" id="lib-rss-notes" checked /> Show notes</label>
+          <label class="chk"><input type="checkbox" id="lib-rss-whisper" /> Transcribe missing episodes</label>
+          <label class="chk" title="Re-read the feed and re-fetch every episode instead of reusing the cache"><input type="checkbox" id="lib-rss-refresh" /> Refresh (ignore cache)</label>
+          <button id="btn-lib-rss-fetch" class="small primary">Fetch</button>
+          <button id="btn-lib-rss-cancel" class="small ghost">Cancel</button>
+        </div>
+        <div id="lib-rss-progress" class="compile-progress hidden"></div>
       </div>
       <div id="lib-search-panel" class="lib-inline-panel hidden">
         <div class="lib-search-fields">
@@ -606,13 +697,16 @@
         <button id="btn-lib-add-write" class="small">➕ Add write-in section</button>
         <button id="btn-lib-add-files" class="small">📎 Add text file(s)</button>
         <button id="btn-lib-add-url" class="small">🔗 Add by URL</button>
-        <button id="btn-lib-add-youtube" class="small">▶ Add YouTube video</button>
+        <button id="btn-lib-add-youtube" class="small" title="A single video, or a whole playlist as one item per video">▶ Add YouTube</button>
+        <button id="btn-lib-add-rss" class="small" title="An RSS or Atom feed. Podcasts get their published transcripts.">📡 Add RSS / Podcast</button>
+        <button id="btn-lib-add-media" class="small" title="Transcribe audio or video with local speech recognition">🎙 Add audio/video</button>
         <button id="btn-lib-add-search" class="small">🔍 Brave search</button>
         <span class="spacer"></span>
         <span id="lib-compile-badge" class="compile-badge-slot"></span>
         <label class="chk" title="Re-embed every item, ignoring the incremental cache"><input type="checkbox" id="lib-compile-force" /> Full rebuild</label>
         <button id="btn-lib-compile" class="small primary" title="Build the reusable vector index (semantic chunking + contextualization)">⚙ Compile Data</button>
       </div>
+      <div id="lib-media-progress" class="compile-progress hidden"></div>
       <div id="lib-compile-progress" class="compile-progress hidden"></div>
     </main>
   </div>
@@ -667,10 +761,28 @@
             </label>
             <label class="chk"><input type="checkbox" id="pe-reword" /> Query rewrite</label>
             <button id="btn-pe-kb-add" class="small primary">Add documents…</button>
+            <button id="btn-pe-kb-rss" class="small" title="Import a podcast or blog feed as knowledge documents">📡 Add RSS / Podcast…</button>
             <span class="spacer"></span>
             <span id="pe-compile-badge" class="compile-badge-slot"></span>
             <label class="chk" title="Re-embed every source + memory, ignoring the incremental cache"><input type="checkbox" id="pe-compile-force" /> Full rebuild</label>
             <button id="btn-pe-compile" class="small primary" title="Build the reusable vector index for this persona's knowledge + memories">⚙ Compile Data</button>
+          </div>
+          <div id="pe-rss-panel" class="lib-inline-panel hidden">
+            <div class="lib-search-fields">
+              <input type="text" id="pe-rss-input" placeholder="https://feeds.example.com/show.xml" />
+              <label class="lib-search-max">Max episodes
+                <input type="number" id="pe-rss-limit" value="5" min="0" max="500" />
+              </label>
+              <label class="chk"><input type="checkbox" id="pe-rss-whisper" /> Transcribe missing episodes</label>
+              <button id="btn-pe-rss-fetch" class="small primary">Import</button>
+              <button id="btn-pe-rss-cancel" class="small ghost">Cancel</button>
+            </div>
+            <div class="muted" style="font-size:12px">
+              Each episode becomes one knowledge document under the persona's
+              <code>sources/</code>, so it travels in an export bundle. Re-importing the
+              same feed replaces those documents rather than duplicating them.
+            </div>
+            <div id="pe-rss-progress" class="compile-progress hidden"></div>
           </div>
           <div id="pe-embed-banner" class="warn-banner hidden"></div>
           <div id="pe-compile-progress" class="compile-progress hidden"></div>
@@ -680,6 +792,23 @@
         <section class="pe-page" id="pe-memories">
           <div class="row-controls">
             <button id="btn-pe-mem-add" class="small primary">Add memory</button>
+            <button id="btn-pe-mem-rss" class="small" title="Draft memories from a feed's episodes. Nothing is saved until you review each one.">📡 Draft from RSS…</button>
+          </div>
+          <div id="pe-mem-rss-panel" class="lib-inline-panel hidden">
+            <div class="lib-search-fields">
+              <input type="text" id="pe-mem-rss-input" placeholder="https://feeds.example.com/show.xml" />
+              <label class="lib-search-max">Max episodes
+                <input type="number" id="pe-mem-rss-limit" value="3" min="1" max="50" />
+              </label>
+              <button id="btn-pe-mem-rss-go" class="small primary">Draft</button>
+              <button id="btn-pe-mem-rss-cancel" class="small ghost">Cancel</button>
+            </div>
+            <div class="muted" style="font-size:12px">
+              Drafts are shown for review — nothing is written until you save each one.
+              Auto-saving machine-written recollections would skew every future memory
+              retrieval, so this deliberately stops short of that.
+            </div>
+            <div id="pe-mem-rss-progress" class="compile-progress hidden"></div>
           </div>
           <div id="pe-mem-list" class="side-list"></div>
         </section>
@@ -856,6 +985,66 @@
           <input type="number" id="set-image-max-dim" min="256" max="8192" step="64" />
         </label>
         <label class="chk" title="Start new chats and batch projects with 🖼 Full res selected. You can still flip it per chat."><input type="checkbox" id="set-image-full-res" /> Send images at full resolution by default</label>
+        <h3 style="margin-top:1em">YouTube cache</h3>
+        <div class="muted" style="font-size:12px; margin-bottom:6px">
+          Fetched transcripts and comments are kept on disk for this data profile, so the
+          same video is never crawled twice — a Batch preview and the run that follows it
+          cost one fetch, not two. Entries never expire. Clear them here when you want
+          fresh comments for everything, or tick “Refresh (ignore cache)” on a single fetch.
+        </div>
+        <div class="control-row">
+          <span id="yt-cache-stats" class="muted">—</span>
+          <button id="btn-yt-cache-clear" class="small danger">🧹 Clear YouTube cache</button>
+        </div>
+        <h3 style="margin-top:1em">RSS / Podcast cache</h3>
+        <div class="muted" style="font-size:12px; margin-bottom:6px">
+          Feed listings are re-read with a conditional request, so checking for new
+          episodes costs nothing when nothing changed. Fetched episodes never expire —
+          re-importing a feed is how you pick up what's new. “Refresh listings” is the
+          cheap reset; clearing episodes also throws away anything transcribed locally.
+        </div>
+        <div class="control-row">
+          <span id="rss-cache-stats" class="muted">—</span>
+          <button id="btn-rss-cache-clear-feeds" class="small">↻ Refresh listings</button>
+          <button id="btn-rss-cache-clear" class="small danger">🧹 Clear episode cache</button>
+        </div>
+        <h3 style="margin-top:1em">Transcription (Whisper)</h3>
+        <div class="muted" style="font-size:12px; margin-bottom:6px">
+          Local speech-to-text via faster-whisper, used for audio/video you add directly
+          and for podcast episodes whose feed publishes no transcript. Runs entirely
+          offline once the model has been downloaded once. Nothing here loads a model —
+          the first transcription does.
+        </div>
+        <div class="control-row">
+          <span id="whisper-status" class="muted">—</span>
+          <button id="btn-whisper-reset" class="small" title="Unload the model to free its VRAM, and re-try the GPU after upgrading ctranslate2">♻ Unload model</button>
+        </div>
+        <label class="setting-row" title="A size name (tiny/base/small/medium/large-v3/distil-large-v3), a Hugging Face repo id, or a local folder.">Model
+          <input type="text" id="set-whisper-model" placeholder="large-v3" />
+        </label>
+        <label class="setting-row" title="'auto' uses the GPU when one is usable and falls back to the CPU on its own.">Device
+          <select id="set-whisper-device">
+            <option value="auto">auto — GPU if usable, else CPU</option>
+            <option value="cuda">cuda — GPU only</option>
+            <option value="cpu">cpu — slower, always works</option>
+          </select>
+        </label>
+        <label class="setting-row" title="float16 needs a GPU; on CPU this is forced to int8, which is the only fast option there.">Compute type
+          <select id="set-whisper-compute">
+            <option value="float16">float16 — GPU default</option>
+            <option value="int8_float16">int8_float16 — less VRAM</option>
+            <option value="bfloat16">bfloat16</option>
+            <option value="int8">int8 — CPU default</option>
+            <option value="float32">float32 — slowest, most accurate</option>
+          </select>
+        </label>
+        <label class="setting-row" title="Batched inference is a large speedup on long audio. 1 disables it.">Batch size
+          <input type="number" id="set-whisper-batch" min="1" max="32" />
+        </label>
+        <label class="setting-row" title="Leave blank to detect the language from the audio. Setting it is faster and avoids a wrong guess on a noisy opening.">Language (blank = auto-detect)
+          <input type="text" id="set-whisper-lang" placeholder="en" />
+        </label>
+        <label class="chk" title="Skip silence before transcribing. A large win on interview and podcast audio."><input type="checkbox" id="set-whisper-vad" /> Voice activity detection (skip silence)</label>
         <h3 style="margin-top:1em">RAG (Retrieval Augmented Generation)</h3>
         <label class="setting-row" title="Which vector store holds your compiled data. The two stores are separate files, so switching never destroys the other's data.">Vector store
           <select id="set-rag-backend">

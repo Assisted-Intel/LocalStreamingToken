@@ -556,6 +556,19 @@ def retrieve_libraries(query_vecs, lib_ids: list, model: str, top_k: int,
     return retrieve("library", lib_ids, query_vecs, model, top_k, mode=mode, queries=queries)
 
 
+def fuse(result_lists: list, top_k: int) -> list:
+    """RRF-merge several independently-retrieved rankings into one.
+
+    Each corpus (libraries, a chat's attachments, its thread) is retrieved separately and
+    comes back with scores from its own space — a Lance distance, a cosine, a BM25 score,
+    or an RRF score from an earlier merge. Sorting those together by raw value compares
+    numbers that mean different things, and in practice let one corpus crowd out the
+    rest. RRF ranks instead, so every corpus's best hit is weighted alike.
+
+    Exposed here so callers outside this module don't reach into the store package."""
+    return scoring.rrf_merge([lst for lst in (result_lists or []) if lst], top_k)
+
+
 # Chunks+vectors for the transient corpus, keyed by (embed model, sha1 of the text).
 # The inline corpus now includes a chat's PINNED ATTACHMENTS, which are re-sent every
 # turn and can be 200k characters each (a YouTube transcript). Embedding that from

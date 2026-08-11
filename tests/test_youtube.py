@@ -7,7 +7,8 @@ import json
 
 import pytest
 
-from app import core, logic, youtube
+import conftest
+from app import core, logic, youtube, youtube_cache
 
 
 @pytest.fixture(autouse=True)
@@ -282,12 +283,7 @@ def _renderer_payload(author, text):
     }}}}
 
 
-def _entity_payload(author, text, likes="412", published="2 months ago"):
-    return {"commentEntityPayload": {
-        "properties": {"content": {"content": text}, "publishedTime": published},
-        "author": {"displayName": author},
-        "toolbar": {"likeCountNotliked": likes},
-    }}
+_entity_payload = conftest.yt_entity_payload
 
 
 def test_harvest_reads_the_modern_entity_shape():
@@ -410,49 +406,18 @@ def test_format_without_comments_has_no_comments_section():
 
 # ------------------------------ fetch chain ------------------------------
 
-_PLAYER = {
-    "videoDetails": {"title": "How Engines Work", "author": "Garage Lab",
-                     "viewCount": "1240113"},
-    "microformat": {"playerMicroformatRenderer": {"publishDate": "2024-03-12"}},
-    "captions": {"playerCaptionsTracklistRenderer": {"captionTracks": [
-        {"languageCode": "en", "vssId": ".en", "baseUrl": "https://timedtext/x"}]}},
-}
-_JSON3 = {"events": [{"segs": [{"utf8": "The engine turns."}]}]}
-
-
-# ytInitialData needs a comments continuation token, or the comment pager correctly
-# concludes the video has no comment section and never calls the API.
-_INITIAL_DATA = {"engagementPanels": {
-    "commentsEntryPointHeaderRenderer": {},
-    "continuationCommand": {"token": "seed-token"},
-}}
-
-
-def _watch_html(player=None, initial=None):
-    return ("var ytInitialPlayerResponse = " + json.dumps(player or _PLAYER) + ";"
-            "var ytInitialData = " + json.dumps(initial or _INITIAL_DATA) + ";"
-            '"INNERTUBE_API_KEY":"AIzaTESTKEY"')
+# The payloads and the network fake live in conftest.py, because test_batch.py drives
+# the same chain to prove Preview and Run share one crawl.
+_PLAYER = conftest._YT_PLAYER
+_JSON3 = conftest._YT_JSON3
+_INITIAL_DATA = conftest._YT_INITIAL_DATA
+_watch_html = conftest.yt_watch_html
 
 
 @pytest.fixture
-def fake_net(monkeypatch):
-    """Stand in for every HTTP call youtube.py makes, recording what was requested."""
-    calls = {"get": [], "post": []}
-
-    def fake_get(url, timeout=45):
-        calls["get"].append(url)
-        if "timedtext" in url:
-            return json.dumps(_JSON3)
-        return _watch_html()
-
-    def fake_post(url, body, timeout=45):
-        calls["post"].append((url, body))
-        return {"frameworkUpdates": {"entityBatchUpdate": {"mutations": [
-            {"payload": _entity_payload("Ada", "Great explainer")}]}}}
-
-    monkeypatch.setattr(youtube, "_requests_get", fake_get)
-    monkeypatch.setattr(youtube, "_requests_post_json", fake_post)
-    return calls
+def fake_net(youtube_net):
+    """This suite's long-standing name for conftest's ``youtube_net``."""
+    return youtube_net
 
 
 def test_fetch_video_via_requests(monkeypatch, fake_net):
@@ -709,6 +674,171 @@ def test_fetch_comments_without_an_api_key_raises():
     with pytest.raises(youtube.YouTubeError):
         youtube._fetch_comments("<html></html>", None, 10,
                                 lambda *a, **k: None, lambda: False)
+
+
+# ------------------------------ cache ------------------------------
+# The cache seeds fetch_video's working dict before the transport loop, so most of the
+# behaviour here is the loop's existing per-half fall-through doing its job — that is
+# the point of wiring it in there rather than bolting a second code path alongside.
+
+@pytest.fixture
+def requests_rung(monkeypatch, fake_net):
+    """The requests rung and nothing above it. Every cache test asserts on `via`, so a
+    stray Bright Data token would rename the contributor and break them all."""
+    monkeypatch.setattr(core, "BRIGHTDATA_TOKEN", "")
+    return fake_net
+
+
+def _prime(max_comments=100, include_comments=True):
+    """Populate the cache the way a real fetch does, and return the result."""
+    return youtube.fetch_video("dQw4w9WgXcQ", include_comments=include_comments,
+                               max_comments=max_comments)
+
+
+def test_fetch_video_writes_the_cache(requests_rung):
+    _prime(max_comments=100)
+    entry = youtube_cache.get("dQw4w9WgXcQ")
+    assert entry["transcript"] == "The engine turns."
+    assert entry["comment_count"] == 1
+    assert entry["comment_target"] == 100
+    assert entry["title"] == "How Engines Work"
+
+
+def test_a_full_cache_hit_makes_no_network_calls(monkeypatch, requests_rung):
+    _prime()
+    requests_rung["get"].clear(); requests_rung["post"].clear()
+
+    def boom(*a, **k):
+        raise AssertionError("a cache hit must not touch the network")
+
+    monkeypatch.setattr(youtube, "_requests_get", boom)
+    monkeypatch.setattr(youtube, "_requests_post_json", boom)
+    got = youtube.fetch_video("dQw4w9WgXcQ", include_comments=True, max_comments=100)
+    assert got["via"] == "cache"
+    assert got["transcript"] == "The engine turns."
+    assert [c["author"] for c in got["comments"]] == ["Ada"]
+    assert "How Engines Work" in got["text"]
+
+
+def test_a_cache_hit_rerenders_text_for_this_call(requests_rung):
+    """`text` is rendered at read time, never stored — otherwise a fetch cached with
+    comments would keep serving them to a caller that asked for none."""
+    _prime(max_comments=100)
+    with_comments = youtube.fetch_video("dQw4w9WgXcQ", include_comments=True)
+    without = youtube.fetch_video("dQw4w9WgXcQ", include_comments=False)
+    assert "--- Comments ---" in with_comments["text"]
+    assert "--- Comments ---" not in without["text"]
+    assert without["via"] == "cache"
+
+
+def test_a_smaller_comment_ask_is_a_full_hit(monkeypatch, requests_rung):
+    _prime(max_comments=100)
+    monkeypatch.setattr(youtube, "_requests_get",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no network")))
+    assert youtube.fetch_video("dQw4w9WgXcQ", max_comments=20)["via"] == "cache"
+
+
+def test_more_comments_refetches_only_the_comments_half(requests_rung):
+    """The headline behaviour: the transcript half stays satisfied by the cache, so
+    only the comment pager runs. No timedtext request is made a second time."""
+    _prime(max_comments=100)
+    requests_rung["get"].clear(); requests_rung["post"].clear()
+    got = youtube.fetch_video("dQw4w9WgXcQ", include_comments=True, max_comments=500)
+    assert got["via"] == "cache + requests"
+    assert not any("timedtext" in u for u in requests_rung["get"])
+    assert requests_rung["post"], "the comment pager should have run"
+    assert got["transcript"] == "The engine turns."
+    # …and the upgrade is recorded, so the next ask of 500 is free.
+    assert youtube_cache.get("dQw4w9WgXcQ")["comment_target"] == 500
+
+
+def test_refresh_bypasses_the_cache_but_still_writes(monkeypatch, requests_rung):
+    _prime()
+    player = json.loads(json.dumps(_PLAYER))
+    player["videoDetails"]["title"] = "How Engines Work (2024 remaster)"
+    monkeypatch.setattr(youtube, "_requests_get",
+                        lambda url, timeout=45: json.dumps(_JSON3) if "timedtext" in url
+                        else _watch_html(player=player))
+    got = youtube.fetch_video("dQw4w9WgXcQ", include_comments=True, refresh=True)
+    assert "cache" not in (got["via"] or "")
+    assert got["title"] == "How Engines Work (2024 remaster)"
+    assert youtube_cache.get("dQw4w9WgXcQ")["title"] == "How Engines Work (2024 remaster)"
+
+
+def test_refresh_without_comments_keeps_the_cached_comments(requests_rung):
+    _prime(max_comments=100)
+    youtube.fetch_video("dQw4w9WgXcQ", include_comments=False, refresh=True)
+    assert youtube_cache.get("dQw4w9WgXcQ")["comment_count"] == 1
+
+
+def test_a_stopped_run_does_not_cache_comments(monkeypatch, requests_rung):
+    calls = {"n": 0}
+
+    def stop_after_the_page():
+        calls["n"] += 1
+        return calls["n"] > 3
+
+    got = youtube.fetch_video("dQw4w9WgXcQ", include_comments=True,
+                              should_stop=stop_after_the_page)
+    entry = youtube_cache.get("dQw4w9WgXcQ")
+    # The transcript either parsed whole or not at all, so it is safe to keep. A
+    # truncated comment list is not: once stored it would be served forever.
+    assert got["transcript"] == "The engine turns."
+    assert entry["transcript"] == "The engine turns."
+    assert "comments" not in entry
+
+
+def test_a_failed_comment_half_is_not_cached_and_is_retried(monkeypatch, requests_rung):
+    def boom(html, transport, max_comments, progress, stopped):
+        raise RuntimeError("InnerTube said no")
+
+    # A nested context, not monkeypatch.undo(): undo() reverts every patch on this
+    # instance, including the fake_net stubs requests_rung installed, so the retry
+    # below went to the real youtube.com and came back with its actual comments.
+    with monkeypatch.context() as broken:
+        broken.setattr(youtube, "_fetch_comments", boom)
+        youtube.fetch_video("dQw4w9WgXcQ", include_comments=True)
+    assert "comments" not in youtube_cache.get("dQw4w9WgXcQ")
+
+    got = youtube.fetch_video("dQw4w9WgXcQ", include_comments=True)
+    assert [c["author"] for c in got["comments"]] == ["Ada"]
+
+
+def test_a_missing_transcript_is_not_cached_as_empty(monkeypatch, requests_rung):
+    """"No captions exist" and "the rung was blocked today" look identical from here,
+    so a blank transcript must never harden into a stored answer."""
+    player = json.loads(json.dumps(_PLAYER))
+    player.pop("captions")
+    # Nested context rather than monkeypatch.undo(), for the reason given in
+    # test_a_failed_comment_half_is_not_cached_and_is_retried.
+    with monkeypatch.context() as no_captions:
+        no_captions.setattr(youtube, "_requests_get",
+                            lambda url, timeout=45: _watch_html(player=player))
+        youtube.fetch_video("dQw4w9WgXcQ", include_comments=True)
+    assert "transcript" not in youtube_cache.get("dQw4w9WgXcQ")
+
+    assert youtube.fetch_video("dQw4w9WgXcQ")["transcript"] == "The engine turns."
+
+
+def test_a_cache_hit_emits_a_cache_progress_phase(requests_rung):
+    _prime()
+    phases = []
+    youtube.fetch_video("dQw4w9WgXcQ", include_comments=True,
+                        on_progress=lambda phase, **kw: phases.append((phase, kw)))
+    assert phases[0][0] == "cache"
+    assert phases[0][1]["transcript"] is True
+    assert phases[0][1]["need_comments"] is False
+
+
+def test_a_partial_hit_reports_what_it_still_needs(requests_rung):
+    _prime(max_comments=100)
+    phases = []
+    youtube.fetch_video("dQw4w9WgXcQ", include_comments=True, max_comments=500,
+                        on_progress=lambda phase, **kw: phases.append((phase, kw)))
+    assert phases[0][0] == "cache"
+    assert phases[0][1]["need_transcript"] is False
+    assert phases[0][1]["need_comments"] is True
+    assert "comments" in [p for p, _ in phases]
 
 
 # ------------------------------ library round-trip ------------------------------

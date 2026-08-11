@@ -8,7 +8,7 @@ evaluation, and AI-assisted database editing — all backed by models running on
 own hardware via [Ollama](https://ollama.com), with everything you feed it stored
 encrypted on your own disk.
 
-*by Assisted Intel · v2.0.0 · MIT licensed*
+*by Assisted Intel · v2.1.0 · MIT licensed*
 
 ---
 
@@ -71,6 +71,14 @@ a model writes a sentence situating it inside its parent document, and that sent
 prepended to the text being indexed. This costs **one LLM call per new or changed
 chunk**, which is exactly why it ships off — but it meaningfully improves retrieval on
 long documents where a chunk in isolation is ambiguous.
+
+### Traceable sources
+Every RAG answer carries a collapsible **📚 Sources** panel under the reasoning, listing
+the chunks that were actually put in front of the model — the document each came from,
+its retrieval score, and the excerpt itself. Click one and the app takes you to it: to
+the Resources tab with the owning library open and the passage highlighted inside the
+item, to the attachment viewer, or to the earlier turn it was quoted from. The panel is
+saved with the chat, so you can still check where an answer came from days later.
 
 ### Persona chain-of-thought pipelines
 A persona answers through a multi-step pipeline instead of a single completion. The
@@ -202,7 +210,13 @@ approved-domain list.
 ## What else is in here
 
 **Chats & profiles** — saved and private (unsaved) chats, chat groups, rename/clear/delete,
-copy on every message, regenerate the last reply with a different model. Per-chat
+copy on every message, **edit** any message in place, regenerate the last reply with a
+different model. Editing works on your own turns and on the assistant's: the text is
+replaced, later messages are left alone and nothing regenerates, and your version is what
+the model sees on the next send — which makes it the simplest way to steer a conversation
+that has drifted. (Ctrl+Enter saves, Esc cancels. In "isolate prompts" mode only the last
+message is sent, so an edit to an earlier one won't reach the model — the app says so when
+that happens.) Per-chat
 pre-prompt (as a system message or folded into the user turn) with reusable presets,
 per-chat context length, "isolate prompts" mode that drops history, and reasoning-model
 support that separates chain-of-thought from the answer. **Data profiles** keep separate
@@ -211,16 +225,28 @@ keys; **incognito** leaves nothing behind. A live context-usage bar shows how fu
 window is.
 
 **Reference libraries** — build a corpus from typed sections, imported text files, URLs,
-YouTube videos, or Brave search results. Ingests **PDF, EPUB, DOCX, TXT, and MD**.
+YouTube videos, RSS/podcast feeds, audio and video files, or Brave search results.
+Ingests **PDF, EPUB, DOCX, TXT, and MD**.
 Import/export as XML. Select libraries per chat, optionally in **Strict** mode (answer
 only from these). RAG chunks and embeds them so large references stay inside your
 context window, with an **Auto-RAG** toggle that engages on its own once a message plus
 attached data crosses a word threshold.
 
-**Chat attachments** — the composer's **＋ Add** button offers the same five sources
+**Chat attachments** — the composer's **＋ Add** button offers the same sources
 without creating a library, for material that belongs to one conversation. Each addition
 becomes a chip that Send consumes; 📌 pins it to the chat instead, so it stays attached
 and is put in front of the model on every turn until you remove it.
+
+**RAG scope** — besides your selected libraries, the **Scope** control decides what RAG
+searches: *Attachments + data* (what you attached to the chat), *Conversation* (the chat
+itself), or *Both*. Searching the conversation is how a long chat outlives its context
+window — only the last few turns are sent verbatim (*Settings → RAG → thread window*)
+and older ones come back as retrieved excerpts when they're relevant, instead of being
+cut off the front. Indexing is incremental and happens as you send, so an unchanged chat
+costs nothing; editing a message re-embeds only that message, and regenerating drops the
+old answer from the index. **Private chats are never indexed** — the default vector store
+is plaintext on disk — so they retrieve in memory each send instead. Clearing a chat, or
+deleting it or its tab, removes what was indexed.
 
 **Images** — attach pictures to a chat by picker, by dragging them onto the composer, or
 with Ctrl+V straight from the clipboard, and ask a vision model to describe, read, or
@@ -240,6 +266,68 @@ otherwise straight from this machine; install the optional `yt-dlp` package and 
 as a third fallback — worth having, because YouTube currently refuses server-side caption
 requests that can't present a proof-of-origin token, and yt-dlp is what fills that gap.
 
+Paste a **playlist** URL into the chat's ＋ Add → ▶ YouTube box and every video is
+fetched as its **own attachment**, so you can drop the ones you don't want before
+sending. A "Max videos" field appears (0 = all), and Cancel actually stops the run
+rather than just closing the panel. A `watch?v=…&list=…` link is genuinely ambiguous —
+YouTube's share sheet produces it constantly — so the panel asks whether you meant the
+one video or the whole playlist, defaulting to the video.
+
+The **Resources** tab's ▶ Add YouTube button works the same way, with the same
+video/playlist prompt and Max-videos field. There each video becomes its **own library
+item**, labelled with its title and linking back to its watch URL, and items are saved
+as they arrive — cancelling a forty-video playlist at video thirty keeps the thirty you
+already have.
+
+**Every fetched video is cached on disk**, per data profile, so the same video is never
+crawled twice — a Batch **Preview** and the **Run** that follows it now cost one crawl
+instead of two, and re-running a saved batch project is close to instant. Transcripts
+and comments are cached separately, so asking for more comments later re-fetches only
+the comments and keeps the transcript. Entries **never expire**: tick **Refresh (ignore
+cache)** — in the chat panel, the Resources panel, or the Batch tab — to force a fresh
+pull, or clear the lot from **Settings → YouTube cache**, which shows how much is stored.
+Nothing partial is ever cached: a cancelled run's truncated comment list and a transcript
+that failed to load are both left out, so a bad fetch can't harden into a permanent
+answer.
+
+**RSS & podcasts** — paste any RSS or Atom feed and pull its items in as documents, from
+the chat composer, the Resources tab, the Batch tab, or straight into a persona's
+knowledge base. You choose how many of the newest items to take; already-fetched ones
+come from cache, so raising that number is how you pick up what's new.
+
+For podcasts this is **Podcasting 2.0**-aware. When a feed publishes a
+`<podcast:transcript>` — as the No Agenda feed does, for all 226 of its episodes — the
+transcript is downloaded and used directly, which is fast and free. Multiple formats are
+tried best-first (the podcast-index JSON, then VTT, then SRT, then plain text), so a dead
+link on one falls through to the next rather than giving up. Speaker labels are kept where
+the source has them and turned into paragraphs; timestamps are dropped, which removes
+about 40% of an SRT file without losing a word of speech. Chapters, hosts and show notes
+come along in the same document, above the transcript so they survive if a very long
+episode has to be truncated. For a plain blog feed there's no transcript to find, so a
+full-text item is used as-is and a summary-only one triggers a fetch of the linked page.
+
+**Local transcription** — for episodes whose feed publishes nothing, tick **Transcribe
+missing episodes** and the audio is downloaded and run through
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper) on this machine. It is **off
+by default** for a reason: it is a hundred-megabyte download and minutes of GPU per
+episode, and a published transcript is always preferred when one exists. The same engine
+handles audio and video you add directly — 🎙 in the composer or the Resources tab — so
+you can drop an `.mp3`, `.m4a`, `.mp4` or `.mkv` in and get a transcript back. The
+downloaded audio is deleted the moment it has been transcribed; the transcript is the
+thing worth keeping. **Settings → Transcription** picks the model, device and compute
+type (default `large-v3` on the GPU, falling back to the CPU on its own if the GPU can't
+run it) and can unload the model to free its VRAM. Requires the optional
+`faster-whisper` package; without it everything else still works and the checkbox is
+simply disabled.
+
+Feeds and episodes are cached per data profile, like YouTube videos. Feed listings are
+re-read with a conditional request so checking for new episodes costs almost nothing when
+nothing has changed; fetched episodes never expire. A locally transcribed episode is
+never overwritten by a re-run — and if the publisher later ships a real transcript, that
+one replaces it, never the other way round. **Settings → RSS / Podcast cache** shows what
+is stored, including how many episodes were transcribed locally, and offers a cheap
+"refresh listings" separately from the destructive clear.
+
 **Web search** — Brave for discovery, Bright Data for crawling live pages, injected as
 research context. Available per message or as a tool the model can call itself.
 
@@ -257,7 +345,8 @@ item's text, plus `{{title}}`, `{{url}}` and `{{source}}` — and it runs agains
 item, with the same system prompts, resource libraries and Multi-Pass refinement the chat
 has — including its own **editable evaluation prompt**, so you decide what each
 refinement round should actually look for. **Preview items** shows exactly what will run
-before you start.
+before you start, and because fetched videos are cached (see YouTube above), previewing a
+playlist and then running it costs one crawl rather than two.
 
 Results go to a batch transcript you can promote into a normal chat, and/or to exported
 files: one file per item, everything in a single file, or written **next to each file it
@@ -337,6 +426,10 @@ app/
   compile.py                Batch chunk+embed ("Compile Data")
   batch.py                  Batch tab: sources -> items, filenames, exports
   youtube.py                Video transcripts + comments; playlist enumeration
+  youtube_cache.py          Never-expiring per-profile cache of fetched videos
+  rss.py                    RSS/Atom feeds + Podcasting 2.0 transcripts
+  rss_cache.py              Per-profile cache of feed listings and episodes
+  transcribe.py             Local speech-to-text (faster-whisper) + cue cleaning
   rewrite.py                Query rewriting and the Rewrite button
   parallel.py               Multi-server fan-out (thread per lane)
   evals.py                  Model-graded evaluation

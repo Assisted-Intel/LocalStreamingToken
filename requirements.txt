@@ -80,6 +80,32 @@ playwright>=1.40          # optional: JS-rendering local crawl fallback
 yt-dlp>=2024.1            # optional: YouTube transcript/comment fallback
 
 # --------------------------------------------------------------------------
+# RSS / Podcast source (Resources tab, chat composer, Batch tab, Personas).
+# Reads RSS 2.0 and Atom feeds. Podcasting 2.0 elements (podcast:transcript,
+# podcast:person, podcast:chapters) are parsed out of the raw XML with the
+# stdlib instead, because feedparser collapses repeated namespaced elements to
+# a single last-one-wins dict — see the note in app/rss.py. Imported lazily in
+# app/rss.py, so the app runs without it.
+# --------------------------------------------------------------------------
+feedparser>=6.0           # optional: RSS/Atom feed parsing
+
+# --------------------------------------------------------------------------
+# Local speech-to-text, used when a podcast episode publishes no transcript,
+# and for audio/video files or URLs added directly. Runs fully offline once the
+# model weights have been downloaded once (~3 GB for large-v3, cached by
+# huggingface_hub under ~/.cache). Decodes media through PyAV, so no ffmpeg
+# binary is required. Settings → Transcription picks the model, device and
+# compute type; the GPU path falls back to CPU automatically. Imported lazily in
+# app/transcribe.py, so the app runs without it.
+#
+# For GPU use, ctranslate2 must ship kernels for your card's compute capability
+# — Blackwell (RTX 50xx, sm_120) needs ctranslate2>=4.6. Older builds report
+# CUDA as available and then fail at the first decode; the app catches that and
+# falls back to CPU.
+# --------------------------------------------------------------------------
+faster-whisper>=1.1       # optional: local speech-to-text
+
+# --------------------------------------------------------------------------
 # Database Processing tab (import → isolated DuckDB staging → safe write-back).
 # Everything here runs fully locally/offline once installed. For an air-gapped
 # install, vendor wheels with:  pip download -r requirements.txt -d wheelhouse

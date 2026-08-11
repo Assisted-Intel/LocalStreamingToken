@@ -25,6 +25,90 @@ from app import core, crypto, profiles, providers
 
 # --------------------------- isolation ---------------------------
 
+@pytest.fixture(autouse=True)
+def isolate_youtube_cache(tmp_path, monkeypatch):
+    """Give every test its own empty YouTube cache dir.
+
+    Autouse and unconditional, unlike the rest of the isolation here, because
+    ``youtube.fetch_video`` writes to this path on any successful fetch — including
+    from suites that never call ``isolate_paths`` (test_youtube.py drives the fetch
+    chain directly). Without this they would cache into the developer's real data
+    profile, and the second test in a run would then be served by the first one's cache
+    instead of exercising the transport chain it means to test.
+    """
+    monkeypatch.setattr(core, "YOUTUBE_CACHE_DIR", tmp_path / "youtube_cache")
+
+
+@pytest.fixture(autouse=True)
+def isolate_rss_cache(tmp_path, monkeypatch):
+    """Give every test its own empty RSS/podcast cache dir.
+
+    Autouse and unconditional for the same reason as ``isolate_youtube_cache``:
+    ``rss.fetch_episode`` writes on any successful fetch, including from suites that
+    drive it directly and never call ``isolate_paths``.
+    """
+    monkeypatch.setattr(core, "RSS_CACHE_DIR", tmp_path / "rss_cache")
+
+
+@pytest.fixture(autouse=True)
+def no_whisper(monkeypatch):
+    """Make local transcription raise in every test that has not opted in.
+
+    faster-whisper downloads ~3 GB of weights on first use and then pins a GPU for
+    minutes. No test may reach it by accident — a suite that means to exercise the
+    transcription path installs its own stub (see tests/test_transcribe.py, which
+    injects a fake ``faster_whisper`` module) and overrides this.
+    """
+    from app import transcribe
+
+    def refuse(*a, **k):
+        raise transcribe.TranscribeError("transcription is disabled in tests")
+
+    monkeypatch.setattr(transcribe, "transcribe_file", refuse)
+    monkeypatch.setattr(transcribe, "transcribe_url", refuse)
+
+
+class RealNetworkAttempted(BaseException):
+    """A test reached for the actual internet.
+
+    Deliberately not an ``Exception``: the app is full of ``except Exception`` blocks
+    (``server.py``'s LAN probe, for one) that would swallow this and turn a leaked call
+    back into the silence this fixture exists to end.
+    """
+
+
+@pytest.fixture(autouse=True)
+def no_real_network(monkeypatch):
+    """Make any real HTTP call raise, in every test.
+
+    Every outbound request in the app goes through the module-level ``requests``
+    helpers, and all five modules that make them (core, rss, server, transcribe,
+    youtube) share one ``requests`` module object, so patching it here covers all of
+    them at once. Suites that exercise a transport chain stub it a rung higher —
+    ``youtube._requests_get``, ``rss._requests_get`` — and never reach this.
+
+    This is here because two cache tests in test_youtube.py called ``monkeypatch.undo()``
+    to drop a single patch. ``undo()`` reverts *every* patch on the instance, including
+    the fixture's HTTP stubs, so both quietly fetched the real youtube.com and asserted
+    against whatever it returned. They failed on the *content* rather than on the act of
+    calling out, which is a slow and confusing way to find out; a leak that happened to
+    agree with the assertion would never have been noticed at all.
+    """
+    import requests
+
+    def refuse(name):
+        def blocked(*a, **k):
+            where = a[0] if a else k.get("url", "?")
+            raise RealNetworkAttempted(
+                f"test tried to reach the network: requests.{name} {where}. "
+                "Stub the transport instead (see the youtube_net / rss_net fixtures).")
+        return blocked
+
+    for name in ("get", "post", "head", "put", "patch", "delete", "request"):
+        monkeypatch.setattr(requests, name, refuse(name))
+    monkeypatch.setattr(requests.Session, "request", refuse("Session.request"))
+
+
 def isolate_paths(tmp_path, monkeypatch, unlock=False):
     """Redirect every data/settings path at ``tmp_path`` and create the keyfile.
 
@@ -84,6 +168,199 @@ def client(tmp_path, monkeypatch):
     No model server is reachable, which is exactly the state these routes must behave
     sanely in — install a stub with ``use_adapter`` when one is needed."""
     return make_client(tmp_path, monkeypatch)
+
+
+# --------------------------- YouTube network ---------------------------
+# Lives here rather than in test_youtube.py because test_batch.py needs it too: the
+# preview-then-run cache test has to drive the REAL fetch chain, so monkeypatching
+# youtube.fetch_video (which the other batch tests do) would defeat the point.
+
+_YT_PLAYER = {
+    "videoDetails": {"title": "How Engines Work", "author": "Garage Lab",
+                     "viewCount": "1240113"},
+    "microformat": {"playerMicroformatRenderer": {"publishDate": "2024-03-12"}},
+    "captions": {"playerCaptionsTracklistRenderer": {"captionTracks": [
+        {"languageCode": "en", "vssId": ".en", "baseUrl": "https://timedtext/x"}]}},
+}
+_YT_JSON3 = {"events": [{"segs": [{"utf8": "The engine turns."}]}]}
+
+# ytInitialData needs a comments continuation token, or the comment pager correctly
+# concludes the video has no comment section and never calls the API.
+_YT_INITIAL_DATA = {"engagementPanels": {
+    "commentsEntryPointHeaderRenderer": {},
+    "continuationCommand": {"token": "seed-token"},
+}}
+
+
+def yt_entity_payload(author, text, likes="412", published="2 months ago"):
+    return {"commentEntityPayload": {
+        "properties": {"content": {"content": text}, "publishedTime": published},
+        "author": {"displayName": author},
+        "toolbar": {"likeCountNotliked": likes},
+    }}
+
+
+def yt_watch_html(player=None, initial=None):
+    return ("var ytInitialPlayerResponse = " + json.dumps(player or _YT_PLAYER) + ";"
+            "var ytInitialData = " + json.dumps(initial or _YT_INITIAL_DATA) + ";"
+            '"INNERTUBE_API_KEY":"AIzaTESTKEY"')
+
+
+@pytest.fixture
+def youtube_net(monkeypatch):
+    """Stand in for every HTTP call youtube.py makes, recording what was requested."""
+    from app import youtube
+
+    calls = {"get": [], "post": []}
+
+    def fake_get(url, timeout=45):
+        calls["get"].append(url)
+        if "timedtext" in url:
+            return json.dumps(_YT_JSON3)
+        return yt_watch_html()
+
+    def fake_post(url, body, timeout=45):
+        calls["post"].append((url, body))
+        return {"frameworkUpdates": {"entityBatchUpdate": {"mutations": [
+            {"payload": yt_entity_payload("Ada", "Great explainer")}]}}}
+
+    monkeypatch.setattr(youtube, "_requests_get", fake_get)
+    monkeypatch.setattr(youtube, "_requests_post_json", fake_post)
+    return calls
+
+
+@pytest.fixture
+def no_ytdlp(monkeypatch):
+    """Block the optional yt-dlp rung so a fetch can't reach the real network.
+
+    test_youtube.py has its own autouse version that also hands back the real function;
+    this is the plain block, for suites that just need the chain to stop at requests.
+    """
+    from app import youtube
+
+    def refuse(*a, **k):
+        raise youtube.YouTubeError("yt-dlp is not installed")
+
+    monkeypatch.setattr(youtube, "_fetch_via_ytdlp", refuse)
+
+
+# --------------------------- RSS / podcast feeds ---------------------------
+# Lives here rather than in test_rss.py because test_rss_routes.py, test_batch.py and
+# test_personas.py all need to build a feed, the same way yt_watch_html is shared.
+
+def podcast_item(n=1, *, guid=None, title=None, transcripts=(("srt", "captions"),),
+                 enclosure=True, body="", link=None, pubdate=None, persons=2,
+                 chapters=False, duration="3600"):
+    """One <item>. ``transcripts`` is [(kind, rel)]; kind in srt|vtt|json|text|html|pdf.
+
+    Emits REAL Podcasting 2.0 markup — repeated <podcast:person> and multiple
+    <podcast:transcript> elements — because that is precisely what feedparser flattens
+    away and app/rss.py parses out of the raw XML instead.
+    """
+    types = {"srt": "application/srt", "vtt": "text/vtt", "json": "application/json",
+             "text": "text/plain", "html": "text/html", "pdf": "application/pdf"}
+    guid = f"https://show.test/ep{n}" if guid is None else guid
+    link = f"https://show.test/ep{n}" if link is None else link
+    parts = [f"    <title>{title if title is not None else f'Episode {n}'}</title>"]
+    if guid:
+        parts.append(f"    <guid isPermaLink='true'>{guid}</guid>")
+    if link:
+        parts.append(f"    <link>{link}</link>")
+    parts.append(f"    <pubDate>{pubdate or 'Thu, 06 Aug 2026 22:05:47 +0000'}</pubDate>")
+    if duration:
+        parts.append(f"    <itunes:duration>{duration}</itunes:duration>")
+    if body:
+        parts.append(f"    <content:encoded><![CDATA[{body}]]></content:encoded>")
+    if enclosure:
+        parts.append(f"    <enclosure url='https://cdn.test/ep{n}.mp3' "
+                     f"type='audio/mpeg' length='1000' />")
+    for kind, rel in transcripts:
+        relattr = f" rel='{rel}'" if rel else ""
+        parts.append(f"    <podcast:transcript url='https://cdn.test/ep{n}.{kind}' "
+                     f"type='{types[kind]}'{relattr} />")
+    for i in range(persons):
+        who = ["Adam Curry", "John C Dvorak", "Guest Three"][i % 3]
+        parts.append(f"    <podcast:person role='host' group='cast'>{who}</podcast:person>")
+    if chapters:
+        parts.append(f"    <podcast:chapters url='https://cdn.test/ep{n}.chapters.json' "
+                     f"type='application/json' />")
+    return "  <item>\n" + "\n".join(parts) + "\n  </item>"
+
+
+def feed_xml(items=None, *, title="Test Show", language="en"):
+    """A Podcasting 2.0 RSS document. ``items`` is a list of podcast_item() strings."""
+    if items is None:
+        items = [podcast_item(1)]
+    return (
+        "<?xml version='1.0' encoding='UTF-8'?>\n"
+        "<rss version='2.0'\n"
+        "  xmlns:itunes='http://www.itunes.com/dtds/podcast-1.0.dtd'\n"
+        "  xmlns:content='http://purl.org/rss/1.0/modules/content/'\n"
+        # Deliberately the GitHub-docs URL the sample feed really uses, NOT the one the
+        # spec text gives — app/rss.py must match on local name, not namespace URI.
+        "  xmlns:podcast='https://github.com/Podcastindex-org/podcast-namespace/blob/main/docs/1.0.md'>\n"
+        "<channel>\n"
+        f"  <title>{title}</title>\n"
+        f"  <language>{language}</language>\n"
+        "  <link>https://show.test/</link>\n"
+        "  <description>A test show.</description>\n"
+        + "\n".join(items) +
+        "\n</channel>\n</rss>\n"
+    ).encode("utf-8")
+
+
+SRT_BODY = (
+    "1\n00:00:00,280 --> 00:00:06,163\nHe's full of shit. It's Thursday,\n\n"
+    "2\n00:00:06,304 --> 00:00:09,966\nAugust 6th. This is your Gitmo Nation\n\n"
+    "3\n00:00:09,986 --> 00:00:15,770\nMedia Assassination. [MUSIC]\n"
+)
+
+
+@pytest.fixture
+def rss_net(monkeypatch):
+    """Stand in for every HTTP call app/rss.py makes, recording what was requested.
+
+    ``routes`` maps a URL substring to bytes, an int status, or an Exception to raise.
+    Anything unmatched is a 404, so a test that forgets to register a URL fails loudly
+    rather than reaching the network.
+
+    That promise covers two rungs, not one. Feed and enclosure traffic goes through
+    ``rss._http_get``, but the show-notes escalation — a body under ``rss_notes_min_chars``
+    falls back to crawling the item's own ``<link>`` page — goes through
+    ``core.fetch_url_text`` instead, which starts with a Playwright launch. Stubbing only
+    the first left tests that never think about show notes (an item with no enclosure
+    escalates by definition) quietly crawling the real ``show.test`` domain, and
+    ``rss.episode_notes`` catches Exception around it, so it showed up as nothing worse
+    than a "Page fetch failed" string in the result. Tests that mean to exercise the
+    escalation still override this with their own stub.
+    """
+    from app import rss
+
+    calls = {"get": [], "routes": {}, "headers": [], "pages": []}
+
+    def fake_get(url, *, headers=None, timeout=45, max_bytes=None):
+        calls["get"].append(url)
+        calls["headers"].append(dict(headers or {}))
+        for needle, value in calls["routes"].items():
+            if needle in url:
+                if isinstance(value, Exception):
+                    raise value
+                if isinstance(value, int):
+                    return value, {}, b""
+                return 200, {"ETag": 'W/"x"'}, value
+        raise RuntimeError(f"404 for {url}")
+
+    def fake_page(url, timeout=45):
+        calls["pages"].append(url)
+        for needle, value in calls["routes"].items():
+            if needle in url and isinstance(value, (bytes, str)):
+                body = value.decode() if isinstance(value, bytes) else value
+                return {"url": url, "title": "", "text": body, "via": "requests"}
+        raise RuntimeError(f"404 for {url}")
+
+    monkeypatch.setattr(rss, "_http_get", fake_get)
+    monkeypatch.setattr(core, "fetch_url_text", fake_page)
+    return calls
 
 
 # --------------------------- SSE ---------------------------
@@ -186,3 +463,29 @@ def use_adapter(monkeypatch, adapter):
     """
     monkeypatch.setattr(providers, "get_client", lambda server: adapter)
     return adapter
+
+
+def stub_embeddings(monkeypatch, dims=768):
+    """Give a route test a deterministic embedder instead of a live Ollama.
+
+    ``use_adapter`` covers the *chat* provider, but RAG embedding does not go through
+    ``providers.get_client`` — ``server._rag_retrieve_frames`` and the persona knowledge
+    service each build a ``core.OllamaClient`` directly and call ``.embed``, so a route
+    test with ``rag_enabled`` on, or one that adds persona knowledge, reaches
+    ``127.0.0.1:11434`` for real. Some of that happens on ``rag.py`` worker threads, where
+    the failure surfaces only as a PytestUnhandledThreadExceptionWarning.
+
+    Vectors are unit-length and content-derived, so identical text embeds identically and
+    retrieval is stable, without asserting anything about what the real model would say.
+    """
+    def embed(self, model, texts):
+        out = []
+        for t in texts:
+            h = hash(t)
+            v = [((h >> (i % 32)) & 0xFF) / 255.0 for i in range(dims)]
+            norm = sum(x * x for x in v) ** 0.5 or 1.0
+            out.append([x / norm for x in v])
+        return out
+
+    monkeypatch.setattr(core.OllamaClient, "embed", embed)
+    return embed

@@ -56,6 +56,14 @@ data/profiles/*/personas/*/knowledge/
 data/profiles/*/personas/*/memories/
 data/profiles/*/personas/*/sources/
 
+# Fetched-source caches under the active data profile: one encrypted file per YouTube
+# video and per podcast episode. Encrypted at rest and fully rebuildable by re-fetching
+# the feed or video, so they are cache, not data. Already covered by data/ above; spelled
+# out for the same reason the persona stores are, and because an episode transcript can
+# carry hours of someone else's copyrighted audio as text.
+data/profiles/*/youtube_cache/
+data/profiles/*/rss_cache/
+
 # Phase checkpoints (used when git history isn't the chosen rollback mechanism).
 backups/
 

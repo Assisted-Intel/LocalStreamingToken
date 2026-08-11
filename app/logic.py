@@ -69,6 +69,7 @@ def create_chat_dict(title="New Chat", server_url=None, model=None, pre_prompt="
         "rag_enabled": False,      # retrieve top-k relevant chunks instead of dumping full context
         "rag_auto": False,         # auto-enable RAG when the message exceeds rag_threshold words
         "rag_threshold": 400,      # word count (question + staged data) that triggers auto-RAG
+        "rag_scope": "attachments",  # what RAG searches besides libraries — see RAG_SCOPES
         "memory_enabled": False,   # inject a user memory core, and grow it from this chat
         "memory_core_id": "",      # which core (per-chat, see app/memory.py)
         "memory_turns_since": 0,   # assistant turns since the last extraction pass
@@ -221,7 +222,8 @@ def _resolve_prompts(chat: dict):
     return "", pre_raw
 
 
-def build_messages(chat: dict, libraries: list, skip_library_dump: bool = False) -> list:
+def build_messages(chat: dict, libraries: list, skip_library_dump: bool = False,
+                   history_window: int = None) -> list:
     """Assemble the message list for an interactive generation, mirroring
     ``_start_assistant_generation``: pre-prompt (system or folded into the last
     user turn), library context, isolation, and truncation to the last user
@@ -230,6 +232,13 @@ def build_messages(chat: dict, libraries: list, skip_library_dump: bool = False)
     When ``skip_library_dump`` is True the full library content is omitted and only
     the lightweight XML *manifest* is attached — RAG owns the reference material and
     injects the relevant chunks as excerpts instead.
+
+    ``history_window`` caps how many trailing non-intermediate messages are sent
+    verbatim; ``None`` sends the whole thread. Thread-scope RAG sets it, because
+    retrieving excerpts from a conversation that is also being sent in full spends the
+    context window twice on the same words. The recent tail stays intact — recency and
+    conversational flow are exactly what retrieval is bad at — and older turns arrive as
+    excerpts only when they're relevant.
     """
     # Intermediate Multi-Pass answers are display-only records — only each turn's
     # final refined answer should feed future context.
@@ -255,7 +264,12 @@ def build_messages(chat: dict, libraries: list, skip_library_dump: bool = False)
     if isolated and last_user_idx >= 0:
         full_messages.append(_clean_msg(chat_messages[last_user_idx]))
     elif last_user_idx >= 0:
-        full_messages.extend([_clean_msg(m) for m in chat_messages[:last_user_idx + 1]])
+        history = chat_messages[:last_user_idx + 1]
+        # Isolation already sends one turn, so the window only applies here. Always keep
+        # at least the final user turn — windowing it away would leave nothing to answer.
+        if history_window is not None:
+            history = history[-max(1, int(history_window)):]
+        full_messages.extend([_clean_msg(m) for m in history])
     else:
         full_messages.extend([_clean_msg(m) for m in chat_messages])
 
@@ -368,16 +382,20 @@ def attachment_text(chat: dict) -> str:
     return "\n\n".join(parts)
 
 
-def resolve_attachments(chat: dict, rag_active: bool = False) -> str:
+def resolve_attachments(chat: dict, rag_active: bool = False, scope: str = None) -> str:
     """The pinned-attachment block to inject for this generation, or ''.
 
     Mirrors ``skip_library_dump``: when RAG is running, retrieval owns the pinned
-    material outright (``collect_rag_inputs`` puts it in the corpus) and the full block
-    is dropped. There used to be a size threshold below which the block was sent
-    *as well as* being retrieved, which spent the context twice on the same text for
-    no benefit.
+    material outright (it is in the corpus) and the full block is dropped. There used to
+    be a size threshold below which the block was sent *as well as* being retrieved,
+    which spent the context twice on the same text for no benefit.
+
+    ``scope`` narrows that: under ``"thread"`` the attachments are NOT in the corpus, so
+    the block has to come back or the pinned material would vanish from the turn
+    entirely — retrieved by nothing and sent by nobody. ``scope=None`` keeps the
+    pre-scope behaviour for callers that don't know about it.
     """
-    if rag_active:
+    if rag_active and (scope or "attachments") != "thread":
         return ""
     return build_attachment_block(chat)
 
@@ -468,6 +486,123 @@ def split_inline_data(user_content: str):
     return data_text, question
 
 
+# What RAG searches BESIDES the selected libraries. A library is always retrieved when
+# selected; this chooses the chat's own corpus:
+#   attachments -> pinned attachments + the staged <Data> blocks (the original behaviour)
+#   thread      -> the conversation itself, so a long chat can outlive its context window
+#   both        -> the union
+RAG_SCOPES = ("attachments", "thread", "both")
+
+# Short turns ("ok", "thanks", "do that") carry no retrievable content but score well on
+# keyword search, where they'd displace real excerpts. Below this they aren't indexed.
+_MIN_THREAD_CHARS = 40
+
+
+def rag_scope(chat: dict) -> str:
+    """The chat's RAG corpus scope, normalised. Chats written before the control existed
+    (and anything unrecognised) read as 'attachments' — the pre-scope behaviour."""
+    scope = ((chat or {}).get("rag_scope") or "").strip().lower()
+    return scope if scope in RAG_SCOPES else "attachments"
+
+
+def rag_is_transient(chat: dict) -> bool:
+    """True when this chat's own corpus must NOT be persisted to the vector store.
+
+    Private chats: the default LanceDB backend keeps chunk text and vectors in PLAINTEXT
+    on disk (see app/vectorstore/__init__.py), so indexing a private chat would write out
+    exactly what the private flag exists to keep off the disk. There is no reliable
+    "chat closed" hook to clean up after, so it is never written in the first place —
+    those chats fall back to the in-memory retrieval path instead.
+
+    Synthetic chats (``rag_ephemeral``): Batch and the queue build per-item chats that
+    either carry the REAL chat's id — indexing them would overwrite and then prune the
+    real chat's index once per file — or a throwaway uid that nothing will ever delete.
+    """
+    return bool((chat or {}).get("private")
+                or (chat or {}).get("rag_ephemeral")
+                or not (chat or {}).get("id"))
+
+
+def attachment_items(chat: dict) -> list:
+    """The pinned attachments + staged ``<Data>`` blocks as indexable items.
+
+    Returns ``rag.upsert_items``-shaped ``[(item_id, content, meta)]``. Attachments key
+    on their own stable id; a ``<Data>`` block keys on the turn that carries it. Honours
+    ``isolated`` exactly as ``collect_rag_inputs`` does — an isolated chat contributes
+    only the current turn's data, while pinned attachments belong to the chat rather
+    than to a turn and so are never hidden by isolation.
+    """
+    items = []
+    for it in (chat or {}).get("attachments") or []:
+        content = (it.get("content") or "").strip()
+        if not content or not it.get("id"):
+            continue
+        label = it.get("label") or "Attachment"
+        items.append((str(it["id"]), content,
+                      {"label": label, "type": it.get("type") or "write",
+                       "kind": "attachment"}))
+
+    msgs = [m for m in (chat or {}).get("messages", []) if not m.get("intermediate")]
+    isolated = bool((chat or {}).get("isolated", False))
+    user_idx = [i for i, m in enumerate(msgs) if m.get("role") == "user"]
+    wanted = user_idx[-1:] if isolated else user_idx
+    for i in wanted:
+        data, _q = split_inline_data(msgs[i].get("content", ""))
+        if data:
+            items.append((f"data:{i}", data,
+                          {"label": f"Attached data (turn {i + 1})", "type": "data",
+                           "kind": "data"}))
+    return items
+
+
+def thread_items(chat: dict, exclude_last_user: bool = True) -> list:
+    """The conversation itself as indexable items — ``[(item_id, content, meta)]``.
+
+    ``item_id`` is ``f"m{index}"`` over the RAW ``chat['messages']`` list. That index is
+    a stable key because messages are only ever appended, popped from the tail
+    (regenerate), edited in place, or cleared wholesale — nothing splices or inserts. So
+    an edit keeps its id and changes only its fingerprint, and a regenerate drops ids off
+    the end where ``prune_items`` reaps them.
+
+    ``exclude_last_user`` drops the just-posted user turn: it IS the retrieval query, so
+    indexing it makes the search return the question as its own best-matching excerpt.
+    ``<Data>`` blocks are stripped — those belong to the attachment corpus, and leaving
+    them here would index a 200k-character transcript twice under two scopes.
+    """
+    messages = (chat or {}).get("messages") or []
+    last_user = -1
+    for i, m in enumerate(messages):
+        if m.get("role") == "user" and not m.get("intermediate"):
+            last_user = i
+
+    items = []
+    for i, m in enumerate(messages):
+        if m.get("intermediate"):
+            continue                      # display-only Multi-Pass drafts
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        if exclude_last_user and i == last_user:
+            continue
+        content = m.get("content", "")
+        if role == "user":
+            _data, content = split_inline_data(content)
+        content = (content or "").strip()
+        if len(content) < _MIN_THREAD_CHARS:
+            continue
+        items.append((f"m{i}", content,
+                      {"label": f"Turn {i + 1} ({role})", "role": role, "index": i,
+                       "kind": "thread"}))
+    return items
+
+
+def thread_text(chat: dict, exclude_last_user: bool = True) -> str:
+    """``thread_items`` flattened to one string, for the transient (private-chat)
+    retrieval path, which chunks text rather than indexing items."""
+    return "\n\n".join(f"{meta['label']}\n{content}"
+                       for _id, content, meta in thread_items(chat, exclude_last_user))
+
+
 def collect_rag_inputs(chat: dict):
     """Isolation-aware gathering of the RAG query and inline-data corpus.
 
@@ -543,6 +678,9 @@ def resolve_rag(chat: dict, config: dict):
     else:
         query_rewrite = bool((config or {}).get("rag_query_rewrite", True))
 
+    scope = rag_scope(chat)
+    use_thread = scope in ("thread", "both")
+
     return {
         "active": True,
         "query": query,
@@ -552,24 +690,68 @@ def resolve_rag(chat: dict, config: dict):
         "queries": [query] if query else [],
         "mode": mode,
         "query_rewrite": query_rewrite,
+        # Kept alongside the scope flags: the transient path (private chats) chunks this
+        # text directly rather than retrieving indexed items.
         "data_text": data_text,
         "use_libraries": bool((chat or {}).get("library_ids")),
+        "scope": scope,
+        "use_attachments": scope in ("attachments", "both"),
+        "use_thread": use_thread,
+        # Retrieving over the thread is pointless while the thread is also sent in full —
+        # the excerpts would duplicate text already in the prompt. Under thread scope the
+        # verbatim history is capped and retrieval supplies what falls outside.
+        "history_window": (int((config or {}).get("rag_thread_window") or 8)
+                           if use_thread else None),
         "top_k": int((config or {}).get("rag_top_k") or 6),
     }
 
 
-def inject_rag(messages: list, retrieved: list, libraries: list = None) -> list:
+def _chunk_meta(r: dict) -> dict:
+    """A retrieved chunk's ``meta`` as a dict. Both vector-store backends hand it back as
+    a JSON string, and a row written before ``meta`` existed has none at all."""
+    meta = r.get("meta")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = None
+    return meta if isinstance(meta, dict) else {}
+
+
+def _excerpt_label(r: dict, label_map: dict) -> str:
+    """Human label for a retrieved chunk.
+
+    The library map wins where it applies — a library item's label can be edited after
+    it was compiled, so the live name beats the one frozen into the chunk. Otherwise the
+    chunk's own persisted ``meta`` carries it, which is how a chat excerpt reads as
+    "Turn 4 (assistant)" rather than the raw ``m3``."""
+    item_id = r.get("item_id") or r.get("source_id") or "excerpt"
+    if label_map.get(item_id):
+        return label_map[item_id]
+    label = _chunk_meta(r).get("label")
+    if label:
+        return str(label)
+    return str(item_id)
+
+
+def inject_rag(messages: list, retrieved: list, libraries: list = None,
+               strip_data: bool = True) -> list:
     """Insert retrieved chunks as a system message before the last user turn, and
     strip the raw <Data> block from every user turn so the full payload isn't sent
     alongside the retrieved excerpts (mirrors ``inject_research``).
 
     Excerpts are emitted as XML ``<excerpt item=… label=… score=…>`` elements whose
-    ``item`` id ties each back to an ``<item>`` in the library manifest. ``libraries``
-    is used to resolve friendly labels for library-sourced excerpts."""
+    ``item`` id ties each back to an ``<item>`` in the library manifest where one
+    exists. ``libraries`` is used to resolve friendly labels for library-sourced
+    excerpts.
+
+    ``strip_data=False`` leaves the ``<Data>`` blocks in place. Thread scope needs that:
+    the staged data is deliberately not in the corpus there, so stripping it would send
+    it neither retrieved nor verbatim — the user's attachment would simply disappear."""
     msgs = []
     for m in messages:
         mm = dict(m)
-        if m.get("role") == "user":
+        if strip_data and m.get("role") == "user":
             d, q = split_inline_data(m.get("content", ""))
             if d:
                 mm["content"] = q if q else "(reference data provided separately)"
@@ -582,7 +764,7 @@ def inject_rag(messages: list, retrieved: list, libraries: list = None) -> list:
     blocks = []
     for r in retrieved:
         item_id = r.get("item_id") or r.get("source_id") or "excerpt"
-        label = label_map.get(item_id) or item_id
+        label = _excerpt_label(r, label_map)
         score = r.get("score")
         score_attr = (f" score=\"{score:.3f}\""
                       if isinstance(score, (int, float)) and score >= 0 else "")
@@ -593,8 +775,9 @@ def inject_rag(messages: list, retrieved: list, libraries: list = None) -> list:
         "role": "system",
         "content": (
             "The following excerpts were retrieved as the most relevant to the user's "
-            "question via semantic search over their reference materials and attached "
-            "data. Each excerpt's item id matches an <item> in the library index above. "
+            "question via semantic search over their reference materials, attached data "
+            "and earlier turns of this conversation. Where an excerpt's item id matches "
+            "an <item> in the library index above, it comes from that item. "
             "Use them to answer the user's message; if the answer is not contained in "
             "them, say you don't have that information.\n\n"
             "<retrieved>\n" + "\n".join(blocks) + "\n</retrieved>"
@@ -609,6 +792,87 @@ def inject_rag(messages: list, retrieved: list, libraries: list = None) -> list:
     else:
         msgs.append(ctx)
     return msgs
+
+
+# --------------------------- Retrieved-source citations ---------------------------
+#
+# ``inject_rag`` renders the retrieved chunks for the MODEL. ``describe_sources`` renders
+# the same chunks for the USER: the Sources panel under an answer, where each excerpt
+# links back to the document it was taken from.
+
+# Display kind per stored ``source_type``. Mirrors the constants in compile.py, which
+# can't be imported here — compile imports logic, not the other way round.
+_SOURCE_KINDS = {
+    "library": "library",
+    "chat_attach": "attachment",
+    "chat_thread": "thread",
+    "persona_knowledge": "persona",
+    "persona_memory": "persona",
+}
+
+
+def _split_chunk_id(chunk_id: str):
+    """(source_type, chunk_index) read off a stored chunk id.
+
+    ``rag.upsert_items`` builds ids as ``f"{source_type}:{source_id}:{item_id}:{ci}"``.
+    Only the two ends are wanted, so this reads from the edges and leaves whatever an id
+    containing colons puts in the middle alone. Returns ("", None) for anything that
+    isn't one — inline retrieval mints no id."""
+    parts = str(chunk_id or "").split(":")
+    if len(parts) < 4:
+        return "", None
+    try:
+        index = int(parts[-1])
+    except (TypeError, ValueError):
+        index = None
+    return parts[0], index
+
+
+def describe_sources(retrieved: list, libraries: list = None) -> list:
+    """Describe the chunks injected this turn so the UI can show and link them.
+
+    One entry per excerpt, labelled exactly as ``inject_rag`` labels it, plus enough
+    identity for the client to navigate back: the display ``kind``, the owning library,
+    and the item within it. The chunk text rides along verbatim because that is what the
+    client searches for in the source document — nothing in the store records a chunk's
+    position (``rag.chunk_text_semantic`` discards the chunker's offsets), so the passage
+    is located at click time rather than looked up.
+    """
+    label_map = _item_label_map(libraries)
+    libs_by_id = {lib.get("id"): lib for lib in (libraries or []) if lib.get("id")}
+    out = []
+    for r in retrieved or []:
+        id_type, id_index = _split_chunk_id(r.get("id"))
+        source_type = r.get("source_type") or id_type
+        source_id = r.get("source_id") or ""
+        item_id = r.get("item_id") or ""
+        chunk_index = r.get("chunk_index")
+        if chunk_index is None:
+            chunk_index = id_index
+        score = r.get("score")
+        src = {
+            "id": r.get("id") or "",
+            "kind": _SOURCE_KINDS.get(source_type, "inline"),
+            "source_type": source_type,
+            "source_id": source_id,
+            "item_id": item_id,
+            "chunk_index": chunk_index,
+            "label": _excerpt_label(r, label_map),
+            "score": float(score) if isinstance(score, (int, float)) else None,
+            "content": r.get("content") or "",
+        }
+        if src["kind"] == "library":
+            # source_id IS the library id; the lookup only supplies the live name, and
+            # its absence means the library was deleted since compiling. The row stays
+            # visible either way — the client decides whether it can be linked.
+            src["library_id"] = source_id
+            src["library_name"] = (libs_by_id.get(source_id) or {}).get("name") or ""
+        elif src["kind"] == "thread":
+            index = _chunk_meta(r).get("index")
+            if isinstance(index, int):
+                src["message_index"] = index
+        out.append(src)
+    return out
 
 
 # --------------------------- Multi-Pass evaluation ---------------------------

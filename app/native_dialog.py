@@ -65,6 +65,16 @@ def _run_dialog(mode, title=None, default_name=None, filetypes_key=None):
         ("All files", "*.*"),
     ]
 
+    # Mirrors transcribe.SUPPORTED_EXTS. Kept as a literal rather than imported: this
+    # function runs in the tkinter subprocess, which must not pay for app imports.
+    media_types = [
+        ("Audio / video", "*.mp3 *.m4a *.m4b *.aac *.ogg *.oga *.opus *.flac *.wav "
+                          "*.wma *.mp4 *.m4v *.mkv *.webm *.mov *.avi"),
+        ("Audio", "*.mp3 *.m4a *.m4b *.aac *.ogg *.oga *.opus *.flac *.wav *.wma"),
+        ("Video", "*.mp4 *.m4v *.mkv *.webm *.mov *.avi"),
+        ("All files", "*.*"),
+    ]
+
     def _open_ftypes():
         if filetypes_key == "xml":
             return xml_types
@@ -74,6 +84,8 @@ def _run_dialog(mode, title=None, default_name=None, filetypes_key=None):
             return doc_types
         if filetypes_key == "images":
             return image_types
+        if filetypes_key == "media":
+            return media_types
         return text_types
 
     result = ""

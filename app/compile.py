@@ -25,14 +25,24 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import core, rag, persona_store, ingest
+from . import core, rag, persona_store, ingest, logic
 from .persona import PersonaService
 
 LIBRARY = "library"
 PERSONA_KNOWLEDGE = persona_store.ST_KNOWLEDGE   # "persona_knowledge"
 PERSONA_MEMORY = persona_store.ST_MEMORY         # "persona_memory"
 
+# A chat's own corpus. Unlike libraries and personas there is no Compile button and no
+# compile gate: a conversation changes every turn, so ``sync_chat`` keeps the index fresh
+# on the send path instead, embedding only what is new or edited.
+CHAT = "chat"                    # manifest kind
+CHAT_THREAD = "chat_thread"      # source_type — the message bodies
+CHAT_ATTACH = "chat_attach"      # source_type — pinned attachments + staged <Data>
+
 _MANIFEST_LOCK = threading.RLock()
+# One lock per chat: the parallel engine can run several lanes against the same chat id,
+# and two concurrent syncs would interleave the backend's delete+insert waves.
+_CHAT_LOCKS = {}
 
 
 # --------------------------- manifest persistence ---------------------------
@@ -103,6 +113,12 @@ def forget_library(lib_id: str) -> None:
 def forget_persona(persona_id: str) -> None:
     """Drop a persona's compile manifest (called on persona delete)."""
     _drop_manifests_all_backends("persona", persona_id)
+
+
+def forget_chat(chat_id: str) -> None:
+    """Drop a chat's compile manifest (called on chat delete and RAG forget). The
+    vectors themselves go via ``rag.delete_source``."""
+    _drop_manifests_all_backends(CHAT, chat_id)
 
 
 # --------------------------- signature / fingerprints ---------------------------
@@ -265,6 +281,134 @@ def library_status(lib: dict, embed_model: str) -> dict:
     current = {iid: _content_fingerprint(content) for iid, content, _ in _library_items(lib)}
     stored_chunks = rag.count_chunks(LIBRARY, lib_id)
     return _state_from(_get_manifest(_manifest_key(LIBRARY, lib_id)), sig, current, stored_chunks)
+
+
+def _chat_lock(chat_id: str):
+    with _MANIFEST_LOCK:
+        lock = _CHAT_LOCKS.get(chat_id)
+        if lock is None:
+            lock = _CHAT_LOCKS[chat_id] = threading.RLock()
+        return lock
+
+
+def _chat_sources(scope: str) -> list:
+    """[(source_type, manifest_prefix, builder)] for the corpora a scope covers."""
+    out = []
+    if scope in ("attachments", "both"):
+        out.append((CHAT_ATTACH, "a", logic.attachment_items))
+    if scope in ("thread", "both"):
+        out.append((CHAT_THREAD, "t", logic.thread_items))
+    return out
+
+
+def chat_status(chat: dict, embed_model: str) -> dict:
+    """compiled / stale / none for a chat's RAG index. Cheap fingerprints only — never
+    embeds. Mostly for tests and diagnostics: there is no compile gate on chats, since
+    ``sync_chat`` keeps them fresh on the send path."""
+    chat_id = (chat or {}).get("id") or ""
+    scope = logic.rag_scope(chat)
+    current, stored_chunks = {}, 0
+    for source_type, prefix, build in _chat_sources(scope):
+        for item_id, content, _meta in build(chat):
+            current[f"{prefix}:{item_id}"] = _content_fingerprint(content)
+        stored_chunks += rag.count_chunks(source_type, chat_id)
+    return _state_from(_get_manifest(_manifest_key(CHAT, chat_id)),
+                       signature(embed_model), current, stored_chunks)
+
+
+def sync_chat(chat: dict, embed_fn, embed_model: str, contextualize=None,
+              force: bool = False, on_status=None, stop_event=None,
+              batch_size: int = 64, max_workers: int = 1) -> dict:
+    """Incrementally index a chat's in-scope corpora into the vector store.
+
+    The send-path counterpart to ``compile_library``. A library is compiled once by an
+    explicit button press and RAG refuses to touch it until that happens; a conversation
+    changes with every message, so the same contract would mean a Compile click per turn.
+    Freshness is maintained continuously instead, and only new or edited items are
+    embedded — an unchanged chat costs one store query per corpus and no embedding at all.
+
+    Item identity comes from ``logic.thread_items`` / ``logic.attachment_items``; see
+    those for why a raw message index is a stable key here.
+
+    Returns ``{"scope", "indexed", "skipped", "chunks", "sources"}``.
+    """
+    chat_id = (chat or {}).get("id") or ""
+    scope = logic.rag_scope(chat)
+    sources = _chat_sources(scope)
+    summary = {"scope": scope, "indexed": 0, "skipped": 0, "chunks": 0,
+               "sources": [s[0] for s in sources]}
+    if not chat_id or not sources:
+        return summary
+
+    key = _manifest_key(CHAT, chat_id)
+    sig = signature(embed_model)
+    with _chat_lock(chat_id):
+        prev = _get_manifest(key)
+        prev_items = prev.get("items") or {}
+        same_sig = prev.get("signature") == sig
+        new_items = dict(prev_items) if not force else {}
+
+        pending = []          # [(source_type, changed_items, all_ids)]
+        for source_type, prefix, build in sources:
+            items = build(chat)
+            # ONE scoped query per corpus, rather than compile_library's per-item
+            # stored_hashes call: that is N store round-trips per send on a long thread.
+            stored = {d.get("item_id") for d in rag.list_items(source_type, chat_id)}
+            changed = []
+            for item_id, content, meta in items:
+                mkey = f"{prefix}:{item_id}"
+                fp = _content_fingerprint(content)
+                if (same_sig and not force
+                        and (prev_items.get(mkey) or {}).get("fingerprint") == fp
+                        and item_id in stored):
+                    summary["skipped"] += 1
+                    continue
+                changed.append((item_id, content, meta, mkey, fp))
+            pending.append((source_type, changed, [i for i, _c, _m in items]))
+
+        if on_status is not None:
+            total_changed = sum(len(c) for _s, c, _a in pending)
+            if total_changed:
+                try:
+                    on_status(f"📚 Indexing {total_changed} new/edited item(s) "
+                              f"for retrieval…")
+                except Exception:
+                    pass
+
+        for source_type, changed, all_ids in pending:
+            if changed:
+                counts = rag.upsert_items(
+                    source_type, chat_id,
+                    [(i, c, m) for i, c, m, _k, _f in changed],
+                    embed_fn, embed_model, contextualize=contextualize,
+                    batch_size=batch_size, max_workers=max_workers,
+                    stop_event=stop_event)
+                complete = (counts.get("__meta__") or {}).get("complete") or set()
+                for item_id, _c, _m, mkey, fp in changed:
+                    if item_id in complete:
+                        # Anything that did not embed cleanly is left OUT of the
+                        # manifest, so it retries next send instead of being recorded
+                        # as done (same rule as compile_library).
+                        new_items[mkey] = {"fingerprint": fp,
+                                           "chunks": counts.get(item_id, 0)}
+                        summary["indexed"] += 1
+            # Prune against what the chat STILL has, which is what self-heals a
+            # regenerate (tail ids gone) or a cleared thread with no client cooperation.
+            rag.prune_items(source_type, chat_id, all_ids)
+            summary["chunks"] += rag.count_chunks(source_type, chat_id)
+
+        # Only the synced corpora are reconciled. A scope the user switched away from
+        # keeps its rows: they are never retrieved, and they are exactly what
+        # cached_vectors reuses if the scope is switched back.
+        live = {f"{p}:{i}" for st, p, b in sources for i, _c, _m in b(chat)}
+        stale_prefixes = tuple(f"{p}:" for _st, p, _b in sources)
+        new_items = {k: v for k, v in new_items.items()
+                     if k in live or not k.startswith(stale_prefixes)}
+
+        _put_manifest(key, {"signature": sig, "items": new_items,
+                            "chunks": summary["chunks"],
+                            "compiled_at": datetime.utcnow().isoformat()})
+    return summary
 
 
 def _persona_source_items(persona_id: str) -> list:

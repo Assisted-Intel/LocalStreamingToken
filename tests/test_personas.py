@@ -19,7 +19,8 @@ import pytest
 
 from app import core, persona as persona_mod, persona_io, persona_store, pipeline
 
-from conftest import StubAdapter, sse_frames, use_adapter
+from conftest import (StubAdapter, all_of, first, sse_frames, stub_embeddings,
+                      use_adapter)
 
 
 # --------------------------- fixtures ---------------------------
@@ -562,6 +563,114 @@ def test_rerun_of_an_unknown_run_is_a_404(client):
     r = client.post("/api/runs/nope/rerun", json={"index": 0})
     assert r.status_code == 404
     assert "run not found" in r.get_json()["error"]
+
+
+# --------------------------- RSS import into a persona ---------------------------
+
+FEED_URL = "https://feeds.test/show.xml"
+
+
+@pytest.fixture
+def rss_feed(rss_net, monkeypatch):
+    from conftest import SRT_BODY, feed_xml, podcast_item
+    # These routes ingest episodes as persona knowledge, which embeds on rag.py worker
+    # threads against a real OllamaClient — the one thing in this file that was reaching
+    # Ollama despite the module docstring above.
+    stub_embeddings(monkeypatch)
+    rss_net["routes"][FEED_URL] = feed_xml([podcast_item(i) for i in (1, 2)])
+    for i in (1, 2):
+        rss_net["routes"][f"ep{i}.srt"] = SRT_BODY.encode()
+    return rss_net
+
+
+def _persona(client):
+    return client.post("/api/personas", json={"name": "Ada"}).get_json()["persona"]["id"]
+
+
+def test_add_rss_writes_one_source_file_per_episode(client, rss_feed):
+    pid = _persona(client)
+    frames = sse_frames(client.post(f"/api/personas/{pid}/knowledge/add-rss",
+                                    json={"url": FEED_URL}))
+    assert len(all_of(frames, "document")) == 2
+    files = sorted(p.name for p in
+                   (persona_mod.personas_dir() / pid / "sources").glob("*.txt"))
+    assert len(files) == 2
+    assert all(f.startswith("test-show-") for f in files)
+    # The transcript really is in there, so it survives an export bundle.
+    body = (persona_mod.personas_dir() / pid / "sources" / files[0]).read_bytes()
+    assert body
+
+
+def test_a_second_import_replaces_rather_than_duplicates(client, rss_feed):
+    """The episode_doc_name stability guarantee. add_text keys doc_id on the filename,
+    so a drifting name would silently duplicate every episode with no bulk-delete UI."""
+    pid = _persona(client)
+    sse_frames(client.post(f"/api/personas/{pid}/knowledge/add-rss",
+                           json={"url": FEED_URL}))
+    sse_frames(client.post(f"/api/personas/{pid}/knowledge/add-rss",
+                           json={"url": FEED_URL}))
+    files = list((persona_mod.personas_dir() / pid / "sources").glob("*.txt"))
+    assert len(files) == 2
+
+
+def test_a_retitled_episode_keeps_its_document(client, rss_feed):
+    from conftest import feed_xml, podcast_item
+    pid = _persona(client)
+    sse_frames(client.post(f"/api/personas/{pid}/knowledge/add-rss",
+                           json={"url": FEED_URL, "limit": 1}))
+    rss_feed["routes"][FEED_URL] = feed_xml(
+        [podcast_item(1, title="Episode 1 (corrected)"), podcast_item(2)])
+    sse_frames(client.post(f"/api/personas/{pid}/knowledge/add-rss",
+                           json={"url": FEED_URL, "limit": 1, "refresh": True}))
+    files = list((persona_mod.personas_dir() / pid / "sources").glob("*.txt"))
+    assert len(files) == 1
+
+
+def test_add_rss_honours_the_limit(client, rss_feed):
+    pid = _persona(client)
+    frames = sse_frames(client.post(f"/api/personas/{pid}/knowledge/add-rss",
+                                    json={"url": FEED_URL, "limit": 1}))
+    assert len(all_of(frames, "document")) == 1
+
+
+def test_add_rss_404s_for_an_unknown_persona(client, rss_feed):
+    r = client.post("/api/personas/ghost/knowledge/add-rss", json={"url": FEED_URL})
+    assert r.status_code == 404
+
+
+def test_add_rss_needs_a_url(client):
+    pid = _persona(client)
+    assert client.post(f"/api/personas/{pid}/knowledge/add-rss",
+                       json={}).status_code == 400
+
+
+def test_draft_memories_returns_one_per_episode_and_saves_none(client, rss_feed):
+    """Auto-saving machine-written recollections would poison the weight-blended memory
+    retrieval for good, so the route hands them back for review."""
+    pid = _persona(client)
+    frames = sse_frames(client.post(f"/api/personas/{pid}/draft-memories-from-rss",
+                                    json={"url": FEED_URL}))
+    drafts = all_of(frames, "draft")
+    assert len(drafts) == 2
+    assert all(d["draft"]["title"] for d in drafts)
+    assert first(frames, "complete")["drafts"][0]["narrative_time"] == "2026-08-06"
+    # Nothing was written.
+    assert client.get(f"/api/personas/{pid}/memories").get_json()["memories"] == []
+
+
+def test_a_draft_falls_back_to_the_episode_title_with_no_model(client, rss_feed):
+    pid = _persona(client)
+    frames = sse_frames(client.post(f"/api/personas/{pid}/draft-memories-from-rss",
+                                    json={"url": FEED_URL, "limit": 1}))
+    draft = first(frames, "draft")["draft"]
+    assert draft["title"] == "Episode 1"
+    assert draft["emotional_weight"] == 5
+
+
+def test_draft_memories_needs_a_url(client):
+    pid = _persona(client)
+    assert client.post(f"/api/personas/{pid}/draft-memories-from-rss",
+                       json={}).status_code == 400
 
 
 # --------------------------- the chat route, end to end ---------------------------

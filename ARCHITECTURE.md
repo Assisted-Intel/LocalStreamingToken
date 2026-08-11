@@ -46,7 +46,7 @@ result. Business logic does not live in `server.py`.
 
 | File | Responsibility |
 |---|---|
-| [app/logic.py](app/logic.py) | GUI-free prompt assembly: `build_messages`, `resolve_rag`/`inject_rag`, `resolve_web_search`/`inject_research`, `inject_memory`, `resolve_attachments`/`inject_attachments`. Takes and returns plain dicts, so it's unit-testable without Flask. |
+| [app/logic.py](app/logic.py) | GUI-free prompt assembly: `build_messages`, `resolve_rag`/`inject_rag`, `resolve_web_search`/`inject_research`, `inject_memory`, `resolve_attachments`/`inject_attachments`. Also owns the per-chat **RAG scope** (`rag_scope`, `thread_items`/`attachment_items`, `rag_is_transient`) — what RAG searches besides the selected libraries. Takes and returns plain dicts, so it's unit-testable without Flask. |
 | [app/memory.py](app/memory.py) | User memory cores — what the assistant has learned about the *user*, grown from chats. The core model, the `<user_memory>` render, `resolve_memory`, and the extraction/consolidation prompts + operation applier. Storage-free. |
 | [app/providers.py](app/providers.py) | Provider adapters behind one interface. `get_client(server)` dispatches on `server["type"]`. |
 | [app/parallel.py](app/parallel.py) | Multi-server fan-out. One thread per participating server, all frames multiplexed back through a single callback. |
@@ -61,8 +61,12 @@ result. Business logic does not live in `server.py`.
 | [app/vectorstore/](app/vectorstore/) | Two interchangeable vector stores behind one interface, chosen in Settings → RAG. `lance_backend.py` — LanceDB, with a durable ANN index and a native full-text (tantivy) index; much faster, but **plaintext on disk**. `duckdb_backend.py` — the original AES-encrypted store, with an in-memory HNSW sidecar and Python BM25. `migrate.py` copies DuckDB → Lance without re-embedding; `scoring.py` holds the shared cosine/BM25/RRF helpers. |
 | [app/ingest.py](app/ingest.py) | Text extraction from PDF, EPUB, DOCX, TXT, MD. |
 | [app/images.py](app/images.py) | Image attachments: sniffing, EXIF orientation, transcoding formats no model accepts (TIFF/BMP/HEIC/…), the send-time downscale, and the per-profile image store. Bytes live in their own encrypted files rather than inside `chats.json`, which is rewritten in full on every settings keystroke. Pillow is imported lazily, so everything text-only still works without it. |
-| [app/youtube.py](app/youtube.py) | A YouTube URL → one plain-text document (transcript + comments). Server-side port of the "YT Copy All" extension. Falls through Bright Data → requests → yt-dlp **per half**: the watch page reliably yields comments, but YouTube answers server-side caption requests with an empty body unless they carry a proof-of-origin token, so the usual outcome is comments from an early rung and the transcript from yt-dlp. `fetch_playlist` enumerates a playlist via yt-dlp's flat extraction (one request, no per-video resolution) and is yt-dlp-only — there is no requests rung, because scraping the playlist page means walking continuation tokens by hand. Note `parse_video_id` ignores `list=` while `parse_playlist_id` reads only it; that asymmetry is deliberate, so a "video in a playlist" URL still means the single video. |
-| [app/compile.py](app/compile.py) | The explicit "Compile Data" pass — embeds changed chunks across the server pool, streams phase/progress frames that drive the progress bar and ETA, supports cancellation, and leaves incompletely-embedded items out of the manifest so they recompile. |
+| [app/youtube.py](app/youtube.py) | A YouTube URL → one plain-text document (transcript + comments). Server-side port of the "YT Copy All" extension. Falls through Bright Data → requests → yt-dlp **per half**: the watch page reliably yields comments, but YouTube answers server-side caption requests with an empty body unless they carry a proof-of-origin token, so the usual outcome is comments from an early rung and the transcript from yt-dlp. `fetch_playlist` enumerates a playlist via yt-dlp's flat extraction (one request, no per-video resolution) and is yt-dlp-only — there is no requests rung, because scraping the playlist page means walking continuation tokens by hand. Note `parse_video_id` ignores `list=` while `parse_playlist_id` reads only it; that asymmetry is deliberate, so a "video in a playlist" URL still means the single video. The cache seeds `fetch_video`'s working dict *before* the transport loop, which is what makes "reuse the transcript, refetch only the comments" fall out of the per-half logic that was already there rather than needing a second code path; `refresh` is read-bypass, write-through. |
+| [app/youtube_cache.py](app/youtube_cache.py) | Per-profile, **never-expiring** on-disk cache of fetched videos: one encrypted `<video_id>.json` each, holding transcript and comments as separately-provenanced halves. One file per video rather than one index, for the same reason image bytes aren't in `chats.json` — a 300KB record must not be re-encrypted in full on every write — and the video id *is* the filename, so `stats()` is a glob and nothing needs decrypting. The rendered `text` is deliberately **not** stored: it is rebuilt through `format_video_text` at read time, because `include_comments`/`max_comments` differ per caller. `comment_target` records what was *asked* for, so a thread shorter than the ask reads as covered instead of refetching forever. Nothing partial or interrupted is ever written, because with no TTL anything stored once is served indefinitely. Holds no in-memory state, which is what lets profile switching need no hook here. |
+| [app/rss.py](app/rss.py) | An RSS/Atom feed → one plain-text document per item, with first-class Podcasting 2.0 support. Two things about it are non-obvious and load-bearing. **feedparser is not used for the `podcast:*` namespace**: it collapses repeated namespaced elements to a single last-one-wins dict, so on the No Agenda feed `entry.podcast_person` returns only the second host and an episode advertising three transcript formats would keep one at random. Those elements are parsed out of the raw XML with `xml.etree` and matched on **local element name**, because the namespace URI in the wild (`github.com/Podcastindex-org/…`) is not the one the spec text gives. Feed listings are refreshed by conditional GET *plus* a content hash — many origins serve 200 with identical bytes (a weak ETag their CDN won't match, and RFC 7232 makes `If-None-Match` suppress the `If-Modified-Since` they would have honoured), so the hash is what actually skips the re-parse. Transcripts fall through **per type** (JSON → VTT → SRT → text → HTML) so a dead JSON link reaches the SRT instead of dropping into a Whisper run. An item with an audio enclosure never escalates to a page crawl; an item without one does, when its feed body is only a teaser. |
+| [app/rss_cache.py](app/rss_cache.py) | Per-profile cache of fetched feeds and episodes: `episodes/<id>.json` never expires, `feeds/<id>.json` is a listing refreshed by conditional GET. Same one-file-per-record reasoning as `youtube_cache.py`. Where YouTube has two independently-failing halves, an episode has **one half with three provenances** — `published`, `whisper`, or none — and `SOURCE_RANK` drives the whole write path: a published transcript always replaces a Whisper one, a Whisper one never replaces a published one. The single most important line is in `have()`: a cached "this episode publishes no transcript" covers a free run but **not** one with the Whisper box ticked, which is the difference between that checkbox working and silently doing nothing on a feed already imported once. |
+| [app/transcribe.py](app/transcribe.py) | Local speech-to-text (faster-whisper), and the shared cue→prose cleaner that `youtube.py` now delegates to. One model, one lock, and the lock is held across **inference**, not just the load — two concurrent runs on one card OOM, and ctranslate2 doesn't document concurrent `generate` as safe; a caller that has to wait gets a `waiting` frame rather than a silent stall. The CUDA→CPU fallback wraps the **first decode**, not the load: a ctranslate2 build older than the card reports CUDA as available, loads happily, and only then dies for want of kernels. Downloaded audio goes to a system temp file and is unlinked in a `finally`. Deliberately does **not** reset on a data-profile switch — the weights are not user data — but a *settings*-profile switch must call `reset_model()`, since the `whisper_*` keys live there. |
+| [app/compile.py](app/compile.py) | The explicit "Compile Data" pass — embeds changed chunks across the server pool, streams phase/progress frames that drive the progress bar and ETA, supports cancellation, and leaves incompletely-embedded items out of the manifest so they recompile. Also `sync_chat`, the send-path counterpart for a chat's own corpus (`chat_thread` / `chat_attach`): a conversation changes every turn, so there is no Compile button and no compile gate — freshness is kept incrementally instead, and an unchanged chat embeds nothing. |
 | [app/rewrite.py](app/rewrite.py) | Query rewriting (one message → 2–3 retrieval queries) and the ✨ Rewrite button. |
 
 ### Personas
@@ -116,7 +120,7 @@ browser (fetch / EventSource)
   → @app.route in server.py
       → login gate (before_request)
       → logic.build_messages(chat, ...)
-            ├─ resolve_rag  → rag retrieve → inject_rag
+            ├─ resolve_rag  → compile.sync_chat → rag retrieve → rag.fuse → inject_rag
             ├─ resolve_web_search → core.web_search → inject_research
             └─ memory.resolve_memory → render_core → inject_memory
       → generate_one(chat, search_query, stop_event)
@@ -128,13 +132,25 @@ browser (fetch / EventSource)
 **`generate_one`** ([app/server.py:1124](app/server.py#L1124)) is the single generation
 loop shared by the `/send` route, the batch runner, and the parallel engine. It yields
 `(kind, data)` tuples where `kind` is one of `pass_start`, `status`, `reasoning`,
-`chunk`, `image`, `pass_end`, `context`, `error`. It deliberately does *not* touch the run
+`sources`, `chunk`, `image`, `pass_end`, `context`, `error`. It deliberately does *not* touch the run
 registry or emit `start`/`done` — the caller wraps those, which is what lets the same
 loop serve one chat or sixteen parallel lanes.
 
 **`sse(event, data)`** ([app/server.py:236](app/server.py#L236)) formats one frame. Event
 names on the wire: `start`, `status`, `chunk`, `context`, `progress`, `gen_progress`,
 `model_start`, `model_done`, `row_result`, `file`, `summary`, `error`, `done`.
+
+**Source citations.** Pass 0 also emits a `sources` frame — `logic.describe_sources`
+turns the chunks RAG actually injected into rows carrying their kind, owning
+library/item, score and text. The browser renders them as a collapsible **📚 Sources**
+panel under the reasoning bubble and stores them on the assistant message, so they
+survive a reload. Clicking a row jumps to the Resources tab, selects the owning library
+and highlights the passage in that item; chat attachments open the attachment modal and
+conversation turns scroll to the bubble. Nothing records a chunk's *position* in its
+document (the chunker's offsets are discarded at index time), so `locatePassage` in
+`app.js` finds the passage by searching for the chunk text — exact first, then over a
+whitespace-collapsed copy with an index back to the original, which is what makes it
+work for the word-window chunker and the in-memory private-chat path too.
 
 **Reasoning models.** Adapters surface chain-of-thought as `("reasoning", …)` chunks
 separate from `("content", …)`. Models that inline it as `<think>…</think>` in the
@@ -175,6 +191,12 @@ issues `USE db` so existing bare-table SQL needs no changes.
 - `settings/settings.example.json` — a committed template with no real values.
 - **All exports.** A persona or library you export is a normal portable file, by design.
   Separate byte builders handle this; `persona_io` decrypts on the way out.
+- **Downloaded podcast audio**, while it is being transcribed. `transcribe.download_media`
+  streams the enclosure to a system temp file so PyAV can decode it, and unlinks it in a
+  `finally` that also covers a cancelled or failed run. It is transient by construction —
+  the transcript is the artifact, and the cache entry keeps the enclosure URL so it can
+  always be fetched again. Deliberately *not* in a data profile: putting it there would
+  drag `merge_into` and the incognito wipe into a file that exists for ninety seconds.
 
 The database connection vault (`db_vault.enc`) has its **own separate password**,
 independent of the app login.
@@ -225,6 +247,13 @@ profile has to copy the referenced files across, or every merged chat ends up po
 pictures that were wiped with the scratch. The `personas/` directory is the other case
 and predates this note.
 
+`rss_cache/` is the counter-example worth recording, because "add it everywhere `images/`
+appears" is the wrong instinct. It is a **rebuildable cache** that nothing references by
+id — a library item holds the episode's rendered text, not a pointer into the cache — so
+`merge_into()` deliberately skips it. Losing it on an incognito merge costs one refetch
+and nothing else. It still needs the two `core.py` edits, and it stays out of
+`DATA_FILE_NAMES` for the same reason `batch_projects.json` does.
+
 ---
 
 ## Conventions
@@ -240,6 +269,15 @@ and predates this note.
   the feature composes with isolate-prompts, strict mode, and the context tracker for
   free. Every injector inserts a `system` message immediately before the last user turn,
   and only on pass 0 — refinement passes rework an answer already written with them in view.
+- **A chat's own corpus is never indexed when `logic.rag_is_transient` says so.** Private
+  chats are the reason: the default LanceDB store keeps chunk text in plaintext on disk,
+  and there is no reliable "chat closed" hook to clean up after, so those chats retrieve
+  in memory instead. The same flag (`rag_ephemeral`) covers the synthetic per-item chats
+  Batch and the queue build — they carry the real chat's id with throwaway messages, so
+  indexing them would overwrite and then prune the actual conversation's index.
+- **Corpora are RRF-fused, never sorted together.** `rag.fuse` merges each corpus's
+  ranking by rank; their raw scores come from different spaces (a Lance distance, a
+  cosine, a BM25 score) and comparing them directly lets one corpus take every slot.
 - **Two things are called "batch" and they are not the same.** The chat composer's
   📂 Batch button (`POST /api/batch/start`) treats every file in a folder as a *prompt*.
   The **Batch tab** (`POST /api/batch/run`, backed by [app/batch.py](app/batch.py))

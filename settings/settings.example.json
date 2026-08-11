@@ -31,5 +31,17 @@
   "max_output_tokens": 16000,
   "rag_embed_server_url": "http://127.0.0.1:11434",
   "rag_embed_model": "nomic-embed-text",
-  "rag_top_k": 6
+  "rag_top_k": 6,
+  "rag_thread_window": 8,
+  "whisper_model": "large-v3",
+  "whisper_device": "auto",
+  "whisper_compute_type": "float16",
+  "whisper_batch_size": 8,
+  "whisper_language": "",
+  "whisper_vad": true,
+  "whisper_beam_size": 5,
+  "whisper_cpu_threads": 0,
+  "rss_notes_min_chars": 600,
+  "rss_fetch_pages": true,
+  "rss_max_episodes": 25
 }

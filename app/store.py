@@ -50,6 +50,10 @@ DEFAULT_SETTINGS = {
     "rag_embed_model": "nomic-embed-text",
     "rag_top_k": 6,                      # number of chunks retrieved and injected per send
     "rag_retrieval_mode": "hybrid",      # "vector" | "keyword" (BM25) | "hybrid" (both, RRF-merged)
+    # Thread-scope RAG only: how many trailing messages still go verbatim. Everything
+    # older is served as retrieved excerpts, which is what lets a long conversation
+    # outlive its context window instead of being truncated from the front.
+    "rag_thread_window": 8,
     # Chunking for the explicit "Compile Data" step (token-accurate, structure-aware via
     # chonkie's RecursiveChunker; falls back to word windows if chonkie is unavailable).
     "rag_chunker": "recursive",          # chunker algorithm id
@@ -94,6 +98,22 @@ DEFAULT_SETTINGS = {
     # can use. Per-chat and per-batch-project toggles override it with "full res".
     "image_max_dim": 1568,               # long-edge clamp for outgoing images (px)
     "image_full_res_default": False,     # new chats start with the full-res toggle on
+    # Local speech-to-text (faster-whisper) — see app/transcribe.py. Used when a podcast
+    # episode publishes no transcript, and for media files/URLs added directly. Changing
+    # any of these drops the loaded model so the next run picks them up (server.py).
+    "whisper_model": "large-v3",         # size name, HF repo id, or a local directory
+    "whisper_device": "auto",            # "auto" | "cuda" | "cpu"
+    "whisper_compute_type": "float16",   # coerced to int8 on CPU, which rejects float16
+    "whisper_batch_size": 8,             # BatchedInferencePipeline batch; 1 disables it
+    "whisper_language": "",              # "" = auto-detect
+    "whisper_vad": True,                 # skip silence — a large win on interview audio
+    "whisper_beam_size": 5,
+    "whisper_cpu_threads": 0,            # 0 = let ctranslate2 decide
+    # RSS / podcast ingestion — see app/rss.py.
+    "rss_notes_min_chars": 600,          # below this, a feed body counts as a teaser and
+                                         # the item's <link> page is fetched instead
+    "rss_fetch_pages": True,             # allow that escalation at all
+    "rss_max_episodes": 25,              # pre-fills the "Max episodes" field
 }
 
 DEFAULT_PRESETS = [
@@ -596,18 +616,26 @@ class Store:
 
     def delete_group(self, group_id):
         """Remove a tab and every chat that belongs to it. The built-in tab is
-        protected. Returns True if a tab was removed."""
+        protected.
+
+        Returns the list of deleted chat ids, or None if no tab was removed. It used to
+        return a bare bool, which left the caller unable to clean up what it had just
+        deleted — those chats' RAG vectors outlived them with nothing left referencing
+        them. An empty list is a successful delete of an empty tab, so callers must test
+        for None rather than falsiness."""
         with self._lock:
             if group_id == DEFAULT_GROUP_ID:
-                return False
+                return None
             before = len(self.chat_groups)
             self.chat_groups = [g for g in self.chat_groups if g.get("id") != group_id]
             if len(self.chat_groups) == before:
-                return False
+                return None
+            doomed = [c.get("id") for c in self.chats
+                      if (c.get("group_id") or DEFAULT_GROUP_ID) == group_id and c.get("id")]
             self.chats = [c for c in self.chats if (c.get("group_id") or DEFAULT_GROUP_ID) != group_id]
             self.save_chat_groups()
             self.save_chats()
-            return True
+            return doomed
 
     # ---------------- chat export / import ----------------
     # Total base64 an export will carry before it stops embedding images. An export

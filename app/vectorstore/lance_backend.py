@@ -20,9 +20,10 @@ LanceDB dependency that may be installed-but-broken, in which case
 """
 
 import threading
+from pathlib import Path
 
-from .. import core
-from . import scoring
+from .. import core, crypto
+from . import VectorStoreError, scoring
 
 # Vector width when we cannot infer one (a keyword-only index, where every chunk is
 # stored with a null vector). Matches nomic-embed-text, the default embedding model, so
@@ -34,6 +35,60 @@ _FALLBACK_DIM = 768
 _ANN_MIN_ROWS = 5000
 
 _LOCK = threading.RLock()
+
+# Lance's own IO errors, lowercased. These all mean "a file under the store is not what
+# Lance wrote", which for a rebuildable cache has exactly one answer.
+_CORRUPT_SIGNS = ("file size is too small", "not a lance file", "invalid magic",
+                  "failed to read manifest", "corrupt")
+
+
+def _encrypted_internals(root):
+    """Files under the store carrying THIS app's encryption header, or [] if none.
+
+    A one-time migration sweep used to walk the data profile and encrypt every file it
+    found, including LanceDB's internals — every file grew by the 36-byte
+    magic+nonce+tag and the store became permanently unopenable. ``app/migrate.py`` now
+    carves ``*.lance`` out (and ``tests/test_migrate.py`` pins that), but a store damaged
+    before the fix is still on disk and still fails, so detect the signature directly:
+    it identifies the cause exactly, rather than inferring it from an error string.
+    """
+    hits = []
+    try:
+        for p in root.rglob("*"):
+            if not p.is_file():
+                continue
+            try:
+                with open(p, "rb") as f:
+                    if f.read(len(crypto.MAGIC)) == crypto.MAGIC:
+                        hits.append(p)
+            except OSError:
+                continue
+    except OSError:
+        return []
+    return hits
+
+
+def _rebuild_advice(root, encrypted_count=0, detail=""):
+    if encrypted_count:
+        why = (f"was encrypted by an old data migration and can no longer be read "
+               f"({encrypted_count} file(s) affected)")
+    else:
+        why = "is damaged and can't be opened"
+    msg = (f"The vector store at {root} {why}. It is a rebuildable cache — close the "
+           f"app, delete that folder, restart, and run Compile Data again.")
+    return f"{msg} ({detail})" if detail and not encrypted_count else msg
+
+
+def _raise_if_corrupt(exc, root):
+    """Raise a legible VectorStoreError if ``exc`` means the store is unreadable.
+
+    Returns quietly otherwise, so the caller's own handling (a missing table is normal)
+    still applies. Kept separate from a blanket translate because "no such table" and
+    "this file is not what I wrote" need opposite responses."""
+    if not any(s in str(exc).lower() for s in _CORRUPT_SIGNS):
+        return
+    raise VectorStoreError(
+        _rebuild_advice(root, len(_encrypted_internals(root)), str(exc))) from exc
 
 
 def _sql_str(value) -> str:
@@ -73,9 +128,15 @@ class LanceBackend:
     # -- lifecycle ---------------------------------------------------------
     def _conn(self):
         if self._db is None:
+            root = Path(core.RAG_LANCE_DIR)
+            # Checked once per connection, not per query, and BEFORE importing lancedb:
+            # lancedb.connect() is lazy, so without this the damage only surfaces later
+            # as a Rust IO error from whatever call happens to read a manifest first.
+            bad = _encrypted_internals(root)
+            if bad:
+                raise VectorStoreError(_rebuild_advice(root, len(bad)))
             import lancedb
-            path = str(core.RAG_LANCE_DIR)
-            self._db = lancedb.connect(path)
+            self._db = lancedb.connect(str(root))
         return self._db
 
     def close(self):
@@ -137,6 +198,11 @@ class LanceBackend:
     def _existing_dims(self) -> list:
         try:
             names = self._table_names()
+        except VectorStoreError:
+            # A damaged store is not an empty one. Swallowing this here would make
+            # every read quietly return nothing and every compile look like it had
+            # simply found no data — which is how the corruption went unnoticed.
+            raise
         except Exception:
             return []
         dims = []
@@ -157,10 +223,19 @@ class LanceBackend:
             name = self._table_name(dim)
             try:
                 tbl = db.open_table(name)
-            except Exception:
+            except Exception as e:
+                # "No such table" is ordinary — nothing has been indexed at this width
+                # yet. A DAMAGED table is not, and must never fall through to
+                # create_table: that writes a fresh table over a store the user may
+                # still be able to recover, and buries the real cause.
+                _raise_if_corrupt(e, Path(core.RAG_LANCE_DIR))
                 if not create:
                     return None
-                tbl = db.create_table(name, schema=self._schema(dim))
+                try:
+                    tbl = db.create_table(name, schema=self._schema(dim))
+                except Exception as e2:
+                    _raise_if_corrupt(e2, Path(core.RAG_LANCE_DIR))
+                    raise
             self._tables[dim] = tbl
             return tbl
 

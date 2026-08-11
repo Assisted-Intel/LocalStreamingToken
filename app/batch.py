@@ -24,7 +24,7 @@ Public API:
     BatchError
     new_project(name) -> dict
     validate_project(project) -> [str]            # fail-fast errors for the route
-    resolve_sources(project, emit, should_stop) -> [item]
+    resolve_sources(project, emit, should_stop, settings) -> [item]
     render_prompt(template, item) -> str
     sanitize_filename(name) -> str
     unique_path(path) -> Path
@@ -40,7 +40,7 @@ import re
 import uuid
 from pathlib import Path
 
-from . import core, images, ingest, youtube
+from . import core, images, ingest, rss, transcribe, youtube
 
 # Item content is truncated to this many characters before it reaches the model, so a
 # 600-page PDF or a 4-hour transcript can't silently blow the context window. Mirrors
@@ -55,7 +55,7 @@ punctuation other than spaces and hyphens. Reply with the file name only.
 
 {{content}}"""
 
-SOURCE_KINDS = ("youtube", "playlist", "search", "folder", "images")
+SOURCE_KINDS = ("youtube", "playlist", "rss", "search", "folder", "media", "images")
 
 
 class BatchError(Exception):
@@ -79,6 +79,16 @@ def new_project(name="Untitled batch"):
         "sources": [],
         "yt_comments": False,
         "yt_max_comments": youtube.DEFAULT_MAX_COMMENTS,
+        # Refetch every video instead of reusing the on-disk cache. Saved with the
+        # project deliberately: "this feed changes, always pull it fresh" is a property
+        # of the project, not of the button press.
+        "yt_refresh": False,
+        # RSS / podcast sources. Deliberately NOT folded into yt_refresh: a user who
+        # always wants fresh comments does not thereby want to re-download and
+        # re-transcribe forty hours of audio.
+        "rss_whisper": False,   # transcribe episodes whose feed publishes no transcript
+        "rss_notes": True,      # include show notes / article body in the item
+        "rss_refresh": False,   # ignore the cache — the feed listing AND the episodes
         "max_item_chars": DEFAULT_MAX_ITEM_CHARS,
         # Images attached to EVERY item — a style guide, a reference chart, the
         # thing each input is being compared against. Records, not ids, so the tab
@@ -129,6 +139,16 @@ def validate_project(project):
     if not (project.get("sources") or []):
         errors.append("Add at least one input source.")
 
+    # Checked once rather than per source: failing here beats discovering it forty
+    # episodes into a run. is_available() is a find_spec, so this stays microseconds.
+    if project.get("rss_whisper") and not transcribe.is_available():
+        errors.append('"Transcribe missing episodes" is on but faster-whisper is not '
+                      "installed. Install it with:  pip install faster-whisper")
+    if (any((s.get("kind") or "") == "media" for s in (project.get("sources") or []))
+            and not transcribe.is_available()):
+        errors.append("An audio/video folder source needs faster-whisper. Install it "
+                      "with:  pip install faster-whisper")
+
     for i, src in enumerate(project.get("sources") or [], 1):
         kind = (src.get("kind") or "").strip()
         if kind not in SOURCE_KINDS:
@@ -138,9 +158,11 @@ def validate_project(project):
             errors.append(f"Source {i}: no YouTube URLs were given.")
         if kind == "playlist" and not (src.get("url") or "").strip():
             errors.append(f"Source {i}: no playlist URL was given.")
+        if kind == "rss" and not (src.get("url") or "").strip():
+            errors.append(f"Source {i}: no feed URL was given.")
         if kind == "search" and not (src.get("query") or "").strip():
             errors.append(f"Source {i}: no search query was given.")
-        if kind in ("folder", "images"):
+        if kind in ("folder", "images", "media"):
             path = (src.get("path") or "").strip()
             if not path:
                 errors.append(f"Source {i}: no folder was chosen.")
@@ -158,10 +180,12 @@ def validate_project(project):
                     "Saving next to the original files needs a name prefix or suffix, "
                     "otherwise the AI output would overwrite the files it just read.")
             kinds = {(s.get("kind") or "") for s in (project.get("sources") or [])}
-            if not kinds & {"folder", "images"}:
+            # "media" belongs here: an audio folder DOES have files on disk, so writing
+            # the transcript's answer beside the .mp3 is legitimate.
+            if not kinds & {"folder", "images", "media"}:
                 errors.append(
                     "Saving next to the original files only works for folder sources "
-                    "— YouTube, playlist and search items have no file on disk.")
+                    "— YouTube, playlist, RSS and search items have no file on disk.")
         else:
             out = (project.get("output_dir") or "").strip()
             if not out:
@@ -201,8 +225,12 @@ def _iter_folder(src, readable=None):
     )
 
 
-def resolve_sources(project, emit=None, should_stop=None):
+def resolve_sources(project, emit=None, should_stop=None, settings=None):
     """Turn a project's sources into a flat, ordered list of items.
+
+    ``settings`` is the app config, needed by the sources that read it — the RSS
+    notes/page-fetch thresholds and the whisper_* model choice. Optional so a test can
+    resolve a folder source without building one.
 
     Each item is ``{item_id, title, content, kind, source_path, source_url, chars}``,
     plus ``image_ids`` for an image source (whose ``content`` is empty — the picture
@@ -264,17 +292,82 @@ def resolve_sources(project, emit=None, should_stop=None):
                 emit("progress", {"phase": "youtube", "done": n, "total": total,
                                   "name": vid.get("title") or url})
                 try:
+                    # Cached by video id, which is what makes Preview cheap: it resolves
+                    # through this same path, so the Run that follows it reads from disk
+                    # instead of crawling the playlist a second time.
                     meta = youtube.fetch_video(
                         url,
                         include_comments=bool(project.get("yt_comments")),
                         max_comments=int(project.get("yt_max_comments")
                                          or youtube.DEFAULT_MAX_COMMENTS),
-                        should_stop=should_stop)
+                        should_stop=should_stop,
+                        refresh=bool(project.get("yt_refresh")))
                 except Exception as e:
                     errors.append(f"{url}: {e}")
                     continue
                 _add(meta.get("title") or vid.get("title") or url,
                      meta.get("text") or "", kind, source_url=meta.get("url") or url)
+
+        elif kind == "rss":
+            emit("progress", {"phase": "feed", "name": src.get("url") or "",
+                              "done": 0, "total": 0})
+            try:
+                feed = rss.fetch_feed(src.get("url") or "",
+                                      limit=int(src.get("limit") or 0),
+                                      refresh=bool(project.get("rss_refresh")),
+                                      should_stop=should_stop)
+            except Exception as e:
+                errors.append(f"Feed: {e}")
+                continue
+            errors.extend(feed.get("warnings") or [])
+            episodes = feed["items"]
+            total = len(episodes)
+            for n, ep in enumerate(episodes, 1):
+                if stopped():
+                    break
+                title = ep.get("title") or ep.get("guid") or ""
+                emit("progress", {"phase": "rss", "done": n, "total": total,
+                                  "name": title})
+                try:
+                    # Cached per episode, which is what makes Preview cheap: it resolves
+                    # through this same path, so the Run that follows reads from disk
+                    # rather than re-downloading — and, with Whisper on, rather than
+                    # re-transcribing hours of audio.
+                    meta = rss.fetch_episode(
+                        feed, ep,
+                        want_whisper=bool(project.get("rss_whisper")),
+                        include_notes=bool(project.get("rss_notes", True)),
+                        settings=settings,
+                        should_stop=should_stop,
+                        refresh=bool(project.get("rss_refresh")))
+                except Exception as e:
+                    errors.append(f"{title}: {e}")
+                    continue
+                _add(meta.get("title") or title, meta.get("text") or "", kind,
+                     source_url=meta.get("link") or meta.get("enclosure_url") or "")
+
+        elif kind == "media":
+            paths = _iter_folder(src, transcribe.SUPPORTED_EXTS)
+            total = len(paths)
+            if not total:
+                errors.append(f"No readable audio or video in {src.get('path')}")
+                continue
+            for n, p in enumerate(paths, 1):
+                if stopped():
+                    break
+                emit("progress", {"phase": "media", "done": n, "total": total,
+                                  "name": p.name})
+                try:
+                    out = transcribe.transcribe_file(p, settings=settings,
+                                                     should_stop=should_stop)
+                except Exception as e:
+                    errors.append(f"{p.name}: {e}")
+                    continue
+                # A cancelled transcription holds only the opening minutes; feeding that
+                # to the model as if it were the episode would be worse than skipping it.
+                if out.get("stopped"):
+                    break
+                _add(p.stem, out.get("text") or "", kind, source_path=str(p))
 
         elif kind == "search":
             query = (src.get("query") or "").strip()

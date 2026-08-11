@@ -12,7 +12,8 @@ import json
 import pytest
 
 from app import batch, ingest, youtube
-from tests.conftest import all_of, events, first, sse_frames, use_adapter, StubAdapter
+from tests.conftest import (all_of, events, first, sse_frames, stub_embeddings,
+                            use_adapter, StubAdapter)
 
 
 # --------------------------- render_prompt ---------------------------
@@ -285,6 +286,183 @@ def test_resolve_truncates_long_items(tmp_path):
     assert items[0]["chars"] < 200 and "truncated" in items[0]["content"]
 
 
+# --------------------------- RSS + media sources ---------------------------
+
+def test_resolve_rss_source_yields_one_item_per_episode(rss_net):
+    from conftest import SRT_BODY, feed_xml, podcast_item
+    url = "https://feeds.test/show.xml"
+    rss_net["routes"][url] = feed_xml([podcast_item(i) for i in (1, 2)])
+    for i in (1, 2):
+        rss_net["routes"][f"ep{i}.srt"] = SRT_BODY.encode()
+
+    proj = _project(sources=[{"kind": "rss", "url": url, "limit": 0}])
+    items, errors = batch.resolve_sources(proj)
+    assert [i["title"] for i in items] == ["Episode 1", "Episode 2"]
+    assert all(i["kind"] == "rss" for i in items)
+    assert items[0]["source_url"] == "https://show.test/ep1"
+    assert "Gitmo Nation" in items[0]["content"]
+    assert errors == []
+
+
+def test_resolve_rss_forwards_the_project_switches(rss_net, monkeypatch):
+    from app import rss as rss_mod
+    from conftest import feed_xml, podcast_item
+    url = "https://feeds.test/show.xml"
+    rss_net["routes"][url] = feed_xml([podcast_item(1, transcripts=())])
+    seen = {}
+    real = rss_mod.fetch_episode
+    monkeypatch.setattr(rss_mod, "fetch_episode",
+                        lambda f, i, **kw: (seen.update(kw), real(f, i, **kw))[1])
+
+    proj = _project(rss_whisper=True, rss_notes=False, rss_refresh=True,
+                    sources=[{"kind": "rss", "url": url}])
+    batch.resolve_sources(proj, settings={"whisper_model": "tiny"})
+    assert seen["want_whisper"] is True
+    assert seen["include_notes"] is False
+    assert seen["refresh"] is True
+    assert seen["settings"] == {"whisper_model": "tiny"}
+
+
+def test_resolve_rss_reports_a_dead_feed_without_aborting(rss_net):
+    from conftest import feed_xml, podcast_item
+    rss_net["routes"]["good.xml"] = feed_xml([podcast_item(1, transcripts=())])
+    rss_net["routes"]["dead.xml"] = RuntimeError("connection refused")
+    proj = _project(sources=[{"kind": "rss", "url": "https://feeds.test/dead.xml"},
+                             {"kind": "rss", "url": "https://feeds.test/good.xml"}])
+    items, errors = batch.resolve_sources(proj)
+    assert [i["title"] for i in items] == ["Episode 1"]
+    assert any("Feed:" in e for e in errors)
+
+
+def test_resolve_rss_truncates_a_long_episode(rss_net):
+    from conftest import feed_xml, podcast_item
+    url = "https://feeds.test/show.xml"
+    rss_net["routes"][url] = feed_xml([podcast_item(1)])
+    rss_net["routes"]["ep1.srt"] = "\n\n".join(
+        f"{i}\n00:00:01,000 --> 00:00:02,000\nSentence {i} of the show."
+        for i in range(2000)).encode()
+    proj = _project(max_item_chars=500, sources=[{"kind": "rss", "url": url}])
+    items, _ = batch.resolve_sources(proj)
+    assert items[0]["chars"] < 600 and "truncated" in items[0]["content"]
+
+
+def test_preview_then_run_fetches_each_episode_once(rss_net):
+    """The whole point of the cache in a batch context: Preview resolves through the
+    same path, so the Run that follows reads from disk."""
+    from conftest import SRT_BODY, feed_xml, podcast_item
+    url = "https://feeds.test/show.xml"
+    rss_net["routes"][url] = feed_xml([podcast_item(i) for i in (1, 2)])
+    for i in (1, 2):
+        rss_net["routes"][f"ep{i}.srt"] = SRT_BODY.encode()
+    proj = _project(sources=[{"kind": "rss", "url": url}])
+
+    batch.resolve_sources(proj)                     # "Preview"
+    rss_net["get"].clear()
+    items, _ = batch.resolve_sources(proj)          # "Run"
+    assert len(items) == 2
+    assert [u for u in rss_net["get"] if u.endswith(".srt")] == []
+
+
+def test_resolve_media_folder_transcribes_each_file(tmp_path, monkeypatch):
+    from app import transcribe
+    for name in ("b.mp3", "a.m4a", "notes.txt"):
+        (tmp_path / name).write_bytes(b"stub")
+    monkeypatch.setattr(transcribe, "transcribe_file",
+                        lambda p, **kw: {"text": f"transcript of {p.name}",
+                                         "stopped": False, "chars": 10})
+    proj = _project(sources=[{"kind": "media", "path": str(tmp_path)}])
+    items, errors = batch.resolve_sources(proj)
+    # Sorted, and the .txt is not a media file.
+    assert [i["title"] for i in items] == ["a", "b"]
+    assert items[0]["content"] == "transcript of a.m4a"
+    assert items[0]["source_path"].endswith("a.m4a")
+
+
+def test_a_cancelled_media_transcription_is_not_fed_to_the_model(tmp_path, monkeypatch):
+    """A stopped run holds only the opening minutes; passing that off as the episode
+    would be worse than skipping it."""
+    from app import transcribe
+    (tmp_path / "a.mp3").write_bytes(b"stub")
+    monkeypatch.setattr(transcribe, "transcribe_file",
+                        lambda p, **kw: {"text": "first ten minutes", "stopped": True})
+    proj = _project(sources=[{"kind": "media", "path": str(tmp_path)}])
+    items, _ = batch.resolve_sources(proj)
+    assert items == []
+
+
+def test_a_failing_media_file_does_not_cost_the_others(tmp_path, monkeypatch):
+    from app import transcribe
+    for name in ("a.mp3", "bad.mp3", "c.mp3"):
+        (tmp_path / name).write_bytes(b"stub")
+
+    def maybe(p, **kw):
+        if p.name == "bad.mp3":
+            raise transcribe.TranscribeError("decoder gave up")
+        return {"text": f"transcript of {p.name}", "stopped": False}
+
+    monkeypatch.setattr(transcribe, "transcribe_file", maybe)
+    proj = _project(sources=[{"kind": "media", "path": str(tmp_path)}])
+    items, errors = batch.resolve_sources(proj)
+    assert [i["title"] for i in items] == ["a", "c"]
+    assert any("bad.mp3" in e for e in errors)
+
+
+def test_an_empty_media_folder_is_reported(tmp_path):
+    (tmp_path / "notes.txt").write_text("x", encoding="utf-8")
+    proj = _project(sources=[{"kind": "media", "path": str(tmp_path)}])
+    items, errors = batch.resolve_sources(proj)
+    assert items == []
+    assert any("audio or video" in e for e in errors)
+
+
+# --------------------------- RSS + media validation ---------------------------
+
+def test_validate_rejects_an_rss_source_with_no_url():
+    proj = _project(model="m", sources=[{"kind": "rss", "url": ""}])
+    assert any("no feed URL" in e for e in batch.validate_project(proj))
+
+
+def test_validate_rejects_whisper_without_faster_whisper(monkeypatch):
+    from app import transcribe
+    monkeypatch.setattr(transcribe, "is_available", lambda: False)
+    proj = _project(model="m", rss_whisper=True,
+                    sources=[{"kind": "rss", "url": "https://f.test/x.xml"}])
+    assert any("pip install faster-whisper" in e for e in batch.validate_project(proj))
+
+
+def test_validate_accepts_whisper_when_faster_whisper_is_there(monkeypatch):
+    from app import transcribe
+    monkeypatch.setattr(transcribe, "is_available", lambda: True)
+    proj = _project(model="m", rss_whisper=True, output_mode="chat",
+                    sources=[{"kind": "rss", "url": "https://f.test/x.xml"}])
+    assert batch.validate_project(proj) == []
+
+
+def test_validate_rejects_a_media_folder_that_does_not_exist(monkeypatch):
+    from app import transcribe
+    monkeypatch.setattr(transcribe, "is_available", lambda: True)
+    proj = _project(model="m", sources=[{"kind": "media", "path": "B:/nope/nowhere"}])
+    assert any("does not exist" in e for e in batch.validate_project(proj))
+
+
+def test_beside_source_accepts_a_media_folder(tmp_path, monkeypatch):
+    """An audio folder DOES have files on disk, so writing the answer beside the .mp3
+    is legitimate — unlike an RSS episode, which has none."""
+    from app import transcribe
+    monkeypatch.setattr(transcribe, "is_available", lambda: True)
+    proj = _project(model="m", output_mode="files", export_mode="beside_source",
+                    name_suffix="-summary",
+                    sources=[{"kind": "media", "path": str(tmp_path)}])
+    assert batch.validate_project(proj) == []
+
+
+def test_beside_source_still_rejects_a_pure_rss_project():
+    proj = _project(model="m", output_mode="files", export_mode="beside_source",
+                    name_suffix="-summary",
+                    sources=[{"kind": "rss", "url": "https://f.test/x.xml"}])
+    assert any("no file on disk" in e for e in batch.validate_project(proj))
+
+
 def test_resolve_item_ids_are_unique_across_same_named_files(tmp_path):
     """Two files called report.txt in different subfolders must not collide — the
     parallel engine keys its item map on item_id."""
@@ -367,6 +545,74 @@ def test_resolve_one_bad_video_does_not_lose_the_others(monkeypatch):
     items, errors = batch.resolve_sources(proj)
     assert len(items) == 2
     assert any("no captions" in e for e in errors)
+
+
+def test_new_project_uses_the_youtube_cache_by_default():
+    assert batch.new_project()["yt_refresh"] is False
+
+
+@pytest.mark.parametrize("yt_refresh", [True, False])
+def test_resolve_passes_yt_refresh_to_fetch_video(monkeypatch, yt_refresh):
+    seen = {}
+
+    def spy(url, **kw):
+        seen.update(kw)
+        return {"url": url, "title": "V", "text": "t"}
+
+    monkeypatch.setattr(batch.youtube, "fetch_video", spy)
+    batch.resolve_sources(_project(sources=[{"kind": "youtube", "urls": "http://y/1"}],
+                                   yt_refresh=yt_refresh))
+    assert seen["refresh"] is yt_refresh
+
+
+def test_a_project_saved_before_the_cache_existed_still_resolves(monkeypatch):
+    """Batch projects load raw, with no normalisation pass — an older one simply has no
+    yt_refresh key, and must read as "use the cache" rather than blowing up."""
+    seen = {}
+    monkeypatch.setattr(batch.youtube, "fetch_video",
+                        lambda url, **kw: seen.update(kw) or {"url": url, "title": "V",
+                                                              "text": "t"})
+    proj = _project(sources=[{"kind": "youtube", "urls": "http://y/1"}])
+    proj.pop("yt_refresh", None)
+    batch.resolve_sources(proj)
+    assert seen["refresh"] is False
+
+
+def test_preview_then_run_crawls_each_video_once(youtube_net, no_ytdlp, monkeypatch):
+    """The headline benefit. Preview runs the same resolve_sources as Run, so before the
+    cache existed it downloaded every transcript and comment thread, threw the content
+    away, and the Run that followed paid for all of it again.
+
+    Deliberately does NOT monkeypatch fetch_video — the real chain has to run for the
+    cache to be exercised at all.
+    """
+    monkeypatch.setattr(batch.core, "BRIGHTDATA_TOKEN", "")
+    proj = _project(
+        sources=[{"kind": "youtube", "urls": "https://youtu.be/dQw4w9WgXcQ"}],
+        yt_comments=True, yt_max_comments=100)
+
+    preview_items, preview_errors = batch.resolve_sources(proj)     # the Preview button
+    assert preview_errors == []
+    assert "The engine turns." in preview_items[0]["content"]
+    assert youtube_net["get"], "the preview should have crawled"
+
+    youtube_net["get"].clear()
+    youtube_net["post"].clear()
+
+    run_items, run_errors = batch.resolve_sources(proj)             # …then Run
+    assert run_errors == []
+    assert run_items[0]["content"] == preview_items[0]["content"]
+    assert youtube_net["get"] == [] and youtube_net["post"] == []
+
+
+def test_yt_refresh_makes_a_rerun_crawl_again(youtube_net, no_ytdlp, monkeypatch):
+    monkeypatch.setattr(batch.core, "BRIGHTDATA_TOKEN", "")
+    proj = _project(sources=[{"kind": "youtube", "urls": "https://youtu.be/dQw4w9WgXcQ"}],
+                    yt_comments=True, yt_refresh=True)
+    batch.resolve_sources(proj)
+    youtube_net["get"].clear()
+    batch.resolve_sources(proj)
+    assert youtube_net["get"], "yt_refresh must bypass the cache"
 
 
 def test_resolve_mixes_source_kinds(tmp_path, monkeypatch):
@@ -640,6 +886,37 @@ def test_old_chat_batch_route_still_exists(client, tmp_path):
     r = client.post("/api/batch/start", json={"chat": {}, "folder": str(tmp_path)})
     # No model in the chat dict -> its own 400, proving the route still routes.
     assert r.status_code == 400
+
+
+def test_folder_batch_never_indexes_the_real_chats_corpus(client, monkeypatch, tmp_path):
+    """A folder batch builds one synthetic chat per prompt file, each carrying the REAL
+    chat's id with only that file's turns in it. Indexing those would overwrite the
+    actual conversation's RAG corpus and then prune it — once per file — so the batch
+    chats are flagged ephemeral and retrieved in memory instead."""
+    from app import compile as compile_mod
+    from app import logic
+
+    folder = tmp_path / "prompts"
+    folder.mkdir()
+    for n in range(2):
+        (folder / f"p{n}.txt").write_text(f"Prompt number {n}", encoding="utf-8")
+
+    synced = []
+    monkeypatch.setattr(compile_mod, "sync_chat",
+                        lambda chat, *a, **kw: synced.append(chat.get("id")) or {})
+    use_adapter(monkeypatch, StubAdapter(replies=["ok", "ok"]))
+    # rag_enabled below sends the route down _rag_retrieve, which embeds the query
+    # against a real OllamaClient. Stubbing sync_chat does not cover that rung.
+    stub_embeddings(monkeypatch)
+
+    chat = {"id": "realchat123", "model": "test-model", "rag_enabled": True,
+            "rag_scope": "both", "messages": []}
+    sse_frames(client.post("/api/batch/start",
+                           json={"chat": chat, "folder": str(folder)}))
+
+    assert synced == []      # the real chat's index was never written to
+    # And the flag the route sets is the one the gate actually reads.
+    assert logic.rag_is_transient(dict(chat, rag_ephemeral=True)) is True
 
 
 # --------------------------- images ---------------------------

@@ -20,6 +20,8 @@ const S = {
   runId: null,
   generating: false,
   batchRunning: false,
+  editingMessage: null, // index in S.chat.messages of the bubble open for in-place editing
+  messagesDirty: false, // a renderMessages() was deferred while that edit was open
   activeLibrary: null, // Resources tab current library
   queue: [],           // pending queued prompts: {item_id, chat, search_query, title}
   queueStop: false,    // cancel flag for the sequential queue loop
@@ -701,6 +703,8 @@ async function init() {
   } else {
     await newPrivateChat(true);
   }
+  // After the chat is loaded, so the summary reflects real values. Absent key ⇒ collapsed.
+  setThreadSettingsCollapsed(S.config.chat_settings_collapsed !== false, false);
 }
 
 // ------------------------------- servers/models ----------------------
@@ -962,6 +966,10 @@ function showChatView() {
  * Central place where chat state becomes UI state.
  */
 function loadChatObject(chat) {
+  // An open in-place edit indexes into the OUTGOING chat's message array. Switching
+  // chats invalidates that index, so drop the edit rather than let a save land on
+  // whichever message happens to sit at that position in the new chat.
+  S.editingMessage = null;
   S.chat = chat;
   // The bottom usage bar tracks the active chat: drop any other chat's stale bar.
   Object.keys(S.contextBars).forEach((k) => {
@@ -990,6 +998,9 @@ function loadChatObject(chat) {
   $("chk-rag").checked = !!chat.rag_enabled;
   $("chk-rag-auto").checked = !!chat.rag_auto;
   $("rag-threshold").value = chat.rag_threshold || 400;
+  // Chats saved before the scope control existed read as "attachments", which is what
+  // RAG has always done.
+  $("rag-scope").value = chat.rag_scope || "attachments";
   $("chk-multipass").checked = !!chat.multi_pass;
   $("mp-passes").value = chat.passes || 2;
   $("chk-mp-system").checked = chat.pass_use_system !== false;
@@ -1021,6 +1032,7 @@ function loadChatObject(chat) {
   }
   renderMessages();
   renderChatList();
+  renderThreadSettingsSummary();   // the chips follow whichever chat is now loaded
 }
 
 async function loadChat(id) {
@@ -1065,9 +1077,14 @@ async function clearMessages() {
   if (!S.chat || !S.chat.messages.length) { toast("Nothing to clear"); return; }
   if (S.generating) stopGeneration();
   if (!confirm("Clear all messages in this chat? Settings are kept.")) return;
+  S.editingMessage = null;   // the message it pointed at is about to stop existing
   S.chat.messages = [];
   renderMessages();
   await persistChat(true);
+  // The next send would prune the indexed thread anyway, but a chat that is cleared and
+  // never used again would keep its chunks forever. Fire-and-forget: nothing here should
+  // hold up the clear.
+  api(`/api/chats/${S.chat.id}/rag/forget`, { method: "DELETE" }).catch(() => {});
   toast("Messages cleared");
 }
 async function savePrivate() {
@@ -1101,6 +1118,13 @@ async function persistChat(immediate) {
  *  sizes, and it keeps the DOM a pure function of state rather than something the
  *  streaming code has to patch incrementally. */
 function renderMessages() {
+  // An open in-place edit lives ONLY in the DOM, so a rebuild would silently discard
+  // whatever the user has typed. Everything that re-renders while an edit is open is a
+  // background event (a queued item finishing, a parallel run ending), and those only
+  // ever append — so defer the rebuild instead of destroying the edit. Save and Cancel
+  // both end in another renderMessages(), which replays it.
+  if (S.editingMessage != null) { S.messagesDirty = true; return; }
+  S.messagesDirty = false;
   const box = $("messages");
   box.innerHTML = "";
   const hide = S.chat && S.chat.hide_thinking;
@@ -1110,10 +1134,16 @@ function renderMessages() {
     if (m.role === "assistant" && m.reasoning && !hide) {
       box.appendChild(makeReasoningBubble(m.reasoning, true).el);
     }
+    // The chunks RAG retrieved for this answer, under the reasoning. Not gated on
+    // `hide_thinking`: this is evidence for the answer, not the model's private
+    // deliberation, and it's the only way to check where the answer came from.
+    if (m.role === "assistant" && (m.sources || []).length) {
+      box.appendChild(makeSourcesBubble(m.sources, true).el);
+    }
     const isLastAssistant = m.role === "assistant" && i === lastAssistantIndex();
     box.appendChild(makeBubble(m.role, m.content, {
       regen: isLastAssistant, label: m.pass_label, intermediate: m.intermediate,
-      images: m.images,
+      images: m.images, index: i,
     }));
   });
   scrollBottom();
@@ -1135,6 +1165,295 @@ function makeReasoningBubble(text, collapsed) {
   el.appendChild(head); el.appendChild(body);
   return { el, body };
 }
+// How each retrieved-chunk kind reads in the panel. Keys match logic._SOURCE_KINDS.
+const SOURCE_KIND_LABEL = {
+  library: "LIBRARY", attachment: "ATTACHED", thread: "TURN",
+  persona: "PERSONA", inline: "IN-MEMORY",
+};
+/** Build the collapsible "what RAG picked" bubble shown under the reasoning. Each row
+ *  names the document the excerpt came from and, where that document still exists in
+ *  this browser's state, links to the exact passage inside it. */
+function makeSourcesBubble(sources, collapsed) {
+  const list = sources || [];
+  const el = document.createElement("div");
+  el.className = "sources-bubble" + (collapsed ? " collapsed" : "");
+  const head = document.createElement("div");
+  head.className = "sources-head";
+  const caret = document.createElement("span");
+  caret.className = "sources-caret"; caret.textContent = "▸";
+  head.appendChild(caret);
+  const title = document.createElement("span");
+  title.className = "sources-title";
+  head.appendChild(title);
+  head.onclick = () => el.classList.toggle("collapsed");
+  const body = document.createElement("div");
+  body.className = "sources-body";
+  el.appendChild(head); el.appendChild(body);
+  const bubble = { el, body, sources: [] };
+  bubble.set = (next) => {
+    bubble.sources = next || [];
+    title.textContent = ` 📚 Sources (${bubble.sources.length})`;
+    body.innerHTML = "";
+    bubble.sources.forEach((src, i) => body.appendChild(makeSourceRow(src, i + 1)));
+  };
+  bubble.set(list);
+  return bubble;
+}
+/** One row of the Sources panel: [n] label · kind · score, then the excerpt itself. */
+function makeSourceRow(src, n) {
+  const row = document.createElement("div");
+  row.className = "source-row";
+  const line = document.createElement("div");
+  line.className = "source-line";
+
+  const target = sourceTarget(src);
+  const name = document.createElement(target ? "button" : "span");
+  name.className = "source-link" + (target ? "" : " dead");
+  name.textContent = `[${n}] ${src.label || "excerpt"}`;
+  if (target) {
+    name.type = "button";
+    name.title = target.kind === "library"
+      ? `Open in Resources → ${src.library_name || "library"}`
+      : (target.kind === "message" ? "Jump to that turn" : "View the source text");
+    name.onclick = () => openSource(src);
+  } else {
+    name.title = src.kind === "inline"
+      ? "Private chat — retrieved in memory, nothing was indexed to link to"
+      : "The source document is no longer available in this chat";
+  }
+  line.appendChild(name);
+
+  const kind = document.createElement("span");
+  kind.className = "source-kind " + (src.kind || "inline");
+  kind.textContent = SOURCE_KIND_LABEL[src.kind] || String(src.kind || "").toUpperCase();
+  line.appendChild(kind);
+  if (src.kind === "library" && src.library_name) {
+    const lib = document.createElement("span");
+    lib.className = "source-lib"; lib.textContent = src.library_name;
+    line.appendChild(lib);
+  }
+  if (typeof src.score === "number") {
+    const score = document.createElement("span");
+    score.className = "source-score"; score.textContent = src.score.toFixed(3);
+    score.title = "Retrieval score";
+    line.appendChild(score);
+  }
+  row.appendChild(line);
+
+  const ex = document.createElement("div");
+  ex.className = "source-excerpt clamped";
+  ex.textContent = src.content || "";
+  ex.title = "Click to expand";
+  ex.onclick = () => ex.classList.toggle("clamped");
+  row.appendChild(ex);
+  return row;
+}
+
+// --------------------------- source navigation ---------------------------
+// Nothing in the vector store records WHERE a chunk sits in its document — the chunker's
+// offsets are discarded at index time (see app/rag.py chunk_text_semantic). So a source
+// link resolves its passage the other way round: find the chunk text inside the document
+// the browser already holds. That works retroactively for everything already compiled.
+
+/** Resolve a source row to something on screen, or null if it can't be reached. */
+function sourceTarget(src) {
+  if (!src) return null;
+  if (src.kind === "library") {
+    const lib = S.libraries.find((l) => l.id === src.library_id);
+    const item = lib && (lib.items || []).find((it) => it.id === src.item_id);
+    return item ? { kind: "library", lib, item } : null;
+  }
+  if (src.kind === "attachment") {
+    // A `data:N` id is an inline <Data> block living in turn N of the (non-intermediate)
+    // message list, not a chip — it resolves to the message that carries it.
+    const m = /^data:(\d+)$/.exec(src.item_id || "");
+    if (m) {
+      const index = rawMessageIndex(parseInt(m[1], 10));
+      return index >= 0 ? { kind: "message", index } : null;
+    }
+    const att = (S.chat?.attachments || []).find((a) => a.id === src.item_id);
+    if (att) return { kind: "attachment", item: att, pinned: true };
+    const staged = S.dataItems.find((d) => d.id === src.item_id);
+    return staged ? { kind: "attachment", item: staged, pinned: false } : null;
+  }
+  if (src.kind === "thread") {
+    const i = src.message_index;
+    const msgs = (S.chat && S.chat.messages) || [];
+    return (Number.isInteger(i) && i >= 0 && i < msgs.length)
+      ? { kind: "message", index: i } : null;
+  }
+  return null;
+}
+/** Map an index over the non-intermediate messages (what logic.attachment_items counts)
+ *  back to an index over the raw S.chat.messages array. -1 when it doesn't exist. */
+function rawMessageIndex(filteredIndex) {
+  const msgs = (S.chat && S.chat.messages) || [];
+  let n = 0;
+  for (let i = 0; i < msgs.length; i++) {
+    if (msgs[i].intermediate) continue;
+    if (n === filteredIndex) return i;
+    n++;
+  }
+  return -1;
+}
+
+/** Go to where a retrieved chunk came from and highlight the passage itself. */
+async function openSource(src) {
+  const target = sourceTarget(src);
+  if (!target) { toast("That source is no longer available"); return; }
+  if (target.kind === "library") {
+    // A debounced edit must land first: switching libraries below would otherwise write
+    // the pending text into whichever library the editor moves to.
+    await flushLibrarySave();
+    switchTab("resources");
+    if (!S.activeLibrary || S.activeLibrary.id !== target.lib.id) {
+      await selectLibrary(target.lib.id);
+      $("lib-list").value = target.lib.id;
+    }
+    const wrap = $("lib-items").querySelector(`.lib-item[data-item-id="${cssEscape(src.item_id)}"]`);
+    if (!wrap) { toast("That item is no longer in the library"); return; }
+    wrap.scrollIntoView({ block: "center", behavior: "smooth" });
+    flashElement(wrap);
+    selectInTextarea(wrap.querySelector("textarea"), src.content);
+    return;
+  }
+  if (target.kind === "attachment") {
+    showAttachment(target.item, target.pinned);
+    selectInTextarea($("attachment-text"), src.content);
+    return;
+  }
+  // A conversation turn: scroll its bubble into view and mark the passage inside it.
+  switchTab("chat");
+  const bubble = $("messages").querySelector(`.bubble[data-msg-index="${target.index}"]`);
+  if (!bubble) { toast("That turn is no longer on screen"); return; }
+  bubble.scrollIntoView({ block: "center", behavior: "smooth" });
+  flashElement(bubble);
+  markPassage(bubble._body || bubble.querySelector(".body"), src.content);
+}
+
+/** Select `chunkText` inside a textarea and scroll it into view. */
+function selectInTextarea(ta, chunkText) {
+  if (!ta) return;
+  const hit = locatePassage(ta.value, chunkText);
+  if (!hit) { toast("Couldn't pinpoint that passage — it may have been edited since"); return; }
+  ta.focus();
+  ta.setSelectionRange(hit.start, hit.end);
+  scrollTextareaTo(ta, hit.start);
+}
+
+/** Wrap `chunkText` in a <mark> inside a plain-text element. Purely visual and undone by
+ *  the next renderMessages(), which rebuilds bubbles from state. */
+function markPassage(el, chunkText) {
+  if (!el) return;
+  const text = el.textContent || "";
+  const hit = locatePassage(text, chunkText);
+  if (!hit) return;
+  const mark = document.createElement("mark");
+  mark.className = "source-mark";
+  mark.textContent = text.slice(hit.start, hit.end);
+  el.textContent = "";
+  el.appendChild(document.createTextNode(text.slice(0, hit.start)));
+  el.appendChild(mark);
+  el.appendChild(document.createTextNode(text.slice(hit.end)));
+  mark.scrollIntoView({ block: "center", behavior: "smooth" });
+}
+
+function flashElement(el) {
+  if (!el) return;
+  el.classList.remove("source-flash");
+  void el.offsetWidth;            // restart the animation if it's already running
+  el.classList.add("source-flash");
+  setTimeout(() => el.classList.remove("source-flash"), 1600);
+}
+
+function cssEscape(s) {
+  return (window.CSS && CSS.escape) ? CSS.escape(String(s)) : String(s).replace(/["\\]/g, "\\$&");
+}
+
+// Whitespace-collapsed views of recently searched documents. Small and bounded: a pinned
+// YouTube transcript can be 200k characters and a user clicks several of its chunks.
+const _normDocCache = new Map();
+const _NORM_CACHE_MAX = 4;
+const WHITESPACE = /\s/;
+
+/** Collapse runs of whitespace to a single space, keeping an index back to the original
+ *  string so a match in the normalized text maps to a real character range. */
+function normalizedDoc(text) {
+  // Length plus both ends: cheap, and enough to notice the library textarea being
+  // edited between two clicks — a stale map would point into the text as it was.
+  const key = text.length + "\u0000" + text.slice(0, 64) + text.slice(-32);
+  const hit = _normDocCache.get(key);
+  if (hit) return hit;
+  const map = new Int32Array(text.length);
+  const chars = [];
+  let n = 0, pendingSpace = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (WHITESPACE.test(c)) {
+      pendingSpace = n > 0;      // never lead with a space
+      continue;
+    }
+    if (pendingSpace) { chars.push(" "); map[n++] = i; pendingSpace = false; }
+    chars.push(c); map[n++] = i;
+  }
+  const out = { norm: chars.join(""), map: map.subarray(0, n) };
+  _normDocCache.set(key, out);
+  while (_normDocCache.size > _NORM_CACHE_MAX) {
+    _normDocCache.delete(_normDocCache.keys().next().value);
+  }
+  return out;
+}
+
+/**
+ * Find a retrieved chunk inside its source document.
+ * @returns {{start:number,end:number}|null} a range in `docText`, or null if not found.
+ *
+ * Chunks from the semantic chunker are verbatim substrings, so the exact search almost
+ * always wins. The fallback word-window chunker (and the private-chat in-memory path)
+ * rejoin words with single spaces, which is why the whitespace-collapsed search exists.
+ * A head-only match is the last resort: it still lands the user on the right paragraph.
+ */
+function locatePassage(docText, chunkText) {
+  const doc = docText || "";
+  const chunk = (chunkText || "").trim();
+  if (!doc || !chunk) return null;
+  const exact = doc.indexOf(chunk);
+  if (exact >= 0) return { start: exact, end: exact + chunk.length };
+
+  const { norm, map } = normalizedDoc(doc);
+  const needle = chunk.replace(/\s+/g, " ").trim();
+  let at = norm.indexOf(needle), len = needle.length;
+  if (at < 0) {
+    const head = needle.slice(0, 40);
+    if (head.length < 12) return null;
+    at = norm.indexOf(head); len = head.length;
+    if (at < 0) return null;
+  }
+  return { start: map[at], end: map[at + len - 1] + 1 };
+}
+
+/** Scroll a textarea so that character `index` sits mid-view. setSelectionRange alone
+ *  doesn't reliably scroll, so measure a hidden mirror laid out the same way. */
+function scrollTextareaTo(ta, index) {
+  try {
+    const cs = getComputedStyle(ta);
+    const mirror = document.createElement("div");
+    const s = mirror.style;
+    ["fontFamily", "fontSize", "fontWeight", "fontStyle", "letterSpacing", "lineHeight",
+     "textTransform", "wordSpacing", "textIndent", "paddingTop", "paddingBottom",
+     "paddingLeft", "paddingRight"].forEach((p) => { s[p] = cs[p]; });
+    s.position = "absolute"; s.top = "0"; s.left = "-9999px";
+    s.visibility = "hidden"; s.whiteSpace = "pre-wrap"; s.overflowWrap = "break-word";
+    // clientWidth is content + padding for either box-sizing, so pin border-box.
+    s.boxSizing = "border-box"; s.width = ta.clientWidth + "px";
+    mirror.textContent = ta.value.slice(0, index) + "\u200b";
+    document.body.appendChild(mirror);
+    const y = mirror.scrollHeight;
+    document.body.removeChild(mirror);
+    ta.scrollTop = Math.max(0, y - ta.clientHeight / 2);
+  } catch (e) { /* best effort — the selection is set either way */ }
+}
+
 function lastAssistantIndex() {
   const msgs = S.chat ? S.chat.messages : [];
   for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].role === "assistant") return i;
@@ -1145,7 +1464,9 @@ function lastAssistantIndex() {
  * @param {string} role      "user" | "assistant"
  * @param {string} content   message text
  * @param {object} opts      `streaming: true` leaves the body open for token appends;
- *                           the returned element exposes `_body` for that purpose
+ *                           the returned element exposes `_body` for that purpose.
+ *                           `index` is the message's position in S.chat.messages and
+ *                           is what makes the bubble editable — see below.
  * @returns {HTMLElement}
  */
 function makeBubble(role, content, opts = {}) {
@@ -1170,6 +1491,19 @@ function makeBubble(role, content, opts = {}) {
   copy.className = "small"; copy.textContent = "Copy";
   copy.onclick = () => { navigator.clipboard.writeText(body.textContent); toast("Copied"); };
   actions.appendChild(copy);
+  // Only a bubble that KNOWS its index in S.chat.messages can be edited — renderMessages
+  // skips non-user/assistant roles, so DOM position is not the array index. Streaming and
+  // parallel-lane bubbles are deliberately passed none: they are views of an in-flight run,
+  // not of stored state, and the re-render when the run ends gives them the button.
+  if (opts.index != null && !opts.streaming) {
+    // Also what a Sources link scrolls to when a chunk came from an earlier turn.
+    b.dataset.msgIndex = String(opts.index);
+    const edit = document.createElement("button");
+    edit.className = "small btn-edit"; edit.textContent = "Edit";
+    edit.title = "Edit this message — nothing regenerates";
+    edit.onclick = () => beginEditMessage(b, opts.index);
+    actions.appendChild(edit);
+  }
   if (opts.regen && !opts.streaming) actions.appendChild(makeRegenControls());
   b.appendChild(actions);
   b._body = body;
@@ -1206,6 +1540,80 @@ function makeRegenControls() {
   wrap.appendChild(sel); wrap.appendChild(btn);
   return wrap;
 }
+
+// --------------------------- editing a message ---------------------------
+// Editing an assistant answer is the cheapest steering tool the app has: the client
+// owns the message array and re-posts it whole on every send, so a corrected answer
+// simply becomes what the model sees next turn. No server route is involved.
+
+/** Swap a bubble's body for a textarea, in place. Deliberately leaves the reasoning
+ *  bubble (a separate element rendered before this one) and the image strip alone —
+ *  an edit is about the text. */
+function beginEditMessage(bubble, index) {
+  if (S.generating || S.batchRunning) { toast("Wait for the answer to finish"); return; }
+  if (S.editingMessage != null) { toast("Finish the open edit first"); return; }
+  const msg = S.chat && S.chat.messages[index];
+  if (!msg) return;
+  S.editingMessage = index;
+  bubble.classList.add("editing");
+
+  const ta = document.createElement("textarea");
+  ta.className = "bubble-edit";
+  ta.value = msg.content || "";
+  const row = document.createElement("div");
+  row.className = "bubble-edit-actions";
+  const save = document.createElement("button");
+  save.className = "small primary"; save.textContent = "Save";
+  save.onclick = () => saveEditMessage(index, ta.value);
+  const cancel = document.createElement("button");
+  cancel.className = "small ghost"; cancel.textContent = "Cancel";
+  cancel.onclick = cancelEditMessage;
+  const hint = document.createElement("span");
+  hint.className = "muted"; hint.textContent = "Ctrl+Enter saves · Esc cancels";
+  row.appendChild(save); row.appendChild(cancel); row.appendChild(hint);
+
+  // Open the textarea at the height the text already occupied, so saving a one-line
+  // fix to a long answer doesn't collapse the thread under the cursor.
+  const wanted = bubble._body.scrollHeight;
+  bubble._body.classList.add("hidden");
+  bubble.insertBefore(ta, bubble._images);
+  bubble.insertBefore(row, bubble._images);
+  ta.style.height = Math.max(90, wanted + 12) + "px";
+  ta.focus();
+  ta.setSelectionRange(ta.value.length, ta.value.length);
+  ta.onkeydown = (e) => {
+    if (e.key === "Escape") { e.preventDefault(); cancelEditMessage(); }
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); saveEditMessage(index, ta.value); }
+  };
+}
+
+/** Replace the text and nothing else. Later messages are untouched and nothing
+ *  regenerates — the edit simply becomes what the model sees on the next send. */
+function saveEditMessage(index, text) {
+  const msg = S.chat && S.chat.messages[index];
+  S.editingMessage = null;
+  if (!msg) { renderMessages(); return; }
+  msg.content = text;          // reasoning / images / pass_label left exactly as they were
+  persistChat(true);
+  renderMessages();
+  warnIfEditIgnoredByIsolation(index);
+  toast("Message updated");
+}
+
+function cancelEditMessage() { S.editingMessage = null; renderMessages(); }
+
+/** Isolation sends ONLY the last user turn (app/logic.py build_messages), so an edit to
+ *  an assistant message — or to any but the final user message — will never reach the
+ *  model while this chat is isolated. Say so rather than let the edit look broken. */
+function warnIfEditIgnoredByIsolation(index) {
+  if (!S.chat || !S.chat.isolated) return;
+  let lastUser = -1;
+  S.chat.messages.forEach((m, i) => { if (m.role === "user") lastUser = i; });
+  if (index !== lastUser) {
+    toast("This chat is isolated — only the last message is sent, so this edit won't reach the model.", 7000);
+  }
+}
+
 function scrollBottom() { const box = $("messages"); box.scrollTop = box.scrollHeight; }
 // True when the view is already pinned near the bottom. Used to decide whether a
 // streaming update should auto-follow — if the user has scrolled up, we leave the
@@ -1238,11 +1646,74 @@ function setupMessagesResizer() {
   handle.addEventListener("dblclick", () => { box.style.flex = ""; box.style.height = ""; });
 }
 
+// --------------------------- thread settings -------------------------
+// The system prompt, pre-prompt and options row collapse into a one-line summary so the
+// thread gets the vertical space. The state is a global preference, not per-chat.
+
+/** Show or hide the settings region. `persist` saves the choice for every chat. */
+function setThreadSettingsCollapsed(collapsed, persist) {
+  const panel = $("thread-settings"), bar = $("thread-settings-bar");
+  if (!panel || !bar) return;
+  panel.classList.toggle("collapsed", collapsed);
+  bar.classList.toggle("open", !collapsed);
+  $("btn-thread-settings").setAttribute("aria-expanded", String(!collapsed));
+  renderThreadSettingsSummary();
+  // A dragged #messages is pinned to an explicit height (setupMessagesResizer), so without
+  // this the space the collapse frees would never reach the thread. Same reset as dblclick.
+  const box = $("messages");
+  if (box) { box.style.flex = ""; box.style.height = ""; }
+  if (!persist) return;
+  S.config.chat_settings_collapsed = collapsed;
+  // Fire-and-forget: /api/settings patches only the keys it is sent.
+  api("/api/settings", { method: "POST", body: { chat_settings_collapsed: collapsed } })
+    .then((r) => { S.config = { ...S.config, ...r.config }; })
+    .catch(() => {});
+}
+
+/** Rebuild the collapsed summary: the context size, plus a chip per option that is on. */
+function renderThreadSettingsSummary() {
+  const el = $("thread-settings-summary");
+  if (!el) return;
+  const chips = [];
+  if ($("system-on").checked && $("system-prompt").value.trim()) chips.push("System ✓");
+  if ($("pre-on").checked && $("pre-prompt").value.trim()) chips.push("Pre ✓");
+  const ctx = $("ctx-select").selectedOptions[0];
+  if (ctx) chips.push(ctx.textContent.trim());
+  const flags = [
+    ["chk-isolate", "Isolated"], ["chk-hide-thinking", "Hide thinking"],
+    ["chk-multipass", "🔁 Multi-Pass"], ["chk-websearch", "🌐 Web"],
+    ["chk-rag", "📚 RAG"], ["chk-parallel", "⚡ Parallel"],
+    ["chk-persona", "🎭 Persona"], ["chk-memory", "🧠 Memory"],
+  ];
+  for (const [id, label] of flags) if ($(id).checked) chips.push(label);
+  el.textContent = "";
+  for (const c of chips) {
+    const s = document.createElement("span");
+    s.className = "ts-chip"; s.textContent = c;
+    el.appendChild(s);
+  }
+}
+
+/** One delegated listener keeps the chips fresh without touching the ~20 existing
+ *  per-control handlers inside the region. */
+function wireThreadSettings() {
+  const panel = $("thread-settings");
+  if (!panel) return;
+  panel.addEventListener("change", renderThreadSettingsSummary);
+  panel.addEventListener("input", renderThreadSettingsSummary);
+  $("btn-thread-settings").onclick = () =>
+    setThreadSettingsCollapsed(!panel.classList.contains("collapsed"), true);
+  $("thread-settings-summary").onclick = () => setThreadSettingsCollapsed(false, true);
+}
+
 // ------------------------------- generation --------------------------
 /** Flip the UI between idle and generating: swap Send for Stop and disable the
  *  controls that must not change mid-run. */
 function setGeneratingUI(on) {
   S.generating = on;
+  // Greys out the per-message Edit buttons (Copy stays live). beginEditMessage guards
+  // this too, because S.batchRunning is set outside this function.
+  $("messages").classList.toggle("generating", on);
   $("btn-send").classList.toggle("hidden", on);
   $("btn-batch").classList.toggle("hidden", on);
   $("btn-stop").classList.toggle("hidden", !on);
@@ -1437,11 +1908,23 @@ function toggleComposerAdd(force) {
 function showComposerPanel(which) {
   $("add-url-panel").classList.toggle("hidden", which !== "url");
   $("add-yt-panel").classList.toggle("hidden", which !== "youtube");
+  $("add-rss-panel").classList.toggle("hidden", which !== "rss");
   $("add-search-panel").classList.toggle("hidden", which !== "search");
   if (which === "url") { $("add-url-input").value = ""; $("add-url-input").focus(); }
+  if (which === "rss") {
+    $("add-rss-input").value = "";
+    $("add-rss-limit").value = String(S.config.rss_max_episodes ?? 25);
+    const p = $("add-rss-progress"); p.classList.add("hidden"); p.textContent = "";
+    // The Whisper box is only offerable if faster-whisper is actually importable.
+    refreshWhisperStatus();
+    $("add-rss-input").focus();
+  }
   if (which === "youtube") {
     $("add-yt-input").value = "";
+    $("add-yt-limit").value = "0";
+    $("add-yt-kind-video").checked = true;
     const p = $("add-yt-progress"); p.classList.add("hidden"); p.textContent = "";
+    updateYouTubePanelKind();
     $("add-yt-input").focus();
   }
   if (which === "search") {
@@ -1453,7 +1936,22 @@ function showComposerPanel(which) {
 function hideComposerPanels() {
   $("add-url-panel").classList.add("hidden");
   $("add-yt-panel").classList.add("hidden");
+  $("add-rss-panel").classList.add("hidden");
   $("add-search-panel").classList.add("hidden");
+}
+
+/** Reveal the playlist affordances the URL actually calls for: the ambiguity radio only
+ *  when both a video id and a list id parse, Max-videos only when a playlist is what
+ *  will be fetched. Also relabels the button, so it says what it is about to do. */
+function updateYouTubePanelKind() {
+  const kind = ytKindOf($("add-yt-input").value);
+  $("add-yt-choice").classList.toggle("hidden", kind !== "both");
+  const asPlaylist = composerYouTubeIsPlaylist(kind);
+  $("add-yt-limit-wrap").classList.toggle("hidden", !asPlaylist);
+  $("btn-add-yt-fetch").textContent = asPlaylist ? "Fetch playlist" : "Fetch";
+}
+function composerYouTubeIsPlaylist(kind) {
+  return kind === "playlist" || (kind === "both" && $("add-yt-kind-playlist").checked);
 }
 
 /** Stage fetched content as a one-shot chip. Labels come from the source's own title
@@ -1679,16 +2177,31 @@ async function composerAddFiles() {
 }
 
 let composerYtES = null;
+let composerYtRunId = null;
+
+/** Dispatch a composer YouTube fetch. A `list=` id means the playlist route, whose
+ *  result is one staged chip per video rather than one blob. */
 function composerAddYouTube() {
   const url = $("add-yt-input").value.trim();
   if (!url) { toast("Enter a YouTube URL"); return; }
-  const comments = $("add-yt-comments").checked;
-  const max = Math.max(5, Math.min(2000, parseInt($("add-yt-max").value, 10) || 100));
+  const opts = {
+    url,
+    comments: $("add-yt-comments").checked,
+    max: Math.max(5, Math.min(2000, parseInt($("add-yt-max").value, 10) || 100)),
+    refresh: $("add-yt-refresh").checked,
+  };
+  return composerYouTubeIsPlaylist(ytKindOf(url))
+    ? composerAddYouTubePlaylist(opts)
+    : composerAddYouTubeVideo(opts);
+}
+
+function composerAddYouTubeVideo(opts) {
   const prog = $("add-yt-progress");
   prog.classList.remove("hidden"); prog.textContent = "Starting…";
   const btn = $("btn-add-yt-fetch"); btn.disabled = true;
-  if (composerYtES) { composerYtES.close(); composerYtES = null; }
-  composerYtES = youtubeStream("/api/youtube/fetch", { url, comments, max }, {
+  cancelComposerYouTube(true);
+  composerYtES = sourceStream("/api/youtube/fetch", opts, {
+    started: (id) => { composerYtRunId = id; },
     progress: (d) => { prog.textContent = ytProgressText(d); },
     complete: (d) => {
       stageSource("youtube", d.title, d.text, d.url);
@@ -1698,8 +2211,221 @@ function composerAddYouTube() {
       hideComposerPanels();
     },
     failed: (msg) => { toast("YouTube fetch failed: " + msg); prog.textContent = "Failed."; },
-    finally: () => { btn.disabled = false; composerYtES = null; },
+    finally: () => { btn.disabled = false; composerYtES = null; composerYtRunId = null; },
   });
+}
+
+/** Stream a whole playlist into the composer, staging ONE chip per video as each
+ *  arrives — so a 40-video playlist is watchable and interruptible rather than a long
+ *  spinner ending in a single undivisible blob. */
+function composerAddYouTubePlaylist(opts) {
+  opts.limit = Math.max(0, parseInt($("add-yt-limit").value, 10) || 0);
+  const prog = $("add-yt-progress");
+  prog.classList.remove("hidden"); prog.textContent = "Reading the playlist…";
+  const btn = $("btn-add-yt-fetch"); btn.disabled = true;
+  cancelComposerYouTube(true);
+  let staged = 0, total = 0, chars = 0;
+  composerYtES = sourceStream("/api/youtube/fetch-playlist", opts, {
+    started: (id) => { composerYtRunId = id; },
+    playlist: (d) => {
+      total = d.total || 0;
+      prog.textContent = `Playlist: ${total} video(s) — fetching…`;
+      // Enumerating is one cheap request; fetching them is not. Say so before the user
+      // walks away, and point at the exit.
+      if (total > 25) toast(`${total} videos queued — press Cancel to stop early.`, 6000);
+    },
+    progress: (d) => { prog.textContent = ytProgressText(d); },
+    video: (d) => {
+      stageSource("youtube", d.title, d.text, d.url);
+      staged++; chars += (d.text || "").length;
+      prog.textContent = `Fetched ${staged}/${total} — ${d.title}`;
+    },
+    video_error: (d) => { toast(`Skipped ${d.title}: ${d.message}`, 5000); },
+    complete: (d) => {
+      prog.textContent = `Attached ${staged} of ${d.total} video(s).`;
+      // The character count matters: every chip lands in the next send's data block.
+      toast(`Attached ${staged} video(s)` + (d.failed ? `, ${d.failed} skipped` : "") +
+            ` — ~${Math.round(chars / 1000)}k characters`, 6000);
+      if (staged) hideComposerPanels();
+    },
+    failed: (msg) => { toast("Playlist fetch failed: " + msg); prog.textContent = "Failed."; },
+    finally: () => { btn.disabled = false; composerYtES = null; composerYtRunId = null; },
+  });
+}
+
+/** Abort an in-flight composer fetch. Cancel used to only hide the panel, which was
+ *  survivable for one video and is not for a playlist: the worker kept fetching and kept
+ *  pushing chips into a chat the user had walked away from. `quiet` reuses this to tear
+ *  down a previous stream before starting a new one. */
+function cancelComposerYouTube(quiet) {
+  const runId = composerYtRunId;
+  if (composerYtES) { composerYtES.close(); composerYtES = null; }
+  composerYtRunId = null;
+  if (runId) api("/api/stop", { method: "POST", body: { run_id: runId } }).catch(() => {});
+  $("btn-add-yt-fetch").disabled = false;
+  if (!quiet) hideComposerPanels();
+}
+
+// ---- RSS / podcast (composer) ----
+
+let composerRssES = null;
+let composerRssRunId = null;
+
+/** Fetch a feed and stage one chip per episode, as each lands. */
+function composerAddRss() {
+  const url = $("add-rss-input").value.trim();
+  if (!url) { toast("Enter a feed URL"); return; }
+  const opts = {
+    url,
+    limit: Math.max(0, Math.min(500, parseInt($("add-rss-limit").value, 10) || 0)),
+    notes: $("add-rss-notes").checked,
+    whisper: $("add-rss-whisper").checked,
+    refresh: $("add-rss-refresh").checked,
+  };
+  const prog = $("add-rss-progress");
+  prog.classList.remove("hidden"); prog.textContent = "Reading the feed…";
+  const btn = $("btn-add-rss-fetch"); btn.disabled = true;
+  // Tear down any previous stream first — otherwise a re-click leaves the old worker
+  // running and it keeps pushing chips into the chat. Same rule as the YouTube panel.
+  cancelComposerRss(true);
+  let staged = 0;
+  composerRssES = sourceStream("/api/rss/fetch-feed", opts, {
+    started: (id) => { composerRssRunId = id; },
+    feed: (d) => {
+      prog.textContent = `${d.title || "Feed"} — ${d.total} episode(s)` +
+                         (d.total_available > d.total ? ` of ${d.total_available}` : "");
+      if (d.total > 25) toast(`${d.total} episodes — that's a lot of context`, 6000);
+    },
+    warning: (d) => { toast(d.message, 8000); },
+    progress: (d) => { prog.textContent = rssProgressText(d); },
+    episode: (d) => {
+      stageSource("rss", d.title, d.text, d.url);
+      staged++;
+      if (d.truncated) {
+        toast(`${d.title}: truncated at ${d.text.length.toLocaleString()} of ` +
+              `${d.full_chars.toLocaleString()} characters`, 7000);
+      }
+    },
+    episode_error: (d) => { toast(`${d.title}: ${d.message}`, 6000); },
+    complete: (d) => {
+      toast(`Attached ${staged} episode(s)` + (d.failed ? ` — ${d.failed} failed` : ""));
+      if ((d.errors || []).length) toast("Notes: " + d.errors.join("; "), 8000);
+      hideComposerPanels();
+    },
+    failed: (msg) => { toast("Feed fetch failed: " + msg, 8000); prog.textContent = "Failed."; },
+    finally: () => { btn.disabled = false; composerRssES = null; composerRssRunId = null; },
+  });
+}
+
+/** Abort an in-flight feed fetch. `quiet` reuses this to tear down a previous stream
+ *  before starting a new one, without also closing the panel. */
+function cancelComposerRss(quiet) {
+  const runId = composerRssRunId;
+  if (composerRssES) { composerRssES.close(); composerRssES = null; }
+  composerRssRunId = null;
+  // Closing the socket alone leaves the worker downloading — and, with Whisper on,
+  // holding the GPU. Ask it to stop outright.
+  if (runId) api("/api/stop", { method: "POST", body: { run_id: runId } }).catch(() => {});
+  $("btn-add-rss-fetch").disabled = false;
+  if (!quiet) hideComposerPanels();
+}
+
+/** Render an RSS progress frame. Separate from ytProgressText rather than one function
+ *  with twelve branches: the two vocabularies barely overlap. */
+function rssProgressText(d) {
+  const head = d.count > 1 && d.index ? `${d.index}/${d.count} — ${d.name || ""}` : "";
+  let phase = "Working…";
+  if (d.phase === "feed") {
+    phase = d.total !== undefined
+      ? `${d.total} episode(s)${d.from_cache ? " (feed unchanged)" : ""}`
+      : "Reading the feed…";
+  } else if (d.phase === "cache") {
+    phase = d.need_transcript ? "From cache — fetching the transcript…"
+                              : `From cache${d.source ? ` (${d.source})` : ""}`;
+  } else if (d.phase === "page") {
+    phase = "Fetching the article page…";
+  } else if (d.phase === "transcript") {
+    phase = d.chars
+      ? `Transcript: ${d.chars.toLocaleString()} characters` +
+        (d.speakers ? ", with speakers" : "")
+      : "No published transcript";
+  } else if (d.phase === "download" || d.phase === "whisper") {
+    // The slow phases share their formatter with the media-file path.
+    phase = mediaProgressText({ ...d, count: 0, name: "" });
+  }
+  return head ? `${head} · ${phase}` : phase;
+}
+
+// ---- local transcription (composer) ----
+
+/** Render a transcription progress frame. Whisper is the slow one, so it gets a real
+ *  ETA rather than a spinner: a three-hour episode is minutes of GPU even when it goes
+ *  well, and a silent bar reads as a hang. */
+function mediaProgressText(d) {
+  // `count` is the number of FILES; `total` on a whisper/download frame is seconds or
+  // bytes. Conflating them is how the bar ends up reading "3/60 files".
+  const head = d.count > 1 && d.index ? `${d.index}/${d.count} — ${d.name || ""}` : (d.name || "");
+  let phase = d.message || "Working…";
+  if (d.phase === "download") {
+    const mb = (n) => (n / 1048576).toFixed(1) + " MB";
+    phase = d.total ? `Downloading ${mb(d.done)} of ${mb(d.total)}…` : `Downloading ${mb(d.done)}…`;
+  } else if (d.phase === "whisper") {
+    if (d.waiting) phase = d.message || "Waiting for the transcriber…";
+    else if (d.fallback) phase = d.message || "Falling back to the CPU…";
+    else if (d.total) {
+      const pct = Math.min(100, Math.round((d.done / d.total) * 100));
+      phase = `Transcribing ${fmtClock(d.done)} of ${fmtClock(d.total)} (${pct}%)` +
+              (d.device ? ` on ${d.device}` : "");
+    } else if (d.message) phase = d.message;
+    else phase = "Transcribing…";
+  }
+  return head ? `${head} · ${phase}` : phase;
+}
+
+function fmtClock(seconds) {
+  const s = Math.max(0, Math.round(seconds || 0));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return (h ? `${h}:${String(m).padStart(2, "0")}` : `${m}`) + `:${String(s % 60).padStart(2, "0")}`;
+}
+
+let composerMediaES = null;
+let composerMediaRunId = null;
+
+/** Pick audio/video files and stage each transcript as a chat attachment.
+ *  POST rather than GET, because the native picker runs on the request thread before the
+ *  stream opens — so this uses streamSSE, not sourceStream (which is EventSource/GET). */
+async function composerAddMediaFiles() {
+  const prog = $("add-media-progress");
+  prog.classList.remove("hidden"); prog.textContent = "Waiting for file selection…";
+  const btn = $("btn-add-media"); btn.disabled = true;
+  try {
+    await streamSSE("/api/transcribe/files", {}, {
+      start: (d) => { composerMediaRunId = d.run_id || null; },
+      begin: (d) => {
+        prog.textContent = d.total ? `Transcribing ${d.total} file(s)…` : "Nothing selected.";
+      },
+      progress: (d) => { prog.textContent = mediaProgressText(d); },
+      file: (d) => {
+        stageSource("audio", d.name, d.text, d.source);
+        prog.textContent = `${d.name}: ${d.chars.toLocaleString()} characters` +
+                           (d.fallback ? " (CPU fallback)" : "");
+      },
+      file_error: (d) => { toast(`${d.name}: ${d.message}`, 6000); },
+      complete: (d) => {
+        const n = (d.results || []).length;
+        if (n) toast(`Attached ${n} transcript(s)`);
+        if ((d.errors || []).length) toast("Some files failed: " + d.errors.join("; "), 6000);
+        prog.classList.add("hidden");
+        hideComposerPanels();
+      },
+      error: (d) => { toast("Transcription failed: " + d.message, 8000); prog.textContent = "Failed."; },
+      done: () => { btn.disabled = false; composerMediaRunId = null; },
+    });
+  } catch (e) {
+    toast("Transcription failed: " + e.message);
+    prog.textContent = "Failed.";
+    btn.disabled = false;
+  }
 }
 
 let composerSearchES = null;
@@ -1848,6 +2574,7 @@ function syncSettingsFromUI() {
   c.rag_enabled = $("chk-rag").checked;
   c.rag_auto = $("chk-rag-auto").checked;
   c.rag_threshold = Math.max(1, parseInt($("rag-threshold").value) || 400);
+  c.rag_scope = $("rag-scope").value || "attachments";
   c.multi_pass = $("chk-multipass").checked;
   c.passes = Math.max(1, parseInt($("mp-passes").value) || 2);
   c.pass_use_system = $("chk-mp-system").checked;
@@ -2236,6 +2963,8 @@ async function saveMemory() {
     closeModal();
     if (S.editingPersona && S.editingPersona.id === _memPersonaId && $("tab-personas").classList.contains("active"))
       renderPersonaMemories();
+    // Walk an RSS drafting queue one save at a time. No-op when there isn't one.
+    openNextMemoryDraft();
   } catch (e) { toast("Save failed: " + e.message); }
 }
 
@@ -2514,6 +3243,57 @@ async function addPersonaKbFiles() {
     });
   } catch (e) { toast("Add failed: " + e.message); }
 }
+/** Import a feed's episodes as persona knowledge documents.
+ *  POST + streamSSE (not sourceStream) because the body carries the options. */
+async function addPersonaKbRss() {
+  const url = $("pe-rss-input").value.trim();
+  if (!url) { toast("Enter a feed URL"); return; }
+  const pid = S.editingPersona.id;
+  const body = {
+    url,
+    limit: Math.max(0, Math.min(500, parseInt($("pe-rss-limit").value, 10) || 0)),
+    whisper: $("pe-rss-whisper").checked,
+  };
+  const prog = $("pe-rss-progress");
+  prog.classList.remove("hidden"); prog.textContent = "Reading the feed…";
+  const btn = $("btn-pe-rss-fetch"); btn.disabled = true;
+  let n = 0;
+  try {
+    await streamSSE(`/api/personas/${pid}/knowledge/add-rss`, body, {
+      start: (d) => { _peRssRunId = d.run_id || ""; },
+      feed: (d) => { prog.textContent = `${d.title || "Feed"} — ${d.total} episode(s)`; },
+      warning: (d) => { toast(d.message, 8000); },
+      progress: (d) => { prog.textContent = rssProgressText(d); },
+      document: (d) => { n++; prog.textContent = `${d.title || d.name}: ${d.chunks} chunk(s)`; },
+      episode_error: (d) => { toast(`${d.title}: ${d.message}`, 6000); },
+      complete: (r) => {
+        toast(`Imported ${n} episode(s) as knowledge documents.`);
+        if ((r.errors || []).length) toast("Notes: " + r.errors.join("; "), 8000);
+        prog.classList.add("hidden");
+        $("pe-rss-panel").classList.add("hidden");
+        renderPersonaKb(); renderEmbedBanner();
+        refreshCompileStatus("persona", pid, $("pe-compile-badge"));
+      },
+      error: (d) => { toast("Import failed: " + d.message, 8000); prog.textContent = "Failed."; },
+      done: () => { btn.disabled = false; _peRssRunId = ""; },
+    });
+  } catch (e) {
+    toast("Import failed: " + e.message);
+    prog.textContent = "Failed.";
+    btn.disabled = false;
+  }
+}
+
+let _peRssRunId = "";
+
+function cancelPersonaKbRss() {
+  if (_peRssRunId) {
+    api("/api/stop", { method: "POST", body: { run_id: _peRssRunId } }).catch(() => {});
+  }
+  $("pe-rss-panel").classList.add("hidden");
+  $("btn-pe-rss-fetch").disabled = false;
+}
+
 function renderEmbedBanner() {
   const b = $("pe-embed-banner");
   const used = S.editingPersona.stores.embedding_model_used;
@@ -2546,6 +3326,76 @@ function addPersonaMemoryUI() {
   _memPersonaId = S.editingPersona.id;
   $("mem-title").value = ""; $("mem-desc").value = ""; $("mem-weight").value = 5; $("mem-tags").value = "";
   openModal("modal-memory");
+}
+
+let _peMemRssRunId = "";
+let _peMemDrafts = [];
+
+/** Draft memories from a feed's episodes and queue them for review.
+ *  Nothing is saved here: the drafts are opened one at a time in the existing memory
+ *  editor, so every one is a deliberate human save. Auto-saving a few hundred
+ *  machine-written recollections would skew the weight-blended retrieval permanently. */
+async function draftMemoriesFromRss() {
+  const url = $("pe-mem-rss-input").value.trim();
+  if (!url) { toast("Enter a feed URL"); return; }
+  const pid = S.editingPersona.id;
+  const body = {
+    url,
+    limit: Math.max(1, Math.min(50, parseInt($("pe-mem-rss-limit").value, 10) || 3)),
+    server_url: currentServerUrl(),
+    model: getSelectedModel(),
+  };
+  const prog = $("pe-mem-rss-progress");
+  prog.classList.remove("hidden"); prog.textContent = "Reading the feed…";
+  const btn = $("btn-pe-mem-rss-go"); btn.disabled = true;
+  _peMemDrafts = [];
+  try {
+    await streamSSE(`/api/personas/${pid}/draft-memories-from-rss`, body, {
+      start: (d) => { _peMemRssRunId = d.run_id || ""; },
+      feed: (d) => { prog.textContent = `${d.title || "Feed"} — drafting ${d.total}…`; },
+      progress: (d) => { prog.textContent = rssProgressText(d); },
+      draft: (d) => {
+        _peMemDrafts.push(d.draft);
+        prog.textContent = `Drafted ${_peMemDrafts.length}: ${d.episode}`;
+      },
+      episode_error: (d) => { toast(`${d.title}: ${d.message}`, 6000); },
+      complete: () => {
+        prog.classList.add("hidden");
+        $("pe-mem-rss-panel").classList.add("hidden");
+        if (!_peMemDrafts.length) { toast("No drafts were produced."); return; }
+        toast(`${_peMemDrafts.length} draft(s) — review and save each one`, 6000);
+        openNextMemoryDraft();
+      },
+      error: (d) => { toast("Drafting failed: " + d.message, 8000); prog.textContent = "Failed."; },
+      done: () => { btn.disabled = false; _peMemRssRunId = ""; },
+    });
+  } catch (e) {
+    toast("Drafting failed: " + e.message);
+    prog.textContent = "Failed.";
+    btn.disabled = false;
+  }
+}
+
+/** Load the next queued draft into the existing memory editor. Closing it without
+ *  saving simply drops that draft — which is the intended escape hatch. */
+function openNextMemoryDraft() {
+  const d = _peMemDrafts.shift();
+  if (!d) return;
+  _memPersonaId = S.editingPersona.id;
+  $("mem-title").value = d.title || "";
+  $("mem-desc").value = d.description || "";
+  $("mem-weight").value = d.emotional_weight ?? 5;
+  $("mem-tags").value = (d.tags || []).join(", ");
+  openModal("modal-memory");
+  if (_peMemDrafts.length) toast(`${_peMemDrafts.length} more draft(s) after this`, 4000);
+}
+
+function cancelDraftMemoriesFromRss() {
+  if (_peMemRssRunId) {
+    api("/api/stop", { method: "POST", body: { run_id: _peMemRssRunId } }).catch(() => {});
+  }
+  $("pe-mem-rss-panel").classList.add("hidden");
+  $("btn-pe-mem-rss-go").disabled = false;
 }
 
 // ---- Test run ----
@@ -2586,6 +3436,15 @@ function bindPersonaEditorEvents() {
     toast("Default pipeline restored (save to keep).");
   };
   $("btn-pe-kb-add").onclick = addPersonaKbFiles;
+  $("btn-pe-kb-rss").onclick = () => {
+    const panel = $("pe-rss-panel");
+    panel.classList.remove("hidden");
+    $("pe-rss-limit").value = String(S.config.rss_max_episodes ?? 25);
+    refreshWhisperStatus();
+    $("pe-rss-input").focus();
+  };
+  $("btn-pe-rss-fetch").onclick = addPersonaKbRss;
+  $("btn-pe-rss-cancel").onclick = cancelPersonaKbRss;
   $("btn-pe-compile").onclick = async () => {
     if (!S.editingPersona) { toast("Open a persona first"); return; }
     await runCompile("persona", S.editingPersona.id, { force: $("pe-compile-force").checked },
@@ -2593,6 +3452,12 @@ function bindPersonaEditorEvents() {
     renderPersonaKb(); renderEmbedBanner();
   };
   $("btn-pe-mem-add").onclick = addPersonaMemoryUI;
+  $("btn-pe-mem-rss").onclick = () => {
+    $("pe-mem-rss-panel").classList.remove("hidden");
+    $("pe-mem-rss-input").focus();
+  };
+  $("btn-pe-mem-rss-go").onclick = draftMemoriesFromRss;
+  $("btn-pe-mem-rss-cancel").onclick = cancelDraftMemoriesFromRss;
   $("btn-pe-test").onclick = runPersonaTest;
   $("btn-persona-export-xml").onclick = () => window.open(`/api/personas/${S.editingPersona.id}/export.xml`, "_blank");
   $("btn-persona-export-bundle").onclick = () => window.open(`/api/personas/${S.editingPersona.id}/export.zip`, "_blank");
@@ -2620,9 +3485,12 @@ async function runGeneration(searchQuery, opts = {}) {
   const sendChat = opts.sendChat || S.chat;
   // Pass-driven: one answer (+optional reasoning) bubble per pass. A single-pass
   // generation is just one unlabeled pass.
-  let bubble = null, reasonBubble = null;
+  let bubble = null, reasonBubble = null, sourceBubble = null;
   let curContent = "", curReason = "", curLabel = "", curIntermediate = false;
   let curImages = [];
+  // The retrieved chunks arrive once, during pass 0, and describe every pass — so unlike
+  // the per-pass state above they are NOT cleared by finalizePass.
+  let curSources = [];
   let errored = false;
 
   function finalizePass() {
@@ -2631,11 +3499,14 @@ async function runGeneration(searchQuery, opts = {}) {
     if (!errored) {
       const msg = { role: "assistant", content: curContent };
       if (curReason) msg.reasoning = curReason;
+      // Multi-Pass reuses one retrieval for every round, so the panel belongs to the
+      // answer the user keeps rather than being repeated above each intermediate pass.
+      if (curSources.length && !curIntermediate) msg.sources = curSources;
       if (curImages.length) msg.images = curImages;
       if (curLabel) { msg.pass_label = curLabel; msg.intermediate = curIntermediate; }
       S.chat.messages.push(msg);
     }
-    bubble = null; reasonBubble = null;
+    bubble = null; reasonBubble = null; sourceBubble = null;
     curContent = ""; curReason = ""; curLabel = ""; curIntermediate = false;
     curImages = [];
   }
@@ -2672,6 +3543,20 @@ async function runGeneration(searchQuery, opts = {}) {
         $("messages").insertBefore(reasonBubble.el, bubble);
       }
       curReason += d.content; reasonBubble.body.textContent = curReason;
+      if (follow) scrollBottom();
+    },
+    // What RAG retrieved for this turn — shown under the reasoning, collapsed, so the
+    // panel doesn't push the answer off screen while it streams.
+    sources: (d) => {
+      curSources = d.items || [];
+      if (!bubble || !curSources.length) return;
+      const follow = isNearBottom($("messages"));
+      if (!sourceBubble) {
+        sourceBubble = makeSourcesBubble(curSources, true);
+        $("messages").insertBefore(sourceBubble.el, bubble);
+      } else {
+        sourceBubble.set(curSources);
+      }
       if (follow) scrollBottom();
     },
     chunk: (d) => {
@@ -2804,6 +3689,10 @@ function buildChatSnapshot(text, model, images) {
     // be in view for every prompt run from it, queued and batched ones included.
     attachments: (src.attachments || []).slice(),
     image_full_res: !!src.image_full_res,
+    // This snapshot gets a throwaway id and a single synthetic turn, so indexing its
+    // corpus would leave one orphaned scope per queued prompt that nothing ever deletes.
+    // Retrieval still works — it just happens in memory for these.
+    rag_ephemeral: true,
     messages: [{ role: "user", content: text,
                  ...((images || []).length ? { images: images } : {}) }],
   };
@@ -2944,6 +3833,8 @@ async function runParallel(path, body, opts = {}) {
       L.head.classList.add("busy"); L.head.classList.remove("idle");
       L.body.innerHTML = ""; L.titleEl.textContent = d.title || "";
       L.curBubble = null; L.curContent = ""; L.curReason = ""; L.reasonBubble = null;
+      // Cleared per ITEM, not per pass: one retrieval serves every pass of an item.
+      L.sourceBubble = null;
     },
     status: (d) => { const L = lanes[d.lane]; if (L && L.curBubble) L.curBubble._body.textContent = d.message; },
     context: (d) => upsertContextBar(d),
@@ -2959,6 +3850,12 @@ async function runParallel(path, body, opts = {}) {
       const L = lanes[d.lane]; if (!L || !L.curBubble) return;
       if (!L.reasonBubble) { L.reasonBubble = makeReasoningBubble("", false); L.body.insertBefore(L.reasonBubble.el, L.curBubble); }
       L.curReason += d.content; L.reasonBubble.body.textContent = L.curReason; laneScroll(L);
+    },
+    sources: (d) => {
+      const L = lanes[d.lane]; if (!L || !L.curBubble || !(d.items || []).length) return;
+      if (!L.sourceBubble) { L.sourceBubble = makeSourcesBubble(d.items, true); L.body.insertBefore(L.sourceBubble.el, L.curBubble); }
+      else L.sourceBubble.set(d.items);
+      laneScroll(L);
     },
     chunk: (d) => {
       const L = lanes[d.lane]; if (!L || !L.curBubble) return;
@@ -3010,6 +3907,7 @@ function appendQueuedResultToChat(item, frame) {
   S.chat.messages.push({ role: "user", content: item.chat.messages[0].content });
   const asst = { role: "assistant", content: frame.content || "" };
   if (frame.reasoning) asst.reasoning = frame.reasoning;
+  if ((frame.sources || []).length) asst.sources = frame.sources;
   S.chat.messages.push(asst);
   persistChat(true);
 }
@@ -4138,9 +5036,131 @@ function renderSettings() {
   $("set-rewrite-model").value = S.config.rewrite_model || "";
   $("set-mem-influence").value = S.config.memory_weight_influence ?? 0.35;
   $("set-pipeline-retries").value = S.config.pipeline_max_retries ?? 3;
+  $("set-whisper-model").value = S.config.whisper_model || "large-v3";
+  $("set-whisper-device").value = S.config.whisper_device || "auto";
+  $("set-whisper-compute").value = S.config.whisper_compute_type || "float16";
+  $("set-whisper-batch").value = S.config.whisper_batch_size ?? 8;
+  $("set-whisper-lang").value = S.config.whisper_language || "";
+  $("set-whisper-vad").checked = S.config.whisper_vad !== false;
   renderServerRows();
   renderParallelServers();
+  refreshYouTubeCacheStats();
+  refreshRssCacheStats();
+  refreshWhisperStatus();
 }
+
+/** Size the on-disk YouTube cache for the Settings card. Cheap — the route stats file
+ *  sizes without decrypting anything. */
+async function refreshYouTubeCacheStats() {
+  const el = $("yt-cache-stats");
+  if (!el) return;
+  try {
+    const r = await api("/api/youtube/cache");
+    const mb = (r.bytes || 0) / (1024 * 1024);
+    el.textContent = r.entries
+      ? `${r.entries} video(s) cached · ${mb < 0.1 ? "<0.1" : mb.toFixed(1)} MB`
+      : "Nothing cached yet.";
+  } catch (e) { el.textContent = "—"; }
+}
+async function clearYouTubeCache() {
+  if (!(await confirmModal("Clear every cached YouTube transcript and comment set for this data profile?"))) return;
+  try {
+    const r = await api("/api/youtube/cache", { method: "DELETE" });
+    toast(`Cleared ${r.removed} cached video(s)`);
+  } catch (e) { toast("Clear failed: " + e.message); }
+  refreshYouTubeCacheStats();
+}
+
+/** Size the on-disk RSS cache for the Settings card. Unlike the YouTube one this does
+ *  decrypt each episode, to count the locally transcribed ones — see clearRssCache. */
+async function refreshRssCacheStats() {
+  const el = $("rss-cache-stats");
+  if (!el) return;
+  try {
+    const r = await api("/api/rss/cache");
+    const mb = (r.bytes || 0) / (1024 * 1024);
+    if (!r.episodes && !r.feeds) { el.textContent = "Nothing cached yet."; return; }
+    el.textContent = `${r.episodes} episode(s), ${r.feeds} feed listing(s) · ` +
+      `${mb < 0.1 ? "<0.1" : mb.toFixed(1)} MB` +
+      (r.transcribed ? ` · ${r.transcribed} transcribed locally` : "");
+  } catch (e) { el.textContent = "—"; }
+}
+
+/** Clear part of the RSS cache. The destructive variant names the cost: a locally
+ *  transcribed episode is GPU-minutes that clearing throws away for good. */
+async function clearRssCache(what) {
+  let msg = "Re-read every feed listing on the next import? Cached episodes are kept.";
+  if (what !== "feeds") {
+    let extra = "";
+    try {
+      const s = await api("/api/rss/cache");
+      extra = s.transcribed
+        ? `\n\n${s.transcribed} of them were transcribed locally — those took minutes of ` +
+          "GPU time each and will have to be redone."
+        : "";
+    } catch (e) {}
+    msg = "Clear every cached podcast episode for this data profile?" + extra;
+  }
+  if (!(await confirmModal(msg))) return;
+  try {
+    const qs = what ? `?what=${encodeURIComponent(what)}` : "";
+    const r = await api(`/api/rss/cache${qs}`, { method: "DELETE" });
+    toast(`Cleared ${r.removed} cached record(s)`);
+  } catch (e) { toast("Clear failed: " + e.message); }
+  refreshRssCacheStats();
+}
+
+/** Report whether local transcription is usable, and on what. Loads no model — this is
+ *  the same probe the RSS panels use to decide whether to offer the Whisper checkbox. */
+async function refreshWhisperStatus() {
+  const el = $("whisper-status");
+  if (!el) return;
+  try {
+    const s = await api("/api/transcribe/status");
+    S.whisper = s;
+    if (!s.available) {
+      el.textContent = "faster-whisper is not installed — pip install faster-whisper";
+    } else if (s.loaded) {
+      el.textContent = `Loaded: ${s.model} on ${s.device} (${s.compute_type})`;
+    } else if (s.cuda_error) {
+      // The sm_120 case: CUDA looked available, then the first decode had no kernels.
+      el.textContent = "Ready (CPU only — the GPU couldn't run the model: " +
+                       s.cuda_error.slice(0, 90) + ")";
+    } else {
+      el.textContent = s.cuda_usable ? "Ready — GPU available, no model loaded"
+                                     : "Ready — CPU only, no model loaded";
+    }
+    updateWhisperOffers();
+  } catch (e) { el.textContent = "—"; }
+}
+
+/** Enable or disable every "transcribe missing episodes" affordance from the last known
+ *  probe. Ticking a box that cannot possibly work is worse than not offering it. */
+function updateWhisperOffers() {
+  const ok = !!(S.whisper && S.whisper.available);
+  ["add-rss-whisper", "lib-rss-whisper", "batch-rss-whisper"].forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    el.disabled = !ok;
+    if (!ok) el.checked = false;
+    const label = el.closest("label");
+    if (label) {
+      label.title = ok
+        ? "Download the audio and transcribe it locally. Slow — minutes per episode."
+        : "Needs faster-whisper:  pip install faster-whisper";
+      label.classList.toggle("disabled", !ok);
+    }
+  });
+}
+
+async function resetWhisperModel() {
+  try {
+    await api("/api/transcribe/reset", { method: "POST" });
+    toast("Speech model unloaded");
+  } catch (e) { toast("Unload failed: " + e.message); }
+  refreshWhisperStatus();
+}
+
 function presetForServer(s) {
   const base = (s.base_url || "").replace(/\/+$/, "");
   let p = S.providerPresets.find((x) => (x.base_url || "").replace(/\/+$/, "") === base && base);
@@ -4300,10 +5320,19 @@ async function saveGeneral() {
     pipeline_max_retries: parseInt($("set-pipeline-retries").value) || 3,
     image_max_dim: parseInt($("set-image-max-dim").value) || 1568,
     image_full_res_default: $("set-image-full-res").checked,
+    whisper_model: $("set-whisper-model").value.trim() || "large-v3",
+    whisper_device: $("set-whisper-device").value,
+    whisper_compute_type: $("set-whisper-compute").value,
+    whisper_batch_size: parseInt($("set-whisper-batch").value) || 8,
+    whisper_language: $("set-whisper-lang").value.trim(),
+    whisper_vad: $("set-whisper-vad").checked,
   };
   const r = await api("/api/settings", { method: "POST", body });
   S.config = { ...S.config, ...r.config };
   updateImageResButton();   // its tooltip quotes the cap that just changed
+  // Saving a whisper_* key drops the loaded model server-side, so the card's "Loaded:"
+  // line is now stale — and a device change may have re-enabled the GPU.
+  refreshWhisperStatus();
   toast("Settings saved");
 }
 async function scanRange() {
@@ -4592,9 +5621,10 @@ async function saveLibrarySelection() {
 // matching `.tag.<kind>` colour in styles.css.
 // "image" is chat-only: the Resources tab can't create one, because a library item
 // is text to be chunked and retrieved, which an image is not.
-const SOURCE_KINDS = ["write", "file", "url", "youtube", "search", "image"];
+const SOURCE_KINDS = ["write", "file", "url", "youtube", "rss", "audio", "search", "image"];
 // Kinds whose `filename` (library) / `source` (attachment) holds a clickable URL.
-const LINKED_KINDS = ["url", "youtube", "search"];
+// "audio" is out: its filename is a local path, and linking one would be a dead <a>.
+const LINKED_KINDS = ["url", "youtube", "rss", "search"];
 
 function renderLibraryList() {
   const sel = $("lib-list");
@@ -4633,6 +5663,9 @@ function renderLibraryEditor() {
 function makeLibItem(it, idx) {
   const wrap = document.createElement("div");
   wrap.className = "lib-item";
+  // Keyed by the item's STABLE id, not its position: a Sources link has to find this
+  // item after other items have been removed above it.
+  if (it.id) wrap.dataset.itemId = it.id;
   const head = document.createElement("div");
   head.className = "item-head";
   const tag = document.createElement("span");
@@ -4790,12 +5823,25 @@ async function addTextFiles() {
 function showLibPanel(which) {
   $("lib-url-panel").classList.toggle("hidden", which !== "url");
   $("lib-yt-panel").classList.toggle("hidden", which !== "youtube");
+  // The RSS panel was populated below but never un-hidden, so "Add RSS / Podcast" hid
+  // every panel and showed nothing.
+  $("lib-rss-panel").classList.toggle("hidden", which !== "rss");
   $("lib-search-panel").classList.toggle("hidden", which !== "search");
   if (which === "url") { $("lib-url-input").value = ""; $("lib-url-input").focus(); }
   if (which === "youtube") {
     $("lib-yt-input").value = "";
+    $("lib-yt-limit").value = "0";
+    $("lib-yt-kind-video").checked = true;
     const prog = $("lib-yt-progress"); prog.classList.add("hidden"); prog.textContent = "";
+    updateLibraryYouTubePanelKind();
     $("lib-yt-input").focus();
+  }
+  if (which === "rss") {
+    $("lib-rss-input").value = "";
+    $("lib-rss-limit").value = String(S.config.rss_max_episodes ?? 25);
+    const prog = $("lib-rss-progress"); prog.classList.add("hidden"); prog.textContent = "";
+    refreshWhisperStatus();
+    $("lib-rss-input").focus();
   }
   if (which === "search") {
     $("lib-search-query").value = ""; $("lib-search-sites").value = "";
@@ -4806,6 +5852,7 @@ function showLibPanel(which) {
 function hideLibPanels() {
   $("lib-url-panel").classList.add("hidden");
   $("lib-yt-panel").classList.add("hidden");
+  $("lib-rss-panel").classList.add("hidden");
   $("lib-search-panel").classList.add("hidden");
 }
 async function addByUrl() {
@@ -4832,23 +5879,103 @@ async function addByUrl() {
 // ---- YouTube ----
 // Both the Resources tab and the composer stream the same fetch, so the wire
 // handling lives here once and the callers only decide what to do with the result.
-function ytProgressText(d) {
-  if (d.phase === "page") return `Fetching the video page${d.via ? " via " + d.via : ""}…`;
-  if (d.phase === "transcript") {
-    return d.chars ? `Transcript: ${d.chars.toLocaleString()} characters` : "No transcript found";
-  }
-  if (d.phase === "comments") return `Comments: ${d.done}/${d.target}…`;
-  return "Working…";
+
+// Deliberate ports of youtube.parse_video_id / parse_playlist_id, kept in sync by hand.
+// Duplicated rather than served by a route because the composer panel reacts per
+// keystroke to reveal a field, and a round trip per keystroke for a regex is not worth
+// it. It is safe because the JS answer only chooses WHICH ROUTE TO CALL — both routes
+// re-parse server-side and reject a mismatch, and the Python version is the tested one.
+// Don't let this grow features the Python side lacks.
+const YT_VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
+const YT_PLAYLIST_ID = /^(?:PL|UU|UL|OL|RD|FL|LL)[A-Za-z0-9_-]{10,}$/;   // WL excluded: needs owner cookies
+const YT_PATH_FORMS = ["/shorts/", "/live/", "/embed/", "/v/"];
+const YT_HOSTS = ["youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be",
+                  "youtube-nocookie.com", "www.youtube.com", "www.youtube-nocookie.com"];
+
+function ytUrlOf(raw) {
+  const s = (raw || "").trim();
+  if (!s) return null;
+  try { return new URL(/^https?:\/\//i.test(s) ? s : "https://" + s); }
+  catch (e) { return null; }
 }
-/** Open the YouTube SSE stream. `path` is the route, `opts` the query params.
- *  Returns the EventSource so the caller can close it. */
-function youtubeStream(path, opts, handlers) {
-  const qs = new URLSearchParams({
-    url: opts.url,
-    comments: opts.comments ? "1" : "0",
-    max: String(opts.max || 100),
-  }).toString();
-  const es = new EventSource(`${path}?${qs}`);
+function ytParseVideoId(raw) {
+  const s = (raw || "").trim();
+  if (YT_VIDEO_ID.test(s)) return s;          // a bare id
+  const u = ytUrlOf(s);
+  if (!u) return "";
+  const host = u.hostname.toLowerCase().replace(/^www\./, "");
+  if (!YT_HOSTS.includes(host) && !YT_HOSTS.includes(u.hostname.toLowerCase())) return "";
+  if (host === "youtu.be") {
+    const id = u.pathname.split("/").filter(Boolean)[0] || "";
+    return YT_VIDEO_ID.test(id) ? id : "";
+  }
+  const v = u.searchParams.get("v") || "";
+  if (YT_VIDEO_ID.test(v)) return v;
+  for (const form of YT_PATH_FORMS) {
+    const at = u.pathname.indexOf(form);
+    if (at >= 0) {
+      const id = u.pathname.slice(at + form.length).split("/")[0];
+      if (YT_VIDEO_ID.test(id)) return id;
+    }
+  }
+  return "";
+}
+function ytParsePlaylistId(raw) {
+  const s = (raw || "").trim();
+  if (YT_PLAYLIST_ID.test(s)) return s;
+  const u = ytUrlOf(s);
+  if (!u) return "";
+  const list = u.searchParams.get("list") || "";
+  return YT_PLAYLIST_ID.test(list) ? list : "";
+}
+/** "" | "video" | "playlist" | "both" — "both" is a watch?v=…&list=… URL, which is
+ *  genuinely ambiguous and is the only case the panel asks the user about. */
+function ytKindOf(raw) {
+  const v = ytParseVideoId(raw), p = ytParsePlaylistId(raw);
+  if (v && p) return "both";
+  if (p) return "playlist";
+  if (v) return "video";
+  return "";
+}
+
+function ytProgressText(d) {
+  // A playlist run tags every frame with its position, so the same formatter serves
+  // both routes and a single-video fetch reads exactly as it always did.
+  const head = d.index ? `Fetching ${d.index}/${d.total} — ${d.title || ""}` : "";
+  let phase = "Working…";
+  if (d.phase === "playlist") {
+    phase = d.total ? `${d.total} video(s) found` : "Reading the playlist…";
+  } else if (d.phase === "cache") {
+    phase = (d.need_transcript || d.need_comments)
+      ? "From cache — fetching the rest…"
+      : `From cache${d.comments ? ` — ${d.comments} comment(s)` : ""}`;
+  } else if (d.phase === "page") {
+    phase = `Fetching the video page${d.via ? " via " + d.via : ""}…`;
+  } else if (d.phase === "transcript") {
+    phase = d.chars ? `Transcript: ${d.chars.toLocaleString()} characters` : "No transcript found";
+  } else if (d.phase === "comments") {
+    phase = `Comments: ${d.done}/${d.target}…`;
+  }
+  return head ? `${head} · ${phase}` : phase;
+}
+// ---- SSE source streams ----
+/** Open a GET SSE stream for any long-running source fetch. `path` is the route, `opts`
+ *  the query params (booleans become 1/0). Every key in `handlers` beyond the reserved
+ *  ones below is registered as a listener for the event of that name, which is what lets
+ *  routes with completely different frame vocabularies share one function: a single
+ *  video (progress/complete), a playlist (playlist/video/video_error/complete), an RSS
+ *  feed (feed/episode/episode_error/complete) and a transcription (file/file_error).
+ *
+ *  Named for what it does rather than what first used it — it was `youtubeStream` while
+ *  YouTube was the only caller. Returns the EventSource so the caller can close it. */
+function sourceStream(path, opts, handlers) {
+  const params = {};
+  Object.keys(opts).forEach((k) => {
+    const v = opts[k];
+    if (v === undefined || v === null) return;
+    params[k] = typeof v === "boolean" ? (v ? "1" : "0") : String(v);
+  });
+  const es = new EventSource(`${path}?${new URLSearchParams(params).toString()}`);
   let finished = false;
   let gotFrame = false;   // did the server ever speak SSE to us?
   const finish = () => { if (!finished) { finished = true; es.close(); handlers.finally?.(); } };
@@ -4860,8 +5987,20 @@ function youtubeStream(path, opts, handlers) {
     let d = null; try { d = JSON.parse(ev.data); } catch (e) {}
     if (d && d.run_id) handlers.started?.(d.run_id);
   });
-  es.addEventListener("progress", (ev) => { gotFrame = true; handlers.progress?.(JSON.parse(ev.data)); });
-  es.addEventListener("complete", (ev) => { gotFrame = true; handlers.complete?.(JSON.parse(ev.data)); finish(); });
+  // `start` and `error` stay hand-written below: they carry the run id and the
+  // no-frame fallback, neither of which is a plain data handler.
+  const RESERVED = ["started", "failed", "finally", "start", "error"];
+  Object.keys(handlers).forEach((name) => {
+    if (RESERVED.includes(name)) return;
+    es.addEventListener(name, (ev) => {
+      gotFrame = true;
+      let d = {}; try { d = JSON.parse(ev.data); } catch (e) {}
+      handlers[name](d);
+      if (name === "complete") finish();
+    });
+  });
+  // The stream still has to close itself if a caller doesn't care about the result.
+  if (!handlers.complete) es.addEventListener("complete", () => { gotFrame = true; finish(); });
   es.addEventListener("error", (ev) => {
     // SSE 'error' fires both on our emitted error frame and on a normal stream close.
     if (ev.data) {
@@ -4880,20 +6019,46 @@ function youtubeStream(path, opts, handlers) {
 }
 let libYtES = null;
 let libYtRunId = null;
+
+/** Reveal the playlist affordances the URL actually calls for — the composer's
+ *  updateYouTubePanelKind, against the library panel's ids. Shares ytKindOf, so the
+ *  two tabs can never disagree about what a URL is. */
+function updateLibraryYouTubePanelKind() {
+  const kind = ytKindOf($("lib-yt-input").value);
+  $("lib-yt-choice").classList.toggle("hidden", kind !== "both");
+  const asPlaylist = libraryYouTubeIsPlaylist(kind);
+  $("lib-yt-limit-wrap").classList.toggle("hidden", !asPlaylist);
+  $("btn-lib-yt-fetch").textContent = asPlaylist ? "Fetch playlist" : "Fetch";
+}
+function libraryYouTubeIsPlaylist(kind) {
+  return kind === "playlist" || (kind === "both" && $("lib-yt-kind-playlist").checked);
+}
+
+/** Dispatch a library YouTube fetch. A `list=` id means the playlist route, which
+ *  appends one library item per video rather than one blob. */
 async function addYouTube() {
   if (!S.activeLibrary) { toast("Select or create a library first"); return; }
   const url = $("lib-yt-input").value.trim();
   if (!url) { toast("Enter a YouTube URL"); return; }
   await flushLibrarySave();
+  const opts = {
+    url,
+    comments: $("lib-yt-comments").checked,
+    max: Math.max(5, Math.min(2000, parseInt($("lib-yt-max").value, 10) || 100)),
+    refresh: $("lib-yt-refresh").checked,
+  };
   const libId = S.activeLibrary.id;
-  const comments = $("lib-yt-comments").checked;
-  const max = Math.max(5, Math.min(2000, parseInt($("lib-yt-max").value, 10) || 100));
+  return libraryYouTubeIsPlaylist(ytKindOf(url))
+    ? addYouTubePlaylist(libId, opts)
+    : addYouTubeVideo(libId, opts);
+}
+
+function addYouTubeVideo(libId, opts) {
   const prog = $("lib-yt-progress");
   prog.classList.remove("hidden"); prog.textContent = "Starting…";
   const btn = $("btn-lib-yt-fetch"); btn.disabled = true;
-  cancelLibYouTube();
-  libYtES = youtubeStream(`/api/libraries/${libId}/add-youtube`,
-                          { url, comments, max }, {
+  cancelLibYouTube(true);
+  libYtES = sourceStream(`/api/libraries/${libId}/add-youtube`, opts, {
     started: (id) => { libYtRunId = id; },
     progress: (d) => { prog.textContent = ytProgressText(d); },
     complete: (d) => {
@@ -4909,9 +6074,146 @@ async function addYouTube() {
     finally: () => { btn.disabled = false; libYtES = null; libYtRunId = null; },
   });
 }
+
+/** Stream a whole playlist into the library, one item per video. Items are appended
+ *  server-side as each lands, so the badge is refreshed per video rather than only at
+ *  the end of what may be a very long run — and Cancel keeps whatever already saved. */
+function addYouTubePlaylist(libId, opts) {
+  opts.limit = Math.max(0, parseInt($("lib-yt-limit").value, 10) || 0);
+  const prog = $("lib-yt-progress");
+  prog.classList.remove("hidden"); prog.textContent = "Reading the playlist…";
+  const btn = $("btn-lib-yt-fetch"); btn.disabled = true;
+  cancelLibYouTube(true);
+  let added = 0, total = 0;
+  libYtES = sourceStream(`/api/libraries/${libId}/add-youtube-playlist`, opts, {
+    started: (id) => { libYtRunId = id; },
+    playlist: (d) => {
+      total = d.total || 0;
+      prog.textContent = `Playlist: ${total} video(s) — fetching…`;
+      // Enumerating is one cheap request; fetching them is not. Say so before the user
+      // walks away, and point at the exit.
+      if (total > 25) toast(`${total} videos queued — press Cancel to stop early.`, 6000);
+    },
+    progress: (d) => { prog.textContent = ytProgressText(d); },
+    video: (d) => {
+      added++;
+      refreshLibBadge(libId);
+      prog.textContent = `Added ${added}/${total} — ${d.title}`;
+    },
+    video_error: (d) => { toast(`Skipped ${d.title}: ${d.message}`, 5000); },
+    complete: (d) => {
+      adoptAddedItems(libId, d.added_items);
+      updateLibraryButton();
+      refreshLibBadge(libId);
+      prog.textContent = `Added ${added} of ${d.total} video(s).`;
+      toast(`Added ${added} video(s)` + (d.failed ? `, ${d.failed} skipped` : ""), 6000);
+      if ((d.errors || []).length) toast("Notes: " + d.errors.join("; "), 8000);
+      if (added) hideLibPanels();
+    },
+    failed: (msg) => { toast("Playlist fetch failed: " + msg); prog.textContent = "Failed."; },
+    finally: () => { btn.disabled = false; libYtES = null; libYtRunId = null; },
+  });
+}
+let libRssES = null;
+let libRssRunId = null;
+
+/** Fetch a feed into the active library, one 'rss' item per episode. */
+async function addRssFeed() {
+  if (!S.activeLibrary) { toast("Select or create a library first"); return; }
+  const url = $("lib-rss-input").value.trim();
+  if (!url) { toast("Enter a feed URL"); return; }
+  await flushLibrarySave();
+  const libId = S.activeLibrary.id;
+  const opts = {
+    url,
+    limit: Math.max(0, Math.min(500, parseInt($("lib-rss-limit").value, 10) || 0)),
+    notes: $("lib-rss-notes").checked,
+    whisper: $("lib-rss-whisper").checked,
+    refresh: $("lib-rss-refresh").checked,
+  };
+  const prog = $("lib-rss-progress");
+  prog.classList.remove("hidden"); prog.textContent = "Reading the feed…";
+  const btn = $("btn-lib-rss-fetch"); btn.disabled = true;
+  cancelLibRss(true);
+  libRssES = sourceStream(`/api/libraries/${libId}/add-rss`, opts, {
+    started: (id) => { libRssRunId = id; },
+    feed: (d) => {
+      prog.textContent = `${d.title || "Feed"} — ${d.total} episode(s)` +
+                         (d.from_cache ? " (feed unchanged)" : "");
+    },
+    warning: (d) => { toast(d.message, 8000); },
+    progress: (d) => { prog.textContent = rssProgressText(d); },
+    // Items are appended server-side as they land, so the editor is refreshed per
+    // episode rather than only at the end of what may be an hours-long run.
+    episode: () => { refreshLibBadge(libId); },
+    episode_error: (d) => { toast(`${d.title}: ${d.message}`, 6000); },
+    complete: (d) => {
+      adoptAddedItems(libId, d.added_items);
+      updateLibraryButton();
+      refreshLibBadge(libId);
+      toast(`Added ${(d.added || []).length} episode(s) from ${d.feed_title || "the feed"}` +
+            (d.failed ? ` — ${d.failed} failed` : ""));
+      if ((d.errors || []).length) toast("Notes: " + d.errors.join("; "), 8000);
+      hideLibPanels();
+    },
+    failed: (msg) => { toast("Feed fetch failed: " + msg, 8000); prog.textContent = "Failed."; },
+    finally: () => { btn.disabled = false; libRssES = null; libRssRunId = null; },
+  });
+}
+
+function cancelLibRss(quiet) {
+  const runId = libRssRunId;
+  if (libRssES) { libRssES.close(); libRssES = null; }
+  libRssRunId = null;
+  if (runId) api("/api/stop", { method: "POST", body: { run_id: runId } }).catch(() => {});
+  $("btn-lib-rss-fetch").disabled = false;
+  if (!quiet) {
+    $("lib-rss-progress").textContent = "Cancelled.";
+    hideLibPanels();
+  }
+}
+
+/** Pick audio/video files and append one transcript item each to the active library.
+ *  The library twin of composerAddMediaFiles; POST for the same native-picker reason. */
+async function addLibMediaFiles() {
+  if (!S.activeLibrary) { toast("Select or create a library first"); return; }
+  await flushLibrarySave();
+  const libId = S.activeLibrary.id;
+  const prog = $("lib-media-progress");
+  prog.classList.remove("hidden"); prog.textContent = "Waiting for file selection…";
+  const btn = $("btn-lib-add-media"); btn.disabled = true;
+  try {
+    await streamSSE(`/api/libraries/${libId}/add-media-files`, {}, {
+      begin: (d) => {
+        prog.textContent = d.total ? `Transcribing ${d.total} file(s)…` : "Nothing selected.";
+      },
+      progress: (d) => { prog.textContent = mediaProgressText(d); },
+      file: (d) => { prog.textContent = `${d.name}: ${d.chars.toLocaleString()} characters`; },
+      file_error: (d) => { toast(`${d.name}: ${d.message}`, 6000); },
+      complete: (d) => {
+        adoptAddedItems(libId, d.added_items);
+        updateLibraryButton();
+        refreshLibBadge(libId);
+        if ((d.added || []).length) toast(`Added: ${d.added.join(", ")}`);
+        if ((d.errors || []).length) toast("Notes: " + d.errors.join("; "), 6000);
+        prog.classList.add("hidden");
+        hideLibPanels();
+      },
+      error: (d) => { toast("Transcription failed: " + d.message, 8000); prog.textContent = "Failed."; },
+      done: () => { btn.disabled = false; },
+    });
+  } catch (e) {
+    toast("Transcription failed: " + e.message);
+    prog.textContent = "Failed.";
+    btn.disabled = false;
+  }
+}
+
 /** Abort an in-flight YouTube fetch. Cancel used to only hide the panel, so the stream
- *  kept running and still appended the video to a library the user had walked away from. */
-function cancelLibYouTube() {
+ *  kept running and still appended the video to a library the user had walked away from.
+ *  `quiet` reuses this to tear down a previous stream before starting a new one, without
+ *  stamping "Cancelled." over the progress line the new run is about to write. */
+function cancelLibYouTube(quiet) {
   if (!libYtES) return;
   // The id the RUN announced, not one composed from whichever library is selected now:
   // after a library switch the composed id named a different run, so Cancel stopped
@@ -4922,7 +6224,7 @@ function cancelLibYouTube() {
   // notices the disconnect; ask it to stop outright.
   if (runId) api("/api/stop", { method: "POST", body: { run_id: runId } }).catch(() => {});
   $("btn-lib-yt-fetch").disabled = false;
-  $("lib-yt-progress").textContent = "Cancelled.";
+  if (!quiet) $("lib-yt-progress").textContent = "Cancelled.";
 }
 let libSearchES = null;
 let libSearchRunId = null;
@@ -5681,6 +6983,10 @@ function bindEvents() {
   $("btn-scan").onclick = scanRange;
   $("btn-add-scanned").onclick = addScanned;
   $("btn-save-general").onclick = saveGeneral;
+  $("btn-yt-cache-clear").onclick = clearYouTubeCache;
+  $("btn-whisper-reset").onclick = resetWhisperModel;
+  $("btn-rss-cache-clear").onclick = () => clearRssCache("episodes");
+  $("btn-rss-cache-clear-feeds").onclick = () => clearRssCache("feeds");
   $("btn-rag-add-servers").onclick = addRagServersFromList;
   $("btn-rag-check-servers").onclick = checkRagServers;
   // Refresh the note as soon as the store is changed, before Save, so the encryption
@@ -5727,6 +7033,17 @@ function bindEvents() {
   $("chk-rag").onchange = () => { if (S.chat) { S.chat.rag_enabled = $("chk-rag").checked; persistChat(); } };
   $("chk-rag-auto").onchange = () => { if (S.chat) { S.chat.rag_auto = $("chk-rag-auto").checked; persistChat(); } };
   $("rag-threshold").onchange = () => { if (S.chat) { S.chat.rag_threshold = Math.max(1, parseInt($("rag-threshold").value) || 400); persistChat(); } };
+  $("rag-scope").onchange = () => {
+    if (!S.chat) return;
+    S.chat.rag_scope = $("rag-scope").value || "attachments";
+    // The vector store is plaintext on disk under the default backend, so a private
+    // chat is never indexed. It still works — retrieval just happens in memory each
+    // send — but the user should know why it's slower and leaves no trace.
+    if (S.chat.private && S.chat.rag_scope !== "attachments") {
+      toast("Private chats are retrieved in memory and never indexed.", 6000);
+    }
+    persistChat();
+  };
   $("chk-multipass").onchange = () => { if (S.chat) { S.chat.multi_pass = $("chk-multipass").checked; persistChat(); } updateMultipassVisibility(); };
   $("chk-memory").onchange = onMemoryToggle;
   $("memory-core-select").onchange = () => {
@@ -5767,13 +7084,21 @@ function bindEvents() {
   setupImageDropPaste();
   $("btn-add-url").onclick = () => showComposerPanel("url");
   $("btn-add-youtube").onclick = () => showComposerPanel("youtube");
+  $("btn-add-rss").onclick = () => showComposerPanel("rss");
+  $("btn-add-rss-fetch").onclick = composerAddRss;
+  $("btn-add-rss-cancel").onclick = () => cancelComposerRss(false);
+  $("btn-add-media").onclick = composerAddMediaFiles;
   $("btn-add-search").onclick = () => showComposerPanel("search");
   $("btn-add-url-fetch").onclick = composerAddUrl;
   $("btn-add-url-cancel").onclick = hideComposerPanels;
   $("add-url-input").onkeydown = (e) => { if (e.key === "Enter") composerAddUrl(); };
   $("btn-add-yt-fetch").onclick = composerAddYouTube;
-  $("btn-add-yt-cancel").onclick = hideComposerPanels;
+  $("btn-add-yt-cancel").onclick = () => cancelComposerYouTube();
   $("add-yt-input").onkeydown = (e) => { if (e.key === "Enter") composerAddYouTube(); };
+  // Per-keystroke, because the panel reshapes itself around what the URL turns out to be.
+  $("add-yt-input").addEventListener("input", updateYouTubePanelKind);
+  $("add-yt-kind-video").onchange = updateYouTubePanelKind;
+  $("add-yt-kind-playlist").onchange = updateYouTubePanelKind;
   $("btn-add-search-go").onclick = composerAddSearch;
   $("btn-add-search-cancel").onclick = hideComposerPanels;
   $("add-search-query").onkeydown = (e) => { if (e.key === "Enter") composerAddSearch(); };
@@ -5791,6 +7116,7 @@ function bindEvents() {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
   });
   setupMessagesResizer();
+  wireThreadSettings();
 
   // Evaluate tab.
   $("eval-project-select").onchange = () => onEvalProjectSelected($("eval-project-select").value);
@@ -5826,6 +7152,10 @@ function bindEvents() {
   $("btn-lib-add-files").onclick = addTextFiles;
   $("btn-lib-add-url").onclick = () => showLibPanel("url");
   $("btn-lib-add-youtube").onclick = () => showLibPanel("youtube");
+  $("btn-lib-add-rss").onclick = () => showLibPanel("rss");
+  $("btn-lib-rss-fetch").onclick = addRssFeed;
+  $("btn-lib-rss-cancel").onclick = () => cancelLibRss(false);
+  $("btn-lib-add-media").onclick = addLibMediaFiles;
   $("btn-lib-add-search").onclick = () => showLibPanel("search");
   $("btn-lib-url-fetch").onclick = addByUrl;
   $("btn-lib-url-cancel").onclick = hideLibPanels;
@@ -5833,6 +7163,11 @@ function bindEvents() {
   $("btn-lib-yt-fetch").onclick = addYouTube;
   $("btn-lib-yt-cancel").onclick = () => { cancelLibYouTube(); hideLibPanels(); };
   $("lib-yt-input").onkeydown = (e) => { if (e.key === "Enter") addYouTube(); };
+  // Per-keystroke so the panel reveals the playlist controls as soon as a list id
+  // appears, and the radio re-decides whether Max-videos is relevant.
+  $("lib-yt-input").addEventListener("input", updateLibraryYouTubePanelKind);
+  $("lib-yt-kind-video").addEventListener("change", updateLibraryYouTubePanelKind);
+  $("lib-yt-kind-playlist").addEventListener("change", updateLibraryYouTubePanelKind);
   $("btn-lib-search-go").onclick = braveSearch;
   $("btn-lib-search-cancel").onclick = () => { cancelLibSearch(); hideLibPanels(); };
   $("btn-lib-compile").onclick = async () => {
@@ -6823,6 +8158,10 @@ const BATCH_FIELDS = [
   ["batch-max-chars", "max_item_chars", "int"],
   ["batch-yt-comments", "yt_comments", "bool"],
   ["batch-yt-max", "yt_max_comments", "int"],
+  ["batch-yt-refresh", "yt_refresh", "bool"],
+  ["batch-rss-whisper", "rss_whisper", "bool"],
+  ["batch-rss-notes", "rss_notes", "bool"],
+  ["batch-rss-refresh", "rss_refresh", "bool"],
   ["batch-server", "server_url", "str"],
   ["batch-model", "model", "str"],
   ["batch-ctx", "num_ctx", "int"],
@@ -6902,6 +8241,15 @@ function batchSourceFields(src, idx) {
                style="width:6em" value="${src.limit || 0}" title="0 = every video" /></label>
       </div>`;
   }
+  if (k === "rss") {
+    return `<div class="control-row">
+        <input type="text" class="bsrc-field" data-key="url" style="flex:1 1 22em"
+               placeholder="https://feeds.example.com/show.xml" value="${escapeHtml(src.url || "")}" />
+        <label>Max episodes: <input type="number" class="bsrc-field" data-key="limit" min="0" max="500"
+               style="width:6em" value="${src.limit || 0}"
+               title="Newest first, in feed order. 0 = every item the feed lists. Cached episodes cost nothing, so raising this is how you pick up what's new." /></label>
+      </div>`;
+  }
   if (k === "search") {
     return `<div class="control-row">
         <input type="text" class="bsrc-field" data-key="query" style="flex:1 1 20em"
@@ -6913,8 +8261,10 @@ function batchSourceFields(src, idx) {
                placeholder="Limit to sites (comma separated)" value="${escapeHtml((src.sites || []).join(", "))}" />
       </div>`;
   }
-  // folder + images share the picker markup, so batchSyncFromUI needs no new case.
-  const label = k === "images" ? "🖼 Choose image folder…" : "📂 Choose folder…";
+  // folder + images + media share the picker markup, so batchSyncFromUI needs no new case.
+  const label = k === "images" ? "🖼 Choose image folder…"
+              : k === "media" ? "🎙 Choose audio/video folder…"
+              : "📂 Choose folder…";
   return `<div class="control-row">
       <button class="small bsrc-pick" data-idx="${idx}">${label}</button>
       <span class="muted bsrc-path">${escapeHtml(src.path || "(no folder chosen)")}</span>
@@ -6936,8 +8286,10 @@ function renderBatchSources() {
          <select class="bsrc-kind">
            <option value="folder">📁 Folder of documents</option>
            <option value="images">🖼 Folder of images</option>
+           <option value="media">🎙 Folder of audio/video</option>
            <option value="youtube">▶ YouTube video(s)</option>
            <option value="playlist">▶ YouTube playlist</option>
+           <option value="rss">📡 RSS / Podcast feed</option>
            <option value="search">🔍 Web search results</option>
          </select>
          <span class="spacer"></span>
@@ -6970,8 +8322,11 @@ function renderBatchSources() {
       const idx = Number(btn.dataset.idx);
       batchSyncFromUI();
       try {
-        const r = await api("/api/pick-folder", {
-          method: "POST", body: { title: "Choose a folder of documents to process" } });
+        const kind = S.batch.project.sources[idx].kind || "folder";
+        const title = kind === "images" ? "Choose a folder of images to process"
+                    : kind === "media" ? "Choose a folder of audio/video to transcribe"
+                    : "Choose a folder of documents to process";
+        const r = await api("/api/pick-folder", { method: "POST", body: { title } });
         if (r.path) { S.batch.project.sources[idx].path = r.path; renderBatchSources(); }
       } catch (e) { toast("Folder picker failed: " + e.message); }
     };

@@ -402,6 +402,100 @@ def test_forgot_password_wipe_removes_the_plaintext_lance_store(tmp_path, monkey
     assert not store.exists(), "plaintext chunk text survived a forgot-password wipe"
 
 
+def test_an_encrypted_lance_store_reports_what_to_do_about_it(tmp_path, monkeypatch):
+    """The sweep above is fixed, but a store damaged BEFORE that fix is still on disk.
+    Opening one used to surface only Lance's own words —
+
+        LanceError(IO): file size is too small,
+        C:\\Users\\runneradmin\\.cargo\\...\\lance-io-9.0.0\\src\\utils.rs:92:20
+
+    — a Rust panic site from whatever machine built the wheel, naming neither the store
+    nor the remedy. Detect the app's own encryption header directly and say so."""
+    from app.vectorstore import VectorStoreError, lance_backend
+
+    store = _fake_lance_store(tmp_path)
+    victim = store / "chunks_768.lance" / "_versions" / "latest_version_hint.json"
+    victim.write_bytes(crypto.MAGIC + b"\x00" * 40)
+    monkeypatch.setattr(core, "RAG_LANCE_DIR", store)
+
+    with pytest.raises(VectorStoreError) as excinfo:
+        lance_backend.LanceBackend()._conn()
+
+    msg = str(excinfo.value)
+    assert str(store) in msg                  # names the folder to delete
+    assert "Compile Data" in msg              # names the way back
+    assert "utils.rs" not in msg              # not the Rust panic site
+
+
+def test_a_healthy_lance_store_is_not_flagged(tmp_path, monkeypatch):
+    """The detector must not fire on a normal store, or it would brick every install."""
+    pytest.importorskip("lancedb", reason="lancedb not installed")
+    from app.vectorstore import lance_backend
+
+    store = _fake_lance_store(tmp_path)
+    monkeypatch.setattr(core, "RAG_LANCE_DIR", store)
+    assert lance_backend.LanceBackend()._conn() is not None
+
+
+def test_a_damaged_table_is_never_created_over(tmp_path, monkeypatch):
+    """_table() falls back to create_table when open_table raises, because a missing
+    table is ordinary. A CORRUPT one must not take that path: creating a fresh table
+    over a store the user might still recover destroys it and buries the cause."""
+    from app.vectorstore import VectorStoreError, lance_backend
+
+    monkeypatch.setattr(core, "RAG_LANCE_DIR", tmp_path / "rag.lance")
+    be = lance_backend.LanceBackend()
+
+    class Boom:
+        def open_table(self, name):
+            raise RuntimeError("lance error: LanceError(IO): file size is too small, "
+                               "/home/runner/.cargo/lance-io/src/utils.rs:92:20")
+
+        def create_table(self, name, schema=None):
+            raise AssertionError("created a table over a damaged store")
+
+    monkeypatch.setattr(be, "_conn", lambda: Boom())
+    with pytest.raises(VectorStoreError):
+        be._table(768, create=True)
+
+
+def test_a_missing_table_still_creates_normally(tmp_path, monkeypatch):
+    """The other half of the case above: an ordinary "no such table" must still fall
+    through to create_table, or a fresh install could never write its first chunk."""
+    from app.vectorstore import lance_backend
+
+    monkeypatch.setattr(core, "RAG_LANCE_DIR", tmp_path / "rag.lance")
+    be = lance_backend.LanceBackend()
+    made = []
+
+    class Empty:
+        def open_table(self, name):
+            raise RuntimeError(f"Table '{name}' was not found")
+
+        def create_table(self, name, schema=None):
+            made.append(name)
+            return "table-handle"
+
+    monkeypatch.setattr(be, "_conn", lambda: Empty())
+    assert be._table(768, create=True) == "table-handle"
+    assert made == ["chunks_768"]
+
+
+def test_a_damaged_store_does_not_read_as_an_empty_one(tmp_path, monkeypatch):
+    """_existing_dims swallows errors and returns [], which is right for "nothing
+    indexed yet" and very wrong for "unreadable": every read would quietly return
+    nothing and every compile would look like it simply found no data."""
+    from app.vectorstore import VectorStoreError, lance_backend
+
+    store = _fake_lance_store(tmp_path)
+    (store / "chunks_768.lance" / "data" / "0123abc.lance").write_bytes(
+        crypto.MAGIC + b"\x00" * 40)
+    monkeypatch.setattr(core, "RAG_LANCE_DIR", store)
+
+    with pytest.raises(VectorStoreError):
+        lance_backend.LanceBackend()._existing_dims()
+
+
 def test_switching_backend_keeps_each_store_independent():
     pytest.importorskip("lancedb", reason="lancedb not installed")
     rag.set_backend("duckdb")

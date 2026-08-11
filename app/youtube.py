@@ -21,7 +21,8 @@ Public API:
     YouTubeError
     parse_video_id(url_or_id) -> str | None
     parse_playlist_id(url_or_id) -> str | None
-    fetch_video(url, include_comments, max_comments, on_progress, should_stop) -> dict
+    fetch_video(url, include_comments, max_comments, on_progress, should_stop,
+                refresh) -> dict
     fetch_playlist(url, limit, on_progress, should_stop) -> [{video_id, url, title}]
     format_video_text(meta, transcript, comments) -> str
 """
@@ -34,6 +35,8 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 from . import core
+from . import transcribe
+from . import youtube_cache
 
 WATCH_URL = "https://www.youtube.com/watch?v={vid}"
 INNERTUBE_NEXT = "https://www.youtube.com/youtubei/v1/next"
@@ -260,27 +263,19 @@ def _pick_caption_track(tracks: list):
     return tracks[0]
 
 
-def _ensure_punctuation_spacing(text: str) -> str:
-    """Insert the space a caption track omits after sentence punctuation."""
-    return re.sub(r"([.,!?;:])(?=[^\s])", r"\1 ", text or "")
-
-
-# Non-speech cues that add tokens without adding meaning.
-_CUE_NOISE = re.compile(r"[♪♫]+|\[.*?\]|\(music\)|\(sound effect\)", re.IGNORECASE)
+# Shared with the comment cleaner below, which has the same missing-space problem.
+_ensure_punctuation_spacing = transcribe.ensure_punctuation_spacing
 
 
 def _clean_transcript(raw: str) -> str:
     """Tidy a transcript assembled from the timedtext API.
 
-    Deliberately narrower than the extension's cleaner. Its `removeTimestampArtifacts`
-    also strips the literal words "Comments", "Description", "Search" and "Subtitles"
-    from anywhere in the text, because its DOM-scraping fallback mixed player chrome
-    into the transcript. The json3 API returns caption text only, so that scrubbing
-    would just corrupt real speech here.
+    The implementation moved to ``transcribe.clean_transcript`` when podcast SRTs turned
+    out to need exactly the same scrubbing — ``[MUSIC]``, ``(laughs)``, the missing space
+    after a full stop. Behaviour is unchanged; this keeps the name so the rest of this
+    module and its tests read as they always did.
     """
-    text = _CUE_NOISE.sub(" ", raw or "")
-    text = _ensure_punctuation_spacing(text)
-    return re.sub(r"\s+", " ", text).strip()
+    return transcribe.clean_transcript(raw)
 
 
 def _transcript_from_json3(payload: dict) -> str:
@@ -831,7 +826,8 @@ def format_video_text(meta: dict, transcript: str, comments: list,
 
 def fetch_video(url: str, include_comments: bool = True,
                 max_comments: int = DEFAULT_MAX_COMMENTS,
-                on_progress=None, should_stop=None, timeout: int = 45) -> dict:
+                on_progress=None, should_stop=None, timeout: int = 45,
+                refresh: bool = False) -> dict:
     """Fetch a YouTube video's transcript and comments as one plain-text document.
 
     Tries each transport in turn — Bright Data when configured, then plain requests,
@@ -842,9 +838,16 @@ def fetch_video(url: str, include_comments: bool = True,
     is only asked for the half still missing, and the chain stops as soon as both are
     in hand.
 
+    The persistent cache rides on exactly that structure: a hit seeds the working dict
+    *before* the loop, so a request for more comments than were cached leaves the
+    transcript half satisfied and only the comment half is re-fetched — by the code
+    that was already there. ``refresh`` is read-bypass, write-through: it ignores what
+    is on disk but still upgrades the entry with whatever it fetched, which is what
+    "Refresh (ignore cache)" means to a user.
+
     ``on_progress`` is called as ``(phase, **fields)`` with phase in
-    {page, transcript, comments}; ``should_stop`` is polled between comment pages so
-    an SSE client can cancel.
+    {cache, page, transcript, comments}; ``should_stop`` is polled between comment
+    pages so an SSE client can cancel.
 
     Returns {video_id, url, title, channel, published, views, transcript, comments,
     text, via, errors}. Raises YouTubeError when the URL isn't a video or no transport
@@ -867,6 +870,25 @@ def fetch_video(url: str, include_comments: bool = True,
     failures = []            # rungs that couldn't read the page at all
     last_transcript_error = ""
     last_comment_error = ""
+
+    # Seed from disk. Blanking a half we don't have is what hands it to the loop below:
+    # its want_transcript/want_comments conditions then do the right thing unchanged.
+    cached = None if refresh else youtube_cache.get(video_id)
+    if cached:
+        have_transcript, have_comments = youtube_cache.have(
+            cached, include_comments, max_comments)
+        if have_transcript or have_comments:
+            merged = youtube_cache.as_result(cached, include_comments, max_comments)
+            if not have_transcript:
+                merged["transcript"] = ""
+            if not have_comments:
+                merged["comments"] = []   # a short cached list can't be paged up from
+            contributors.append("cache")
+            if on_progress:
+                on_progress("cache", transcript=have_transcript,
+                            comments=len(merged["comments"]),
+                            need_transcript=not have_transcript,
+                            need_comments=include_comments and not have_comments)
 
     for name in attempts:
         want_transcript = not (merged and merged["transcript"])
@@ -899,6 +921,12 @@ def fetch_video(url: str, include_comments: bool = True,
             if want_comments and result["comments"]:
                 merged["comments"] = result["comments"]
                 gave = True
+            # A rung that reached the watch page has better metadata than a cached
+            # entry whose first fetch failed before it could read a title.
+            if result.get("title") and merged.get("title") in ("", "Unknown Video"):
+                for key in ("title", "channel", "published", "views"):
+                    if result.get(key):
+                        merged[key] = result[key]
         if gave:
             contributors.append(name)
         if want_transcript and result.get("transcript_error"):
@@ -920,6 +948,20 @@ def fetch_video(url: str, include_comments: bool = True,
 
     merged["via"] = " + ".join(contributors) if contributors else merged.get("via", "")
     merged["errors"] = errors
+
+    # Write back only when this call actually fetched something: a pure cache hit must
+    # not re-encrypt a 300KB file for having been read. Best effort — a cache write
+    # must never cost the caller the fetch it has already paid for.
+    if any(c != "cache" for c in contributors):
+        try:
+            youtube_cache.put(merged, include_comments, max_comments,
+                              stopped=bool(should_stop and should_stop()),
+                              comment_error=last_comment_error)
+        except Exception:
+            pass
+
+    # Rendered here rather than stored, because include_comments/max_comments differ
+    # per caller — which is exactly why the cache keeps the two halves and not `text`.
     merged["text"] = format_video_text(merged, merged["transcript"],
                                        merged["comments"], include_comments)[
                                            :core.LIBRARY_PAGE_CHARS]
