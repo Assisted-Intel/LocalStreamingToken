@@ -2,14 +2,27 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>Local Streaming Token</title>
   <link rel="icon" href="data:," />
   <link rel="stylesheet" href="/static/styles.css" />
+  <!-- Every responsive rule lives here, and only here, so the desktop stylesheet above is
+       never edited to accommodate a phone. Contributes nothing above the breakpoint. -->
+  <link rel="stylesheet" href="/static/mobile.css" />
+  <link rel="manifest" href="/static/manifest.json" />
+  <meta name="theme-color" content="#1c5096" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Streaming Token" />
+  <link rel="apple-touch-icon" href="/static/icon-192.png" />
 </head>
 <body>
   <!-- ============================ Header ============================ -->
   <header id="app-header">
+    <!-- Small screens only: opens #nav-drawer, into which syncNav() moves the tab strip
+         and the profile bar. Hidden above the breakpoint, where the strip fits inline. -->
+    <button id="btn-nav" class="nav-toggle" aria-label="Menu" aria-expanded="false"
+            aria-controls="nav-drawer">☰</button>
     <div class="brand">
       <span class="brand-name" id="brand-name">Local Streaming Token</span>
       <span class="brand-author" id="brand-author">by Assisted Intel</span>
@@ -25,6 +38,11 @@
       <button class="tab" data-tab="settings">⚙ Settings</button>
     </nav>
   </header>
+
+  <!-- Empty by design: syncNav() moves the real nav and profile bar in here below the
+       breakpoint and puts them back above it, so there is only ever one of each. -->
+  <div id="nav-scrim" hidden></div>
+  <nav id="nav-drawer" aria-label="Sections" hidden></nav>
 
   <!-- Profile bar: two independent selectors (data + settings) spanning all tabs -->
   <div id="profile-bar">
@@ -80,6 +98,8 @@
 
       <!-- Chat header -->
       <div id="chat-header">
+        <button id="btn-chats" class="nav-toggle" aria-label="Chats" aria-expanded="false"
+                aria-controls="sidebar">☰ Chats</button>
         <span id="chat-title">New Chat</span>
         <button id="btn-rename" class="icon" title="Rename">✎</button>
         <button id="btn-clear" class="icon" title="Clear messages">🧹</button>
@@ -147,7 +167,7 @@
         <label class="chk"><input type="checkbox" id="chk-websearch" /> 🌐 Web search</label>
         <label class="chk" title="Retrieve only the most relevant chunks of your selected libraries and attached data instead of sending them in full (uses the embedding server in Settings)"><input type="checkbox" id="chk-rag" /> 📚 RAG</label>
         <label class="chk" title="Automatically turn RAG on when a message (question + attached data) reaches the word threshold — ideal for prompts carrying large pasted data"><input type="checkbox" id="chk-rag-auto" /> Auto-RAG</label>
-        <label>≥ <input type="number" id="rag-threshold" min="1" value="400" style="width:5em" /> words</label>
+        <label>≥ <input type="number" id="rag-threshold" min="1" value="400" style="width:70px" /> words</label>
         <label title="What RAG searches besides your selected libraries — the material you attached, the conversation itself, or both. Searching the conversation lets a long chat outlive its context window: older turns arrive as retrieved excerpts instead of being cut off.">Scope:
           <select id="rag-scope">
             <option value="attachments">Attachments + data</option>
@@ -247,12 +267,21 @@
       <div id="add-rss-panel" class="lib-inline-panel hidden">
         <div class="lib-search-fields">
           <input type="text" id="add-rss-input" placeholder="https://feeds.example.com/show.xml  — RSS or Atom" />
-          <label class="lib-search-max" title="Newest first, in feed order. Already-fetched episodes are served from cache, so raising this is how you pick up what's new.">Max episodes
+          <label class="lib-search-max" title="Newest first, in feed order — counted AFTER the filter below, so this is the newest N matching episodes. Already-fetched episodes are served from cache, so raising this is how you pick up what's new.">Max episodes
             <input type="number" id="add-rss-limit" value="5" min="0" max="500" />
           </label>
           <label class="chk" title="Include the show notes or article body alongside the transcript"><input type="checkbox" id="add-rss-notes" checked /> Show notes</label>
           <label class="chk"><input type="checkbox" id="add-rss-whisper" /> Transcribe missing episodes</label>
           <label class="chk" title="Re-read the feed and re-fetch every episode instead of reusing the cache"><input type="checkbox" id="add-rss-refresh" /> Refresh (ignore cache)</label>
+          <div class="rss-filter-row">
+            <span class="muted rss-filter-label">Only include:</span>
+            <input type="text" id="add-rss-categories" placeholder="Categories (comma separated)" title="Matches a WHOLE category or tag on the episode — “Arts”, not “art”. Case and punctuation are ignored, so “Society & Culture” and “society and culture” are the same tag. Many podcasts tag the show rather than each episode; if nothing matches you'll be told so." />
+            <input type="text" id="add-rss-keywords" placeholder="Keywords (anywhere in the text)" title="Matches anywhere in the title, categories, author or show notes. Never the transcript — reading that would cost a download, or minutes of GPU, for every episode." />
+            <input type="text" id="add-rss-exclude" placeholder="Exclude" title="Skips any episode whose text matches. Beats the two boxes to the left, and works on its own." />
+            <label class="rss-filter-label" title="Any: one listed term is enough. All: every listed category and every listed keyword must be present.">Match
+              <select id="add-rss-match"><option value="any">any</option><option value="all">all</option></select>
+            </label>
+          </div>
           <button id="btn-add-rss-fetch" class="small primary">Fetch</button>
           <button id="btn-add-rss-cancel" class="small ghost">Cancel</button>
         </div>
@@ -286,6 +315,14 @@
            dictated the composer's height and squeezed the thread. Send/Stop come last in
            DOM order so margin-left:auto pins them to the right edge. -->
       <div id="input-row">
+        <div id="voice-hud" class="voice-hud hidden">
+          <div class="voice-hud-row">
+            <span id="voice-hud-badge" class="voice-hud-badge idle">Voice off</span>
+            <span class="voice-meter" id="voice-hud-meter"><span id="voice-hud-meter-fill"></span></span>
+            <span id="voice-hud-level" class="voice-hud-level"></span>
+          </div>
+          <div id="voice-hud-detail" class="voice-hud-detail"></div>
+        </div>
         <textarea id="input-box" rows="3" placeholder="Type a message…  (Enter to send, Shift+Enter for newline)"></textarea>
         <div class="input-btns">
           <button id="btn-rewrite" class="ghost" title="Rewrite your message into a clearer, more effective prompt">✨ Rewrite</button>
@@ -297,8 +334,13 @@
           <button id="btn-queue-run" class="primary hidden" title="Process every queued prompt">▶ Run Queue (0)</button>
           <button id="btn-queue-clear" class="ghost hidden" title="Empty the queue">Clear Queue</button>
           <button id="btn-batch" class="ghost" title="Batch process a folder of .txt/.md prompts">📂 Batch</button>
-          <button id="btn-send" class="primary">Send</button>
-          <button id="btn-stop" class="stop hidden">Stop</button>
+          <span class="send-group">
+            <button id="btn-voice" class="ghost" title="Voice chat — talk, 6 seconds of silence sends. Hold the Avatar helper PTT key to talk without waiting for the noise gate.">🎤 Voice</button>
+            <span id="voice-meter" class="voice-meter hidden" title="Mic level vs noise gate"><span id="voice-meter-fill"></span></span>
+            <button id="btn-voice-reason" class="ghost" title="Read the model's reasoning aloud while it streams">💭 Reason</button>
+            <button id="btn-send" class="primary">Send</button>
+            <button id="btn-stop" class="stop hidden">Stop</button>
+          </span>
         </div>
       </div>
       <!-- Live context-usage meter: one thin bar per active chat/server -->
@@ -354,7 +396,7 @@
           </div>
           <div class="eval-run-row">
             <label>Rows to generate:
-              <input type="number" id="eval-gen-rows" min="1" max="500" value="10" style="width:5em" />
+              <input type="number" id="eval-gen-rows" min="1" max="500" value="10" style="width:70px" />
             </label>
             <button id="btn-eval-gen-run" class="primary">✨ Generate Data</button>
             <button id="btn-eval-gen-stop" class="stop hidden">Stop</button>
@@ -462,11 +504,11 @@
         <div id="batch-items" class="batch-items"></div>
         <div class="control-row">
           <label title="Longer items are cut off before they reach the model, so one huge transcript can't blow the context window.">Max characters per item:
-            <input type="number" id="batch-max-chars" min="1000" max="2000000" step="1000" style="width:8em" />
+            <input type="number" id="batch-max-chars" min="1000" max="2000000" step="1000" style="width:112px" />
           </label>
           <label class="chk"><input type="checkbox" id="batch-yt-comments" /> Include YouTube comments</label>
           <label>Max comments:
-            <input type="number" id="batch-yt-max" min="5" max="2000" style="width:6em" />
+            <input type="number" id="batch-yt-max" min="5" max="2000" style="width:84px" />
           </label>
           <label class="chk" title="Refetch every video instead of reusing the on-disk cache. Off means a Preview and the Run that follows it cost one crawl, not two."><input type="checkbox" id="batch-yt-refresh" /> Refresh (ignore cache)</label>
         </div>
@@ -565,7 +607,7 @@
 
           <div id="batch-combined-row" class="control-row hidden">
             <label>Combined file name:
-              <input type="text" id="batch-combined-name" style="width:16em" />
+              <input type="text" id="batch-combined-name" style="width:224px" />
             </label>
           </div>
 
@@ -577,10 +619,10 @@
               </select>
             </label>
             <label>Prefix:
-              <input type="text" id="batch-name-prefix" style="width:9em" placeholder="(none)" />
+              <input type="text" id="batch-name-prefix" style="width:126px" placeholder="(none)" />
             </label>
             <label>Append:
-              <input type="text" id="batch-name-suffix" style="width:9em" placeholder="(none)" />
+              <input type="text" id="batch-name-suffix" style="width:126px" placeholder="(none)" />
             </label>
             <label>Extension:
               <select id="batch-ext">
@@ -670,12 +712,21 @@
       <div id="lib-rss-panel" class="lib-inline-panel hidden">
         <div class="lib-search-fields">
           <input type="text" id="lib-rss-input" placeholder="https://feeds.example.com/show.xml  — RSS or Atom" />
-          <label class="lib-search-max" title="Newest first, in feed order. Already-fetched episodes are served from cache, so raising this is how you pick up what's new.">Max episodes
+          <label class="lib-search-max" title="Newest first, in feed order — counted AFTER the filter below, so this is the newest N matching episodes. Already-fetched episodes are served from cache, so raising this is how you pick up what's new.">Max episodes
             <input type="number" id="lib-rss-limit" value="5" min="0" max="500" />
           </label>
           <label class="chk" title="Include the show notes or article body alongside the transcript"><input type="checkbox" id="lib-rss-notes" checked /> Show notes</label>
           <label class="chk"><input type="checkbox" id="lib-rss-whisper" /> Transcribe missing episodes</label>
           <label class="chk" title="Re-read the feed and re-fetch every episode instead of reusing the cache"><input type="checkbox" id="lib-rss-refresh" /> Refresh (ignore cache)</label>
+          <div class="rss-filter-row">
+            <span class="muted rss-filter-label">Only include:</span>
+            <input type="text" id="lib-rss-categories" placeholder="Categories (comma separated)" title="Matches a WHOLE category or tag on the episode — “Arts”, not “art”. Case and punctuation are ignored. Many podcasts tag the show rather than each episode; if nothing matches you'll be told so." />
+            <input type="text" id="lib-rss-keywords" placeholder="Keywords (anywhere in the text)" title="Matches anywhere in the title, categories, author or show notes. Never the transcript — that would cost a download, or minutes of GPU, per episode." />
+            <input type="text" id="lib-rss-exclude" placeholder="Exclude" title="Skips any episode whose text matches. Beats the two boxes to the left, and works on its own." />
+            <label class="rss-filter-label" title="Any: one listed term is enough. All: every listed category and every listed keyword must be present.">Match
+              <select id="lib-rss-match"><option value="any">any</option><option value="all">all</option></select>
+            </label>
+          </div>
           <button id="btn-lib-rss-fetch" class="small primary">Fetch</button>
           <button id="btn-lib-rss-cancel" class="small ghost">Cancel</button>
         </div>
@@ -770,10 +821,19 @@
           <div id="pe-rss-panel" class="lib-inline-panel hidden">
             <div class="lib-search-fields">
               <input type="text" id="pe-rss-input" placeholder="https://feeds.example.com/show.xml" />
-              <label class="lib-search-max">Max episodes
+              <label class="lib-search-max" title="Newest first, in feed order — counted AFTER the filter below, so this is the newest N matching episodes.">Max episodes
                 <input type="number" id="pe-rss-limit" value="5" min="0" max="500" />
               </label>
               <label class="chk"><input type="checkbox" id="pe-rss-whisper" /> Transcribe missing episodes</label>
+              <div class="rss-filter-row">
+                <span class="muted rss-filter-label">Only include:</span>
+                <input type="text" id="pe-rss-categories" placeholder="Categories (comma separated)" title="Matches a WHOLE category or tag on the episode — “Arts”, not “art”. Case and punctuation are ignored." />
+                <input type="text" id="pe-rss-keywords" placeholder="Keywords (anywhere in the text)" title="Matches anywhere in the title, categories, author or show notes — never the transcript." />
+                <input type="text" id="pe-rss-exclude" placeholder="Exclude" title="Skips any episode whose text matches. Beats the two boxes to the left, and works on its own." />
+                <label class="rss-filter-label" title="Any: one listed term is enough. All: every listed category and every listed keyword must be present.">Match
+                  <select id="pe-rss-match"><option value="any">any</option><option value="all">all</option></select>
+                </label>
+              </div>
               <button id="btn-pe-rss-fetch" class="small primary">Import</button>
               <button id="btn-pe-rss-cancel" class="small ghost">Cancel</button>
             </div>
@@ -797,9 +857,18 @@
           <div id="pe-mem-rss-panel" class="lib-inline-panel hidden">
             <div class="lib-search-fields">
               <input type="text" id="pe-mem-rss-input" placeholder="https://feeds.example.com/show.xml" />
-              <label class="lib-search-max">Max episodes
+              <label class="lib-search-max" title="Newest first, in feed order — counted AFTER the filter below, so this is the newest N matching episodes.">Max episodes
                 <input type="number" id="pe-mem-rss-limit" value="3" min="1" max="50" />
               </label>
+              <div class="rss-filter-row">
+                <span class="muted rss-filter-label">Only include:</span>
+                <input type="text" id="pe-mem-rss-categories" placeholder="Categories (comma separated)" title="Matches a WHOLE category or tag on the episode — “Arts”, not “art”. Case and punctuation are ignored." />
+                <input type="text" id="pe-mem-rss-keywords" placeholder="Keywords (anywhere in the text)" title="Matches anywhere in the title, categories, author or show notes — never the transcript." />
+                <input type="text" id="pe-mem-rss-exclude" placeholder="Exclude" title="Skips any episode whose text matches. Beats the two boxes to the left, and works on its own." />
+                <label class="rss-filter-label" title="Any: one listed term is enough. All: every listed category and every listed keyword must be present.">Match
+                  <select id="pe-mem-rss-match"><option value="any">any</option><option value="all">all</option></select>
+                </label>
+              </div>
               <button id="btn-pe-mem-rss-go" class="small primary">Draft</button>
               <button id="btn-pe-mem-rss-cancel" class="small ghost">Cancel</button>
             </div>
@@ -904,6 +973,112 @@
   <div id="tab-settings" class="tab-page">
     <main id="settings-main">
       <h2 class="settings-title">Settings</h2>
+
+      <section class="settings-card">
+        <h3>Network Access</h3>
+        <p class="muted">By default this app only answers on the computer it runs on. Turn it on below to open it to your phone, laptop or another PC on the same network. Local access keeps working either way.</p>
+        <div id="net-status" class="muted">—</div>
+        <label class="chk"><input type="checkbox" id="set-lan-enabled" /> Let other computers on my network use this app</label>
+        <div id="net-creds-warning" class="warn-banner hidden"></div>
+        <div id="net-creds-actions" class="control-row hidden">
+          <button id="btn-net-show-pw" class="small">Change the password now</button>
+        </div>
+        <div id="net-pw-form" class="hidden">
+          <label class="setting-row">Username
+            <input type="text" id="net-pw-user" autocomplete="off" />
+          </label>
+          <label class="setting-row">Current password
+            <input type="password" id="net-pw-current" autocomplete="off" placeholder="admin" />
+          </label>
+          <label class="setting-row">New password
+            <input type="password" id="net-pw-new" autocomplete="new-password" />
+          </label>
+          <label class="setting-row">Confirm new password
+            <input type="password" id="net-pw-confirm" autocomplete="new-password" />
+          </label>
+          <div class="muted" style="font-size:12px">This is also the key to your encrypted data, so it is re-wrapped rather than re-encrypted — nothing is re-written and you stay signed in.</div>
+          <div class="settings-actions">
+            <button id="btn-net-change-pw" class="primary">Save new password</button>
+          </div>
+        </div>
+        <label class="setting-row" title="The number after the colon in the address. 8756 is the default; anything from 1024 to 65535 works.">Port
+          <input type="number" id="set-net-port" min="1024" max="65535" step="1" />
+        </label>
+        <div id="net-port-warning" class="warn-banner hidden"></div>
+        <div id="net-restart-note" class="warn-banner hidden"></div>
+        <div id="net-addresses" class="net-addresses"></div>
+        <div id="net-share-warning" class="warn-banner hidden">
+          <b>Before you share this:</b> everyone who connects signs in with the <em>same</em>
+          password and shares the same chats, profile and settings — this is for reaching
+          your own app from your other devices, not for two people working at once.
+          Anyone who can sign in can also read and write files on <em>this</em> computer
+          and run database queries from it, and the connection is plain HTTP, so only do
+          this on a network you trust.
+        </div>
+        <details class="net-help">
+          <summary>Another computer can't connect?</summary>
+          <div class="muted">
+            <p><b>1. Windows Firewall.</b> The first time the app opens to the network,
+            Windows asks whether to allow Python through. That prompt needs administrator
+            rights — if it never appeared, someone clicked Cancel, or your organisation
+            suppresses it, Windows quietly adds a <em>block</em> rule instead and the app
+            looks perfectly healthy while no connection ever arrives. Allow it for
+            <b>Private</b> networks, or run this in an <b>administrator</b> PowerShell:</p>
+            <div class="control-row">
+              <code id="net-firewall-cmd"></code>
+              <button id="btn-net-copy-firewall" class="small">Copy</button>
+            </div>
+            <p>Each Python executable is a separate firewall entry, so a virtual
+            environment's <code>python.exe</code> needs its own rule.</p>
+            <p><b>2. Network profile.</b> A rule allowed for Private networks does nothing
+            while Windows has the adapter classified as Public. Check under Settings →
+            Network &amp; internet → your adapter.</p>
+            <p><b>3. The network itself.</b> Guest Wi-Fi, hotel networks and many company
+            access points use client isolation, which stops two devices reaching each
+            other no matter how the firewall is set.</p>
+            <p><b>4. File pickers open here.</b> Import…, Save as… and the folder picker
+            open a window on <em>this</em> computer, not on the one you are browsing from.</p>
+          </div>
+        </details>
+        <div class="settings-actions">
+          <button id="btn-net-redetect" class="small">↻ Re-detect addresses</button>
+          <button id="btn-save-network" class="primary">Save network settings</button>
+          <button id="btn-restart-network" class="small">Save &amp; restart server</button>
+        </div>
+      </section>
+
+      <section class="settings-card">
+        <h3>Voice / Avatar helper</h3>
+        <p class="muted">Voice chat uses the Avatar Read Server for the microphone, silence-ended transcription, and reading replies aloud. It starts with the same Python this app is running (your F5 conda env). Point at that project folder.</p>
+        <label class="setting-row">Helper folder
+          <input type="text" id="set-avatar-dir" placeholder="B:\Documents\Assisted Intel\Avitar VibeCode\avatar-read-server" />
+          <button type="button" id="btn-avatar-browse-dir" class="small">Browse…</button>
+        </label>
+        <label class="setting-row">Helper URL
+          <input type="text" id="set-avatar-url" placeholder="http://127.0.0.1:8765" />
+        </label>
+        <div class="muted" style="font-size:12px; margin:4px 0">When to start the helper</div>
+        <label class="chk"><input type="radio" name="avatar-start" id="avatar-start-app" value="app_start" /> When Local Streaming Token starts (loads models only — press Voice to talk)</label>
+        <label class="chk"><input type="radio" name="avatar-start" id="avatar-start-voice" value="voice_button" checked /> Only when Voice is pressed</label>
+        <label class="setting-row" title="How loud you must be to count as speech. Raise it if fans or room noise start a turn; lower it if your voice is ignored.">Noise gate
+          <input type="range" id="set-avatar-gate" min="0" max="100" value="30" />
+          <span id="set-avatar-gate-label">30</span>
+        </label>
+        <label class="setting-row" title="After you stop talking, wait this long before sending the turn. Lower it for snappier chat. Hold-to-talk still sends on release.">Silence before send (seconds)
+          <input type="number" id="set-avatar-silence" min="1" max="30" step="1" value="6" style="width:70px" />
+        </label>
+        <div class="voice-meter-row">
+          <span class="voice-meter" id="set-avatar-meter"><span id="set-avatar-meter-fill"></span></span>
+          <span id="set-avatar-meter-text" class="muted" style="font-size:12px">Mic: —</span>
+        </div>
+        <p class="muted" style="font-size:12px">While Voice is on, the Avatar helper’s hold-to-talk hotkey (Mouse Back by default) also starts a turn. Release it to send without waiting for silence. Auto-detect uses the gate and the silence timeout above.</p>
+        <div id="avatar-helper-state" class="muted" style="font-size:12px; margin-top:6px">—</div>
+        <div class="settings-actions">
+          <button id="btn-avatar-save" class="primary">Save voice settings</button>
+          <button type="button" id="btn-avatar-restart" class="small">Restart helper</button>
+          <a id="link-avatar-settings" class="small" href="http://127.0.0.1:8765" target="_blank" rel="noopener noreferrer">Open Avatar settings</a>
+        </div>
+      </section>
 
       <section class="settings-card">
         <h3>Web Search API Keys</h3>

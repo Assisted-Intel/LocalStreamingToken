@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy this file to settings.json and fill in your own values. settings.json is gitignored so your keys are never committed. You can also add servers/providers and keys from the app's Settings tab.",
+  "_comment": "Reference for the settings file format only — do not put real keys here. The live copy is created on first run at settings/profiles/<id>/settings.json, is encrypted, and is gitignored. Bind host/port live separately in settings/network.json (also gitignored). Fill values from the app's Settings tab.",
   "servers": [
     {
       "name": "My Remote Ollama",

@@ -58,8 +58,17 @@ from . import core
 
 # Bumped when the entry shape changes incompatibly; a record from another version reads
 # as a miss rather than as corrupt data, so an upgrade just re-fetches.
+#
+# ENTRY_VERSION stays at 1 deliberately, and should be very hard to talk anyone into
+# bumping: an episode record can hold a Whisper transcript that cost minutes of GPU, and
+# discarding a shelf of them to pick up a new metadata field is not a trade worth making.
+# Prefer tolerating a missing key in rss.py.
 ENTRY_VERSION = 1
-FEED_ENTRY_VERSION = 1
+# 2: items and feeds carry `categories`. The bump is what makes the category filter
+# correct on an existing install — a v1 listing has no such key, so every filter would
+# match nothing, and "run it again with Refresh ticked" is not a discoverable cure. Costs
+# one full-body GET per feed on upgrade (no cached validators to send with).
+FEED_ENTRY_VERSION = 2
 
 # How good a transcript is, by where it came from. Only ever compared, never displayed.
 SOURCE_RANK = {"": 0, "whisper": 1, "published": 2}

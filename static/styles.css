@@ -30,6 +30,10 @@ html, body {
   background: var(--bg);
 }
 body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+/* iOS reports 100vh as the toolbar-expanded height, which pushes the composer under
+   the browser chrome. dvh tracks the real visible height; the line above stays as the
+   fallback for browsers without it. */
+@supports (height: 100dvh) { body { height: 100dvh; } }
 
 /* ---------------- Header ---------------- */
 #app-header {
@@ -171,9 +175,62 @@ textarea { resize: vertical; width: 100%; }
 #input-row { display: flex; flex-direction: column; gap: 6px; }
 #input-box { flex: 0 0 auto; }
 .input-btns { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 6px; }
-/* Pushes the primary action to the right edge of whatever line it lands on.
-   Both carry it because Stop replaces Send mid-run. */
-#btn-send, #btn-stop { margin-left: auto; }
+/* Voice + Send sit together on the right. Voice carries margin-left:auto so the
+   group still pins to the edge while send-group is display:contents on desktop. */
+#btn-voice { margin-left: auto; }
+#btn-voice.active, #btn-voice-reason.active {
+  background: var(--accent); color: #fff; border-color: var(--accent);
+}
+#btn-voice.loading { opacity: .85; cursor: wait; }
+#btn-voice.listening { box-shadow: 0 0 0 2px rgba(180, 40, 40, .45); }
+#btn-voice.speaking { box-shadow: 0 0 0 2px rgba(40, 110, 180, .45); }
+.voice-meter {
+  display: inline-block; width: 64px; height: 8px;
+  background: #ddd; border-radius: 4px; overflow: hidden;
+  vertical-align: middle; flex: 0 0 auto;
+}
+.voice-meter > span {
+  display: block; height: 100%; width: 0; background: #3a8;
+  transition: width .08s linear;
+}
+.voice-meter.open > span { background: #c44; }
+.voice-meter-row { display: flex; align-items: center; gap: 8px; margin: 4px 0 8px; }
+#set-avatar-gate { flex: 1 1 180px; min-width: 120px; }
+
+.voice-hud {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #eef2ff;
+}
+.voice-hud-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.voice-hud-badge {
+  display: inline-block;
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: .02em;
+  padding: 4px 10px;
+  border-radius: 999px;
+  color: #fff;
+  background: #64748b;
+}
+.voice-hud-badge.listening { background: #1d4ed8; }
+.voice-hud-badge.ptt { background: #b91c1c; animation: blink 1s steps(2) infinite; }
+.voice-hud-badge.speech { background: #15803d; }
+.voice-hud-badge.silence { background: #0f766e; }
+.voice-hud-badge.transcribing { background: #b45309; }
+.voice-hud-badge.speaking { background: #6d28d9; }
+.voice-hud-badge.ready { background: #0f766e; }
+.voice-hud-badge.error { background: #b91c1c; }
+.voice-hud-level { font-size: 12px; color: #555; }
+.voice-hud-detail {
+  margin-top: 6px;
+  font-size: 13px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  color: #111;
+}
+#btn-send, #btn-stop { margin-left: 0; }
 .status-line { font-size: 12px; color: #666; min-height: 16px; }
 
 /* Live context-usage meter (bottom of chat) */
@@ -289,6 +346,13 @@ button.primary { background: var(--accent); color: #fff; border-color: var(--acc
 button.primary:hover { background: rgb(24, 68, 128); }
 button.ghost { background: transparent; }
 button.small { padding: 4px 9px; font-size: 12px; }
+a.small {
+  display: inline-flex; align-items: center;
+  padding: 4px 9px; font-size: 12px; line-height: 1.4;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: #fff; color: inherit; text-decoration: none;
+}
+a.small:hover { background: #f0f0f3; }
 button.stop { background: var(--stop-btn); color: #fff; border-color: var(--stop-btn); }
 button.stop:hover { background: rgb(178, 55, 55); }
 button:disabled { opacity: .5; cursor: not-allowed; }
@@ -323,6 +387,15 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .lib-search-max input { width: 60px; }
 .lib-search-fields #lib-yt-input { flex: 3 1 260px; }
 #lib-yt-max input, .lib-search-max #lib-yt-max { width: 70px; }
+/* The RSS category/keyword filter. Nested inside .lib-search-fields (which wraps) and
+   forced to its own line, so the four panels that carry it need no layout change of
+   their own — the row lands between the feed switches and the Fetch button. */
+.rss-filter-row { flex: 1 1 100%; display: flex; gap: 8px; align-items: center;
+  flex-wrap: wrap; padding-top: 6px; border-top: 1px dashed var(--border); }
+.rss-filter-row input[type="text"] { flex: 1 1 168px; min-width: 98px; }
+.rss-filter-row select { width: auto; }
+.rss-filter-label { font-size: 12px; white-space: nowrap; }
+
 #lib-search-panel, #lib-yt-panel { flex-direction: column; align-items: stretch; }
 #lib-search-panel .compile-progress, #lib-yt-panel .compile-progress { margin-top: 8px; width: 100%; }
 
@@ -383,9 +456,6 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .modal h3 { margin: 0 0 8px; }
 .muted { color: #777; font-size: 12px; margin: 0 0 10px; }
 .modal-btns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
-.server-row { display: flex; gap: 6px; align-items: center; }
-.server-row input { flex: 1 1 auto; }
-.server-row .name { flex: 0 0 130px; }
 #modal-prompt input[type="text"] { width: 100%; }
 /* optional tickbox under the field (e.g. "treat the delimiter as a regex") */
 #prompt-check-row { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 13px; }
@@ -684,6 +754,9 @@ button.danger { background: var(--stop-btn); color: #fff; border: none; }
 
 /* result tables */
 .eval-table { border-collapse: collapse; font-size: 12.5px; width: 100%; }
+/* Both result tables can outgrow their card once a project has several criteria, so
+   each needs its own horizontal scroll rather than pushing the page wider. */
+.eval-table-wrap { overflow-x: auto; max-width: 100%; }
 .eval-table th, .eval-table td { border: 1px solid var(--border); padding: 5px 8px; text-align: left; vertical-align: top; }
 .eval-table thead th { background: var(--panel); position: sticky; top: 0; }
 .eval-rows-table { display: block; overflow-x: auto; max-height: 420px; overflow-y: auto; }
@@ -765,7 +838,7 @@ button.danger { background: var(--stop-btn); color: #fff; border: none; }
 .step-body.hidden, .persona-select.hidden { display: none; }
 .step-json { width: 100%; box-sizing: border-box; font-family: monospace; font-size: 11px; }
 .step-raw { color: #c0473f; white-space: pre-wrap; margin: 4px 0; font-family: monospace; }
-#persona-select, #persona-variant { max-width: 12em; }
+#persona-select, #persona-variant { max-width: 168px; }
 #persona-select.hidden, #persona-variant.hidden { display: none; }
 
 /* ---- Personas tab ---- */
@@ -781,7 +854,7 @@ button.danger { background: var(--stop-btn); color: #fff; border: none; }
 .side-item.broken { border-color: #e6c86a; background: #fbeecb; color: #7a5b00; cursor: default; }
 .side-item em { opacity: 0.6; }
 .persona-editor-head { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; }
-.pe-name { font-size: 16px; font-weight: 600; flex: 0 0 auto; min-width: 16em; }
+.pe-name { font-size: 16px; font-weight: 600; flex: 1 1 auto; min-width: 224px; }
 .spacer { flex: 1; }
 .pe-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 10px; flex-wrap: wrap; }
 .pe-tab { background: none; border: none; padding: 6px 10px; cursor: pointer; border-bottom: 2px solid transparent; }
@@ -812,9 +885,9 @@ button.danger { background: var(--stop-btn); color: #fff; border: none; }
 .mc-empty p { line-height: 1.55; margin: 10px 0 16px; }
 
 .mc-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
-#mc-name { font-size: 16px; font-weight: 600; min-width: 18em; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; }
+#mc-name { font-size: 16px; font-weight: 600; min-width: 252px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; }
 .mc-settings { margin-bottom: 14px; }
-.mc-settings input[type="number"] { width: 4.5em; }
+.mc-settings input[type="number"] { width: 63px; }
 
 .mc-entries { display: flex; flex-direction: column; gap: 14px; }
 .mc-none { max-width: 40em; line-height: 1.5; }
@@ -853,7 +926,7 @@ button.danger { background: var(--stop-btn); color: #fff; border: none; }
 .mcs-ops { margin: 0; padding-left: 1.2em; font-size: 12px; line-height: 1.5; }
 .mcs-summary { padding: 8px 10px; border-radius: 6px; background: var(--row-selected); font-size: 13px; }
 
-#memory-core-select { max-width: 14em; }
+#memory-core-select { max-width: 196px; }
 #memory-core-select.hidden, #btn-memory-extract.hidden { display: none; }
 
 /* ---------------- Batch tab ---------------- */
@@ -933,3 +1006,14 @@ label.chk.disabled { opacity: 0.55; }
 /* Lane columns are sized for the full-height chat view; inside a card they need a cap. */
 #batch-lanes { max-height: 320px; }
 #batch-lanes.hidden { display: none; }
+
+/* ---------------- Network Access (Settings) ---------------- */
+.net-addresses { margin: 4px 0 8px; display: flex; flex-direction: column; gap: 4px; }
+.net-addr { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.net-addr code { font-size: 13px; }
+.net-addr .badge { font-size: 10px; }
+.net-help { margin: 6px 0 2px; font-size: 12px; }
+.net-help summary { cursor: pointer; opacity: 0.75; }
+.net-help p { margin: 6px 0; }
+.net-help .control-row { margin: 4px 0; }
+.net-help code { word-break: break-all; }

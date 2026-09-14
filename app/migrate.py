@@ -13,6 +13,10 @@ that already refuse a plain open) are skipped, so it is safe to run on every lau
 Carve-outs (must stay readable BEFORE login, or are already encrypted / are templates):
   * ``data/profiles.json`` and ``settings/profiles.json`` — the profile registries the
     ProfileManager reads at boot to know which profile is active.
+  * ``settings/network.json`` — the bind host and port (app/netconfig.py). main.py reads
+    it to open the listening socket, which happens before any login can supply the key.
+    Encrypting it does not fail loudly: netconfig falls back to its defaults, so the app
+    silently reverts to localhost on 8756 and the user simply cannot reach it any more.
   * ``settings/app_key.enc`` and any ``*.enc`` (e.g. the DB connection vault) — already
     encrypted with their own scheme.
   * ``settings/settings.example.json`` — a plaintext template that ships in the repo.
@@ -34,7 +38,7 @@ from pathlib import Path
 from . import core, crypto
 
 # Files that must NOT be encrypted (see module docstring).
-_SKIP_NAMES = {"profiles.json", "app_key.enc", "settings.example.json"}
+_SKIP_NAMES = {"profiles.json", "network.json", "app_key.enc", "settings.example.json"}
 _SKIP_SUFFIXES = {".enc", ".tmp", ".encmig"}
 # Directory suffix marking a third-party store we must not touch the insides of.
 _OPAQUE_STORE_SUFFIX = ".lance"

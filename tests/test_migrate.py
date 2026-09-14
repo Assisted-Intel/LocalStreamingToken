@@ -113,3 +113,26 @@ def test_the_profile_registry_survives_both_the_sweep_and_the_wipe(profile):
 
     migrate.wipe_encrypted()
     assert reg.exists()
+
+
+def test_the_network_settings_survive_both_the_sweep_and_the_wipe(profile):
+    """network.json holds the bind host and port, and main.py reads it to open the
+    listening socket — before any login can supply the key.
+
+    Encrypting it does not fail loudly, which is what makes this worth a test: netconfig
+    would fall back to its defaults, the app would quietly revert to localhost on 8756,
+    and a user who had shared it on their network would simply find it unreachable with
+    nothing to explain why.
+    """
+    from app import core, netconfig
+
+    _lance_store(profile)
+    netconfig.save({"lan_enabled": True, "port": 9000})
+
+    migrate.run()
+    assert not crypto.is_encrypted(core.NETWORK_FILE.read_bytes())
+    assert netconfig.load()["port"] == 9000
+
+    migrate.wipe_encrypted()
+    assert core.NETWORK_FILE.exists()
+    assert netconfig.load()["lan_enabled"] is True

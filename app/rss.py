@@ -39,10 +39,19 @@ a full page crawl of the item's ``<link>`` via ``core.fetch_url_text``. An episo
 escalates — importing the 226-item sample feed would otherwise fire 226 Playwright
 crawls to fetch credits we already have.
 
+--- Narrowing a feed before it is paid for ---
+
+``filter_items`` matches on the LISTING — title, categories, author, show notes — which
+one conditional GET already put in hand. It deliberately never reads the transcript: that
+costs a download, or minutes of GPU with Whisper on, for every episode, which is precisely
+the work a filter exists to avoid spending. And it runs BEFORE ``limit``, so "max 5" means
+the five newest *matching* items rather than whatever survives a head-slice.
+
 Public API:
     RSSError
     feed_id(url) / episode_key(item) / episode_id(feed_id, raw_key)
-    fetch_feed(url, limit=, refresh=, should_stop=, on_progress=) -> dict
+    parse_filters(src) -> dict / filter_items(items, filters) -> (kept, stats)
+    fetch_feed(url, limit=, filters=, refresh=, should_stop=, on_progress=) -> dict
     fetch_episode(feed, item, ...) -> dict
     format_episode_text(meta, ...) -> str
     episode_doc_name(feed, meta) -> str
@@ -72,6 +81,21 @@ _MEDIA_TYPES = ("audio/", "video/")
 
 DEFAULT_NOTES_MIN_CHARS = 600
 _FEED_TIMEOUT = 45
+
+# Category/keyword terms kept per item. Feeds written for search engines ship 100+
+# <itunes:keywords> terms on every episode; at 226 items that is most of a megabyte of
+# noise in a listing that gets re-encrypted and rewritten every time the feed changes.
+_MAX_CATEGORIES = 50
+_MAX_CATEGORY_CHARS = 80
+# Show notes searched by a keyword filter. Some feeds put a whole article in
+# <content:encoded>, and a filter is not a full-text index.
+_MAX_KEYWORD_NOTES_CHARS = 20_000
+# Categories quoted back when a filter matched nothing. Enough to correct a typo, not so
+# many that the warning becomes the feed's whole tag cloud. The tally behind it is bounded
+# too, because a keyword-stuffed feed can offer thousands of distinct terms.
+_MAX_WARNING_TERMS = 12
+_MAX_TALLIED_TERMS = 500
+_FILTER_MODES = ("any", "all")
 # A transcript file is text; 20 MB is far past any real one and stops a mislabelled
 # enclosure URL from being pulled into memory as a "transcript".
 _MAX_TRANSCRIPT_BYTES = 20 * 1024 * 1024
@@ -304,6 +328,182 @@ def _int_or_blank(value):
         return ""
 
 
+# --------------------------- categories & filtering ---------------------------
+
+def _norm_category(value) -> str:
+    """A category folded to its comparable form.
+
+    ``&`` becomes ``and`` and every other run of non-alphanumerics becomes one space, so
+    "Society & Culture", "society and culture" and "Society  &  Culture" are one category
+    without the match becoming fuzzy — the point is to absorb punctuation and casing, not
+    to guess at near-misses.
+    """
+    text = str(value or "").casefold().replace("&", " and ")
+    return re.sub(r"[^0-9a-z]+", " ", text).strip()
+
+
+def _terms(tags) -> list:
+    """Category terms out of a feedparser ``tags`` list, first spelling of each kept.
+
+    feedparser is enough here, unlike the ``podcast:*`` elements above: it already folds
+    ``<category>``, ``<category domain=…>``, ``<itunes:category text=…>``,
+    ``<itunes:keywords>`` (comma-split) and ``<media:keywords>`` into this one flat list,
+    and repeated ``<category>`` elements all survive. Verified against feedparser 6.0.11.
+    """
+    out, seen = [], set()
+    for tag in (tags or []):
+        if not isinstance(tag, dict):
+            continue
+        term = ((tag.get("term") or tag.get("label")) or "").strip()
+        if not term:
+            continue
+        term = term[:_MAX_CATEGORY_CHARS]
+        key = _norm_category(term)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(term)
+        if len(out) >= _MAX_CATEGORIES:
+            break
+    return out
+
+
+def _as_list(value) -> list:
+    """A filter field as a list of trimmed strings, from a list or a comma-separated
+    string. Both arrive in practice: the batch tab and the query string carry a string,
+    a JSON body or a test may carry a list."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        parts = []
+        for item in value:
+            parts.extend(str(item or "").split(","))
+    else:
+        parts = str(value).split(",")
+    out, seen = [], set()
+    for part in parts:
+        part = part.strip()
+        if not part or part.casefold() in seen:
+            continue
+        seen.add(part.casefold())
+        out.append(part)
+    return out
+
+
+def parse_filters(src) -> dict:
+    """Canonical filter dict from a mapping, or ``{}`` when nothing is set.
+
+    ``src`` is a batch source, a JSON body or a Flask ``request.args`` — all three are
+    mappings with ``get``, and all three may carry the fields as a comma-separated string.
+    An empty or whitespace-only box means "off", because ``sourceStream`` sends
+    ``categories=`` for an untouched input and that must not narrow anything.
+
+    An unrecognised ``match`` falls back to ``any`` rather than raising: these values
+    round-trip through a saved batch project that a user can hand-edit, and a typo there
+    must not turn into a failed run.
+    """
+    if not src:
+        return {}
+    get = getattr(src, "get", None)
+    if not callable(get):
+        return {}
+    categories = _as_list(get("categories"))
+    keywords = _as_list(get("keywords"))
+    exclude = _as_list(get("exclude"))
+    if not (categories or keywords or exclude):
+        return {}
+    mode = str(get("match") or "").strip().casefold()
+    return {"categories": categories, "keywords": keywords, "exclude": exclude,
+            "match": mode if mode in _FILTER_MODES else "any"}
+
+
+def _haystack(item) -> str:
+    """Lower-cased text a keyword filter searches: title, categories, author, notes.
+
+    The notes are run through the tag stripper first. On raw HTML a keyword filter is
+    quietly broken — "audio" matches ``class="audio-player"``, "img" matches every episode
+    carrying an image — and the failure looks like a bad filter rather than a bug.
+    """
+    parts = [item.get("title") or "", " ".join(item.get("categories") or []),
+             item.get("author") or ""]
+    body = item.get("body_html") or ""
+    if body:
+        parts.append(core._html_to_text(body[:_MAX_KEYWORD_NOTES_CHARS]))
+    return " ".join(parts).casefold()
+
+
+def filter_items(items, filters):
+    """``(kept, stats)`` for the items a listing filter accepts.
+
+    Two fields with two deliberately different rules, each stated in its own placeholder
+    in the UI:
+
+    * ``categories`` matches a WHOLE term, on ``_norm_category``'s folded form. Category
+      vocabularies are closed sets a user picks a label out of, so equality is the honest
+      match — substring would make "art" hit "Arts", "Martial Arts" and "Heart Health".
+    * ``keywords`` matches ANYWHERE in ``_haystack``. That is where "art" belongs.
+
+    ``exclude`` is a veto over that same text — which includes the categories — beats any
+    match, and is a valid filter by itself. ``match`` quantifies WITHIN a field: ``all``
+    wants every listed category and every listed keyword, ``any`` wants one of each. The
+    two fields are always ANDed.
+
+    Categories are read from the ITEM only, never inherited from the channel. Podcasts
+    overwhelmingly categorise at the show level, so inheriting would make every episode of
+    a News podcast match "news": the filter would appear to work perfectly while doing
+    nothing, and on a mixed blog feed it would wrongly rescue untagged posts. ``fetch_feed``
+    answers that case with a warning naming the show's categories instead.
+    """
+    if not filters:
+        return list(items), {"matched": len(items), "with_categories": 0}
+    wanted = [_norm_category(c) for c in filters.get("categories") or []]
+    wanted = [c for c in wanted if c]
+    keywords = [k.casefold() for k in filters.get("keywords") or []]
+    excluded = [e.casefold() for e in filters.get("exclude") or []]
+    need_all = (filters.get("match") or "any") == "all"
+    quantify = all if need_all else any
+
+    kept, with_categories, seen_terms = [], 0, {}
+    for item in items:
+        terms = {_norm_category(t) for t in (item.get("categories") or [])}
+        terms.discard("")
+        if terms:
+            with_categories += 1
+        # Tallied in the feed's own spelling: this is what the zero-match warning offers
+        # back as "the categories these items DO publish", which is the difference between
+        # a dead end and a one-word correction. Counted, not just collected, so the offer
+        # can lead with the terms that actually partition the feed — a facet shared by 40
+        # episodes is worth typing, and the <itunes:keywords> noise unique to one episode
+        # is not, even though both are equally matchable.
+        for original in (item.get("categories") or []):
+            key = _norm_category(original)
+            if not key:
+                continue
+            if key in seen_terms:
+                seen_terms[key][1] += 1
+            elif len(seen_terms) < _MAX_TALLIED_TERMS:
+                seen_terms[key] = [original, 1]
+        # Built once per item and only when something needs it: _html_to_text over 226
+        # items' show notes is not free.
+        text = None
+        if keywords or excluded:
+            text = _haystack(item)
+        if excluded and any(e in text for e in excluded):
+            continue
+        if wanted and not quantify(c in terms for c in wanted):
+            continue
+        if keywords and not quantify(k in text for k in keywords):
+            continue
+        kept.append(item)
+    # Commonest first, ties in feed order — sorted() is stable, so equally common terms
+    # keep the order the feed listed them in rather than an arbitrary one.
+    ranked = sorted(seen_terms.values(), key=lambda pair: -pair[1])
+    return kept, {"matched": len(kept), "with_categories": with_categories,
+                  "terms": [original for original, _n in ranked[:_MAX_WARNING_TERMS]]}
+
+
 def _normalize_entry(entry, extras) -> dict:
     """One feedparser entry plus its raw-XML ``podcast:*`` extras, as a plain dict.
 
@@ -333,6 +533,9 @@ def _normalize_entry(entry, extras) -> dict:
         "episode": _int_or_blank(entry.get("itunes_episode")),
         "season": _int_or_blank(entry.get("itunes_season")),
         "author": (entry.get("author") or "").strip(),
+        # Always a list, never absent: this dict IS the cached listing shape, and a
+        # filter reading a missing key would silently match nothing.
+        "categories": _terms(entry.get("tags")),
         "enclosure_url": enc_url,
         "enclosure_type": enc_type,
         "enclosure_bytes": enc_bytes,
@@ -344,8 +547,16 @@ def _normalize_entry(entry, extras) -> dict:
     }
 
 
-def fetch_feed(url, *, limit=0, refresh=False, should_stop=None, on_progress=None) -> dict:
+def fetch_feed(url, *, limit=0, filters=None, refresh=False, should_stop=None,
+               on_progress=None) -> dict:
     """Read a feed, newest-first in feed order, and return its listing.
+
+    ``filters`` (see ``parse_filters``) narrows the listing BEFORE ``limit`` is applied.
+    That order is the whole design: taking the newest 5 and then filtering would return
+    one episode from a feed with 200 matching items, with no way to reach the older
+    matches, whereas filtering first makes ``limit`` read as "the newest N *matching*
+    items" — and makes the filter bound the per-episode downloads and Whisper GPU time
+    rather than discard work already paid for.
 
     Cached with an HTTP conditional GET rather than forever: a feed's whole purpose is to
     change, so a never-expiring listing would break "check for new episodes" — while no
@@ -402,22 +613,70 @@ def fetch_feed(url, *, limit=0, refresh=False, should_stop=None, on_progress=Non
         entry, from_cache = cached, True
 
     items = list(entry.get("items") or [])
+    total_available = len(items)
+    # Before the filter: the comparison has to see the whole listing, or a narrow filter
+    # would quietly stop reporting a feed that regenerated its episode ids.
     if cached and not from_cache:
         warnings.extend(_warn_on_unstable_ids(cached, entry))
+
+    filters = filters or {}
+    feed_categories = _terms_or_list(entry.get("categories"))
+    if filters:
+        # Rebinding the local list only. ``entry["items"]`` is the cached record, and
+        # filtering it would poison every later read of this feed with one run's filter.
+        items, stats = filter_items(items, filters)
+        if not items:
+            warnings.append(_no_match_warning(total_available, stats, feed_categories,
+                                              filters))
+    matched = len(items)
     if limit and limit > 0:
         items = items[:int(limit)]
 
     if on_progress:
-        on_progress("feed", total=len(items), title=entry.get("title") or "",
+        on_progress("feed", total=len(items), matched=matched, title=entry.get("title") or "",
                     from_cache=from_cache)
 
     return {"feed_id": fid, "url": url, "final_url": entry.get("final_url") or url,
             "title": entry.get("title") or "", "author": entry.get("author") or "",
             "link": entry.get("link") or "", "description": entry.get("description") or "",
             "image": entry.get("image") or "", "language": entry.get("language") or "",
+            "categories": feed_categories,
             "items": items, "item_count": len(items),
-            "total_available": len(entry.get("items") or []),
+            # Three separate numbers rather than two overloaded ones: the whole feed, what
+            # the filter accepted, and what the limit then took.
+            "total_available": total_available, "matched": matched, "filters": filters,
             "from_cache": from_cache, "warnings": warnings}
+
+
+def _terms_or_list(value) -> list:
+    """Feed-level categories from either shape. A listing cached before categories existed
+    is re-parsed (rss_cache.FEED_ENTRY_VERSION), so this only guards a hand-built dict."""
+    return [str(v).strip() for v in (value or []) if str(v or "").strip()]
+
+
+def _no_match_warning(total_available, stats, feed_categories, filters) -> str:
+    """Why a filter matched nothing — the difference between a feature that looks broken
+    and one that explains itself.
+
+    Every branch tries to name the thing the user could type instead, because "0 items" on
+    its own is indistinguishable from a bug. The commonest case by far is a podcast that
+    categorises the SHOW and not its episodes: the user filters on a category they can
+    plainly see on the feed and gets nothing back.
+    """
+    head = f"The filter matched none of the {total_available} item(s) in this feed."
+    wanted_categories = bool(filters.get("categories"))
+    if not stats.get("with_categories") and feed_categories:
+        return (f"{head} It publishes its categories at the show level "
+                f"({', '.join(feed_categories)}) rather than per episode, so a category "
+                f"filter can't narrow it — try a keyword filter instead.")
+    if not stats.get("with_categories"):
+        return (f"{head} None of its items publish any categories at all, so only a "
+                f"keyword filter can narrow this feed.")
+    if wanted_categories and stats.get("terms"):
+        offer = ", ".join(stats["terms"])
+        return (f"{head} The categories these items do publish are: {offer}. Category "
+                f"terms have to match in full — use the keyword box for partial words.")
+    return f"{head} Try fewer terms, or 'any' instead of 'all'."
 
 
 def _parse_feed_bytes(url, fid, raw, resp_headers) -> dict:
@@ -447,6 +706,10 @@ def _parse_feed_bytes(url, fid, raw, resp_headers) -> dict:
                                           info.get("description") or "")[:2000],
         "image": image,
         "language": (info.get("language") or "").strip().lower(),
+        # Show-level <itunes:category>, nested subcategories included. Not used for
+        # matching (see filter_items) — this is what the zero-match warning quotes back
+        # when a feed categorises the show but not its episodes.
+        "categories": _terms(info.get("tags")),
         "etag": _header(resp_headers, "ETag"),
         "modified": _header(resp_headers, "Last-Modified"),
         "content_hash": _content_hash(raw),

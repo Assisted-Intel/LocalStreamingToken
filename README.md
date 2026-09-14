@@ -2,7 +2,8 @@
 
 **A local-first LLM workbench that runs entirely on your own machine.**
 
-One command starts a small web server on `127.0.0.1` and opens your browser to it.
+One command starts a small web server on `127.0.0.1` and opens your browser to it
+(one setting opens it to your other devices on the same network, if you want that).
 From there you get chat, document retrieval, personas, batch processing, model
 evaluation, and AI-assisted database editing — all backed by models running on your
 own hardware via [Ollama](https://ollama.com), with everything you feed it stored
@@ -150,9 +151,36 @@ pip install -r requirements.txt
 python main.py
 ```
 
-That's it. `main.py` binds **`127.0.0.1` only** (never `0.0.0.0`), takes port **8756**
+That's it. Out of the box `main.py` binds **`127.0.0.1` only**, takes port **8756**
 or the next free one if that's taken, prints the URL, and opens your default browser
 after a second. Press **Ctrl+C** in the terminal to stop.
+
+To reach it from your phone or another PC on the same network, turn on
+**Settings -> Network Access**, which also sets the port. Those two values are the one
+piece of configuration kept *outside* the encrypted settings file — in plaintext
+`settings/network.json` — because the server has to bind its socket before anyone can
+log in to decrypt anything. `python main.py --lan`, `--no-lan` and `--port N` override
+them for a single run without changing what is saved. Read
+[Your data and privacy](#your-data-and-privacy) before you turn sharing on.
+
+### From a phone
+
+The interface is responsive. On a small screen the tab strip and the profile pickers move
+into a **☰** drawer, the chat list becomes a slide-over panel, and the composer stays
+pinned above the keyboard. Add it to your home screen and it opens without browser chrome.
+
+Two things work differently away from the host machine, because they have to. Every file
+button here was built around a native OS dialog, which opens on the computer running the
+app — no use at all from a phone. So when you are browsing from another device:
+
+- **Attach, import and export use the browser instead.** Picking a file opens your
+  phone's own picker (including the camera for images), and exports download normally.
+- **Choosing a *folder* still only works on the host.** A web page cannot hand a
+  directory to a server, so the Batch folder pickers say so rather than doing nothing.
+
+The layout is checked by `python tools/mobile_check.py <url>`, which drives a
+phone-sized browser and fails on sideways overflow, unreachable tabs, touch targets under
+44px and text fields small enough to make iOS zoom.
 
 A fresh clone contains no configuration and no data. Everything — the `data/` folder,
 the encryption keyfile, your first profile — is created on that first run.
@@ -179,8 +207,8 @@ This is not cosmetic. Your login password is what protects your encrypted data:
 
 The normal route is the **⚙ Settings** tab in the app — nothing needs to be edited by
 hand. [`settings/settings.example.json`](settings/settings.example.json) is committed as
-a reference for the file format; your real `settings/settings.json` is gitignored and
-encrypted.
+a reference for the file format; your real `settings/profiles/<id>/settings.json` is
+gitignored and encrypted. Bind host/port live in `settings/network.json`, also gitignored.
 
 Add a server row, pick a type, and the base URL fills itself in:
 
@@ -295,6 +323,25 @@ the chat composer, the Resources tab, the Batch tab, or straight into a persona'
 knowledge base. You choose how many of the newest items to take; already-fetched ones
 come from cache, so raising that number is how you pick up what's new.
 
+**Narrowing a feed** — every one of those panels can take a filter, so a 226-episode feed
+doesn't have to arrive whole. **Categories** matches a whole tag on the item, drawn from
+`<category>`, `<itunes:category>` and `<itunes:keywords>` alike — "Arts", not "art", with
+case and punctuation ignored so *Society & Culture* and *society and culture* are one tag.
+**Keywords** matches anywhere in the title, categories, author or show notes.
+**Exclude** skips anything it matches and beats both. **Match any/all** decides whether one
+listed term is enough. The filter reads only the listing, which one request already
+fetched — never the transcript, since reading that would cost the download and GPU time the
+filter exists to save. In the Batch tab the filter belongs to each source, so two feeds in
+one run can be narrowed differently, and it is saved with the project.
+
+The filter is applied **before** "Max episodes", so that number means the newest N
+*matching* items — and it decides what gets downloaded rather than discarding work already
+paid for, which is where the real saving is when local transcription is on. If nothing
+matches you're told why rather than just handed nothing: most podcasts tag the *show*
+instead of each episode, so that case names the show's categories and points you at keyword
+filtering; a feed that does tag its episodes offers the categories it actually publishes,
+commonest first.
+
 For podcasts this is **Podcasting 2.0**-aware. When a feed publishes a
 `<podcast:transcript>` — as the No Agenda feed does, for all 226 of its episodes — the
 transcript is downloaded and used directly, which is fast and free. Multiple formats are
@@ -394,16 +441,37 @@ source documents + memories). Importing a bundle re-ingests and re-embeds locall
 - **The repo is safe to fork.** `data/` and everything in `settings/` except the example
   template are gitignored, so your keys and chats can't be committed by accident.
 
-Bear in mind what this is: a **single-user tool bound to localhost**. It trusts its own
-operator — SQL fragments in the database tab, for example, are passed through verbatim
-by design. Don't expose it to a network you don't control.
+Bear in mind what this is: a **single-user tool**, bound to localhost unless you say
+otherwise. It trusts its own operator — SQL fragments in the database tab, for example,
+are passed through verbatim by design.
+
+**If you turn on Settings -> Network Access**, that trust extends to everyone who can
+reach the port, so understand what you are handing out:
+
+- **One login, one shared everything.** There are no separate accounts. Everyone signs
+  in with the same password and shares the same chats, profile and settings; two people
+  using it at once will overwrite each other. It is remote *access* to your own app, not
+  multi-user.
+- **Change the default password first.** A `admin`/`admin` login on an open port is an
+  open door. The app warns loudly — in the Settings card and in the terminal — but by
+  design it does not stop you.
+- **Anyone signed in can reach this machine's filesystem.** Batch runs read and write
+  folder paths sent by the client, and the file pickers open native dialogs on the
+  *host* desktop, not the visitor's.
+- **It is plain HTTP.** Traffic, including the password, crosses the network unencrypted.
+  Fine on your own LAN; not fine on a network you don't control.
+
+Two things do guard the exposed surface: state-changing requests carrying an `Origin`
+from another site are refused, and repeated failed logins from one address are throttled.
+Neither substitutes for a real password on a trusted network.
 
 ---
 
 ## Project layout
 
 ```
-main.py                     Launcher: pick a port, start the server, open the browser
+main.py                     Launcher: pick host+port, serve, open the browser, rebind on request
+tools/mobile_check.py       Drives a phone-sized browser and checks the layout holds up
 requirements.txt            Python dependencies (annotated, air-gap friendly)
 OLLAMA_REQUIREMENTS.md      Ollama install + model/hardware guidance
 rag-deps.md                 Which Ollama models RAG needs, and on which host
@@ -415,6 +483,8 @@ app/
   providers.py              Provider adapters behind one chat_stream() interface
   core.py                   Ollama client, web search, paths, branding, encrypted I/O
   crypto.py                 AES-256-GCM at rest; scrypt-wrapped data key
+  netconfig.py              Bind host + port (plaintext: read before login)
+  transfer.py               Browser uploads/downloads for the native-dialog features
   migrate.py                One-time, idempotent encryption of legacy plaintext
   store.py                  Thread-safe JSON persistence per profile
   profiles.py               Data profiles + settings profiles + incognito

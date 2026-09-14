@@ -128,6 +128,10 @@ def isolate_paths(tmp_path, monkeypatch, unlock=False):
     monkeypatch.setattr(core, "SETTINGS_REGISTRY_FILE", settings / "profiles.json")
     monkeypatch.setattr(core, "INCOGNITO_DIR", data / "profiles" / ".incognito")
     monkeypatch.setattr(core, "APP_KEYFILE", settings / "app_key.enc")
+    # Plaintext and app-wide, so it is NOT covered by the profile redirection above and
+    # a test that saves network settings would otherwise write into the developer's real
+    # settings/ folder — and change where their app binds.
+    monkeypatch.setattr(core, "NETWORK_FILE", settings / "network.json")
     for d in (data, settings):
         d.mkdir(parents=True, exist_ok=True)
     crypto.create_keyfile(core.APP_KEYFILE)          # default admin/admin
@@ -250,12 +254,19 @@ def no_ytdlp(monkeypatch):
 
 def podcast_item(n=1, *, guid=None, title=None, transcripts=(("srt", "captions"),),
                  enclosure=True, body="", link=None, pubdate=None, persons=2,
-                 chapters=False, duration="3600"):
+                 chapters=False, duration="3600", categories=(), domain_category="",
+                 keywords="", itunes_category=""):
     """One <item>. ``transcripts`` is [(kind, rel)]; kind in srt|vtt|json|text|html|pdf.
 
     Emits REAL Podcasting 2.0 markup — repeated <podcast:person> and multiple
     <podcast:transcript> elements — because that is precisely what feedparser flattens
     away and app/rss.py parses out of the raw XML instead.
+
+    The four category flavours are separate parameters rather than one list because
+    ``rss._terms`` rests on feedparser folding all of them into a single flat
+    ``entry.tags``: plain <category>, <category domain=…>, <itunes:category text=…> and
+    comma-separated <itunes:keywords>. A test that only emitted the plain form would not
+    notice feedparser changing its mind about the others.
     """
     types = {"srt": "application/srt", "vtt": "text/vtt", "json": "application/json",
              "text": "text/plain", "html": "text/html", "pdf": "application/pdf"}
@@ -271,6 +282,14 @@ def podcast_item(n=1, *, guid=None, title=None, transcripts=(("srt", "captions")
         parts.append(f"    <itunes:duration>{duration}</itunes:duration>")
     if body:
         parts.append(f"    <content:encoded><![CDATA[{body}]]></content:encoded>")
+    for cat in categories:
+        parts.append(f"    <category>{cat}</category>")
+    if domain_category:
+        parts.append(f"    <category domain='http://test/tax'>{domain_category}</category>")
+    if itunes_category:
+        parts.append(f"    <itunes:category text='{itunes_category}' />")
+    if keywords:
+        parts.append(f"    <itunes:keywords>{keywords}</itunes:keywords>")
     if enclosure:
         parts.append(f"    <enclosure url='https://cdn.test/ep{n}.mp3' "
                      f"type='audio/mpeg' length='1000' />")
@@ -287,10 +306,23 @@ def podcast_item(n=1, *, guid=None, title=None, transcripts=(("srt", "captions")
     return "  <item>\n" + "\n".join(parts) + "\n  </item>"
 
 
-def feed_xml(items=None, *, title="Test Show", language="en"):
-    """A Podcasting 2.0 RSS document. ``items`` is a list of podcast_item() strings."""
+def feed_xml(items=None, *, title="Test Show", language="en", categories=()):
+    """A Podcasting 2.0 RSS document. ``items`` is a list of podcast_item() strings.
+
+    ``categories`` is show-level <itunes:category>. A tuple entry emits the NESTED
+    subcategory form — <itunes:category text="News"><itunes:category text="Politics"/>
+    </itunes:category> — which is what real podcast feeds publish and what the zero-match
+    warning quotes back when a show is categorised but its episodes are not.
+    """
     if items is None:
         items = [podcast_item(1)]
+    chan = []
+    for cat in categories:
+        if isinstance(cat, (list, tuple)):
+            subs = "".join(f"<itunes:category text='{s}' />" for s in cat[1:])
+            chan.append(f"  <itunes:category text='{cat[0]}'>{subs}</itunes:category>\n")
+        else:
+            chan.append(f"  <itunes:category text='{cat}' />\n")
     return (
         "<?xml version='1.0' encoding='UTF-8'?>\n"
         "<rss version='2.0'\n"
@@ -304,6 +336,7 @@ def feed_xml(items=None, *, title="Test Show", language="en"):
         f"  <language>{language}</language>\n"
         "  <link>https://show.test/</link>\n"
         "  <description>A test show.</description>\n"
+        + "".join(chan)
         + "\n".join(items) +
         "\n</channel>\n</rss>\n"
     ).encode("utf-8")

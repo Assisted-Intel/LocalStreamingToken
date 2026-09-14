@@ -50,6 +50,18 @@ const S = {
   evalGenRunId: null,   // the ✨ Generate Data run, independent of an evaluation run
   evalGenRunning: false,
   evalInited: false,
+  voice: {
+    on: false,
+    speaking: false,
+    skipSpeak: false,
+    handlingTurn: false,
+    pollTimer: null,
+    speaker: null,
+    listenState: "idle",
+    speakChain: Promise.resolve(),
+    helperLoading: false,
+    modelsReady: false,
+  },
   // Batch tab. `batchRunning` above belongs to the chat composer's older folder-batch
   // button and stays separate, so a Batch-tab run doesn't lock the chat.
   batch: {
@@ -129,6 +141,87 @@ async function postFiles(path, files, fields = {}) {
   }
   return res.json();
 }
+
+
+// ------------------------------- File transfer -----------------------------
+// Every file button in this app was written around a native dialog that opens on the
+// machine running the server. From any other device that is a button which hangs. These
+// two helpers give those same buttons a browser path: pick locally, stage on the server,
+// hand the route the paths it already knows how to consume (see app/transfer.py).
+
+/** Show the browser's file picker. Resolves to a (possibly empty) array of File. */
+function chooseFiles({ accept = "", multiple = true, capture = "" } = {}) {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    if (accept) input.accept = accept;
+    if (multiple) input.multiple = true;
+    // On a phone this is what puts "Take Photo" at the top of the sheet.
+    if (capture) input.capture = capture;
+    input.style.position = "fixed";
+    input.style.opacity = "0";
+    input.style.pointerEvents = "none";
+    document.body.appendChild(input);
+    let done = false;
+    const finish = (files) => {
+      if (done) return;
+      done = true;
+      input.remove();
+      resolve(files);
+    };
+    input.addEventListener("change", () => finish([...input.files]), { once: true });
+    // Not every browser fires `cancel`; without the focus fallback a dismissed picker
+    // would leave the caller awaiting a promise that never settles.
+    input.addEventListener("cancel", () => finish([]), { once: true });
+    window.addEventListener("focus", () => setTimeout(() => finish([]), 400), { once: true });
+    input.click();
+  });
+}
+
+/** Choose files and stage them on the server.
+ *
+ *  Returns `{ paths: [...] }` to merge into the route's body, `{}` when this browser is
+ *  on the server's own machine and the native dialog should be used exactly as before,
+ *  or `null` when the user cancelled.
+ */
+async function chooseAndStage(opts = {}) {
+  if (isLocalBrowser()) return {};
+  const files = await chooseFiles(opts);
+  if (!files.length) return null;
+  setStatus(`Uploading ${files.length} file(s)…`);
+  try {
+    const r = await postFiles("/api/uploads", files);
+    return { paths: r.paths };
+  } finally {
+    setStatus("");
+  }
+}
+
+/** A route that could not open a Save dialog stages its output instead; collect it. */
+function takeDownload(r) {
+  if (r && r.download) {
+    window.open(r.download, "_blank");
+    return true;
+  }
+  return false;
+}
+
+/** Folder selection has no browser equivalent — there is no way for a page to hand a
+ *  directory to the server. Say so rather than opening a picker on someone else's
+ *  desktop (which the server also refuses). */
+function folderPickingUnavailable() {
+  if (isLocalBrowser()) return false;
+  toast("Choosing a folder only works on the computer running the app. Browse to it "
+        + "there, or attach the files individually.", 8000);
+  return true;
+}
+
+// Accept lists, kept here so a route and its picker cannot drift apart.
+const ACCEPT_DOCS = ".txt,.md,.markdown,.pdf,.docx,.epub,.csv,.json,.log,.rst";
+const ACCEPT_IMAGES = "image/*";
+const ACCEPT_MEDIA = "audio/*,video/*";
+const ACCEPT_JSON = ".json,application/json";
+const ACCEPT_XML = ".xml,text/xml,application/xml";
 
 /**
  * Consume a Server-Sent Events stream from a POST endpoint.
@@ -705,6 +798,7 @@ async function init() {
   }
   // After the chat is loaded, so the summary reflects real values. Absent key ⇒ collapsed.
   setThreadSettingsCollapsed(S.config.chat_settings_collapsed !== false, false);
+  maybeAutostartAvatar();
 }
 
 // ------------------------------- servers/models ----------------------
@@ -930,21 +1024,27 @@ function reportExport(r, what) {
 }
 async function exportAllChats() {
   try {
-    const r = await api("/api/chats/export", { method: "POST", body: { scope: "all" } });
+    const r = await api("/api/chats/export",
+                        { method: "POST", body: { scope: "all", download: !isLocalBrowser() } });
     if (r.cancelled) return;
+    if (takeDownload(r)) { toast(`Exported ${r.count} chat(s)`); return; }
     reportExport(r, `Exported ${r.count} chat(s)`);
   } catch (e) { toast("Export failed: " + e.message); }
 }
 async function exportChat(id) {
   try {
-    const r = await api(`/api/chats/${id}/export`, { method: "POST", body: {} });
+    const r = await api(`/api/chats/${id}/export`,
+                        { method: "POST", body: { download: !isLocalBrowser() } });
     if (r.cancelled) return;
+    if (takeDownload(r)) { toast("Chat exported"); return; }
     reportExport(r, "Chat exported");
   } catch (e) { toast("Export failed: " + e.message); }
 }
 async function importChats() {
   try {
-    const r = await api("/api/chats/import", { method: "POST", body: {} });
+    const staged = await chooseAndStage({ accept: ACCEPT_JSON, multiple: false });
+    if (staged === null) return;
+    const r = await api("/api/chats/import", { method: "POST", body: staged });
     if (r.cancelled) return;
     S.chats = r.chats; S.groups = r.chat_groups;
     S.activeGroup = r.group.id;
@@ -991,6 +1091,7 @@ function loadChatObject(chat) {
   $("ctx-select").value = chat.num_ctx || S.config.default_num_ctx || 4096;
   $("chk-isolate").checked = !!chat.isolated;
   $("chk-hide-thinking").checked = !!chat.hide_thinking;
+  $("btn-voice-reason").classList.toggle("active", !!chat.voice_read_reasoning);
   $("chk-websearch").checked = !!chat.web_search;
   $("chk-strict").checked = !!chat.library_strict;
   $("crawl-pages").value = chat.crawl_pages || S.minCrawledPages || 7;
@@ -1618,7 +1719,13 @@ function scrollBottom() { const box = $("messages"); box.scrollTop = box.scrollH
 // True when the view is already pinned near the bottom. Used to decide whether a
 // streaming update should auto-follow — if the user has scrolled up, we leave the
 // scroll position alone so they can read earlier content without being yanked down.
-function isNearBottom(box) { return box.scrollHeight - box.scrollTop - box.clientHeight < 80; }
+function isNearBottom(box) {
+  // Looser on a touchscreen: momentum scrolling overshoots the bottom routinely, and
+  // a soft keyboard opening changes clientHeight under us. At 80px a phone drops out
+  // of follow-the-stream constantly.
+  const slack = (typeof isTouch === "function" && isTouch()) ? 160 : 80;
+  return box.scrollHeight - box.scrollTop - box.clientHeight < slack;
+}
 
 // Drag handle under the chat thread: pins #messages to an explicit height while
 // dragging (double-click clears it to restore the default flex-fill). Pointer
@@ -1627,6 +1734,9 @@ function setupMessagesResizer() {
   const handle = $("messages-resizer"), box = $("messages");
   if (!handle || !box) return;
   let dragging = false, startY = 0, startH = 0;
+  // Without this the browser claims a touch drag for scrolling and pointermove never
+  // fires. The handle is hidden below the breakpoint anyway, but a touch laptop has it.
+  handle.style.touchAction = "none";
   handle.addEventListener("pointerdown", (e) => {
     dragging = true; startY = e.clientY; startH = box.getBoundingClientRect().height;
     handle.setPointerCapture(e.pointerId); document.body.style.userSelect = "none";
@@ -1644,6 +1754,129 @@ function setupMessagesResizer() {
   handle.addEventListener("pointerup", end);
   handle.addEventListener("pointercancel", end);
   handle.addEventListener("dblclick", () => { box.style.flex = ""; box.style.height = ""; });
+}
+
+// ------------------------------- Small screens -----------------------------
+// Everything that a stylesheet cannot do on its own: moving the nav into a drawer,
+// keeping the composer usable with a soft keyboard, and not sending a message every
+// time someone reaches for a newline.
+//
+// The breakpoint is duplicated from mobile.css by necessity — CSS custom properties
+// cannot be read by a media query and matchMedia cannot read a stylesheet — so the two
+// have to be changed together.
+const MOBILE_MQ = matchMedia("(max-width: 820px)");
+const COARSE_MQ = matchMedia("(pointer: coarse)");
+const isTouch = () => COARSE_MQ.matches;
+
+/** Move the tab strip and the profile bar into the drawer below the breakpoint, and put
+ *  them back above it.
+ *
+ *  Moved rather than duplicated: two copies would mean two elements answering to
+ *  `data-tab` and two `#data-profile-select`s, and every handler in this file binds to a
+ *  single element by id. Re-parenting keeps those bindings intact — listeners belong to
+ *  the element, not to its position in the tree. */
+function syncNav() {
+  const drawer = $("nav-drawer");
+  const tabs = document.querySelector("nav.tabs");
+  const profiles = $("profile-bar");
+  if (!drawer || !tabs || !profiles) return;
+  if (MOBILE_MQ.matches) {
+    if (tabs.parentElement !== drawer) drawer.appendChild(tabs);
+    if (profiles.parentElement !== drawer) drawer.appendChild(profiles);
+  } else {
+    closeDrawers();
+    if (tabs.parentElement !== $("app-header")) $("app-header").appendChild(tabs);
+    if (profiles.parentElement !== document.body) {
+      document.body.insertBefore(profiles, $("app-header").nextSibling);
+    }
+    // The resizer writes an explicit pixel height onto #messages, and it is hidden below
+    // the breakpoint — coming back to a wide window with a stale height would leave the
+    // thread the wrong size with no visible handle to have caused it.
+    const box = $("messages");
+    if (box) { box.style.flex = ""; box.style.height = ""; }
+  }
+}
+
+/** Open or close one of the two slide-over panels (the nav drawer, the chat list).
+ *  Both share the scrim, and only one can be open at a time. */
+function setDrawer(panel, toggle, open) {
+  const scrim = $("nav-scrim");
+  if (open) {
+    panel.hidden = false;
+    // Two frames: [hidden] must be gone and the browser must have laid the panel out
+    // before .open flips the transform, or there is nothing to transition from.
+    requestAnimationFrame(() => requestAnimationFrame(() => panel.classList.add("open")));
+    scrim.hidden = false;
+    toggle.setAttribute("aria-expanded", "true");
+    const first = panel.querySelector("button, select, a, input");
+    if (first) first.focus();
+  } else {
+    panel.classList.remove("open");
+    toggle.setAttribute("aria-expanded", "false");
+    scrim.hidden = true;
+    // #sidebar is a real element on desktop, so it must never be left hidden; only the
+    // drawer, which is empty above the breakpoint, gets its attribute back.
+    if (panel.id === "nav-drawer") setTimeout(() => { if (!panel.classList.contains("open")) panel.hidden = true; }, 200);
+  }
+}
+
+function closeDrawers() {
+  const drawer = $("nav-drawer"), side = $("sidebar");
+  if (drawer && (drawer.classList.contains("open") || !drawer.hidden)) {
+    setDrawer(drawer, $("btn-nav"), false);
+  }
+  if (side && side.classList.contains("open")) setDrawer(side, $("btn-chats"), false);
+  $("nav-scrim").hidden = true;
+}
+
+function toggleDrawer(panel, toggle) {
+  setDrawer(panel, toggle, !panel.classList.contains("open"));
+}
+
+/** Grow the composer with its content instead of leaving it stuck at three rows.
+ *  `resize: vertical` is a mouse-only grabber and does nothing on a touchscreen. */
+function autoGrowComposer() {
+  const ta = $("input-box");
+  if (!ta) return;
+  if (!MOBILE_MQ.matches) { ta.style.height = ""; return; }
+  ta.style.height = "auto";
+  // Capped in CSS via max-height; this keeps the element itself in step with it.
+  ta.style.height = Math.min(ta.scrollHeight, Math.round(innerHeight * 0.4)) + "px";
+}
+
+function setupMobile() {
+  const drawer = $("nav-drawer"), side = $("sidebar");
+  $("btn-nav").onclick = () => toggleDrawer(drawer, $("btn-nav"));
+  $("btn-chats").onclick = () => toggleDrawer(side, $("btn-chats"));
+  $("nav-scrim").onclick = closeDrawers;
+  // Picking a destination should not leave the drawer sitting over it.
+  drawer.addEventListener("click", (e) => { if (e.target.closest(".tab")) closeDrawers(); });
+  side.addEventListener("click", (e) => {
+    if (e.target.closest(".chat-row, .chat-tab, #btn-new-chat, #btn-new-private")) closeDrawers();
+  });
+
+  syncNav();
+  MOBILE_MQ.addEventListener("change", () => { syncNav(); autoGrowComposer(); });
+
+  // On a phone the Return key is how you start a new line. Enter-to-send is a keyboard
+  // convenience and there is a Send button two centimetres away; without this guard the
+  // composer cannot produce a newline at all.
+  const ta = $("input-box");
+  ta.addEventListener("input", autoGrowComposer);
+  if (isTouch()) {
+    ta.placeholder = "Type a message…";
+  }
+
+  // The soft keyboard shrinks the visual viewport rather than resizing the window, so
+  // nothing in the layout reacts to it. If the thread was pinned to the bottom, keep it
+  // there once the keyboard has settled.
+  if (window.visualViewport) {
+    visualViewport.addEventListener("resize", () => {
+      const box = $("messages");
+      if (box && isNearBottom(box)) setTimeout(scrollBottom, 50);
+      autoGrowComposer();
+    });
+  }
 }
 
 // --------------------------- thread settings -------------------------
@@ -1714,9 +1947,14 @@ function setGeneratingUI(on) {
   // Greys out the per-message Edit buttons (Copy stays live). beginEditMessage guards
   // this too, because S.batchRunning is set outside this function.
   $("messages").classList.toggle("generating", on);
-  $("btn-send").classList.toggle("hidden", on);
   $("btn-batch").classList.toggle("hidden", on);
-  $("btn-stop").classList.toggle("hidden", !on);
+  refreshStopVisibility();
+}
+
+function refreshStopVisibility() {
+  const stopOn = !!S.generating || (S.voice.on && S.voice.speaking);
+  $("btn-send").classList.toggle("hidden", stopOn);
+  $("btn-stop").classList.toggle("hidden", !stopOn);
 }
 
 // --------------------------- data classification ---------------------------
@@ -1914,6 +2152,7 @@ function showComposerPanel(which) {
   if (which === "rss") {
     $("add-rss-input").value = "";
     $("add-rss-limit").value = String(S.config.rss_max_episodes ?? 25);
+    resetRssFilters("add-rss");
     const p = $("add-rss-progress"); p.classList.add("hidden"); p.textContent = "";
     // The Whisper box is only offerable if faster-whisper is actually importable.
     refreshWhisperStatus();
@@ -2011,9 +2250,11 @@ async function uploadImageBlobs(blobs) {
 async function composerAddImages() {
   const progressEl = $("add-image-progress");
   let ui = null;
-  setStatus("Waiting for image selection…");
+  const stagedImgs = await chooseAndStage({ accept: ACCEPT_IMAGES, capture: "environment" });
+  if (stagedImgs === null) return;
+  setStatus(isLocalBrowser() ? "Waiting for image selection…" : "Reading images…");
   try {
-    await streamSSE("/api/images/pick", {}, {
+    await streamSSE("/api/images/pick", stagedImgs, {
       begin: (d) => {
         setStatus("");
         if (!d.total) return;
@@ -2062,9 +2303,11 @@ async function saveImageToDisk(id, defaultName) {
   btn.disabled = true;
   try {
     const r = await api(`/api/images/${encodeURIComponent(id)}/save`, {
-      method: "POST", body: { default_name: defaultName || "image" },
+      method: "POST",
+      body: { default_name: defaultName || "image", download: !isLocalBrowser() },
     });
-    if (r.ok) toast("Saved to " + r.path);
+    if (takeDownload(r)) toast("Image downloaded");
+    else if (r.ok) toast("Saved to " + r.path);
     else if (!r.cancelled) toast("Save failed" + (r.error ? ": " + r.error : ""));
   } catch (e) { toast("Save failed: " + e.message); }
   btn.disabled = false;
@@ -2149,9 +2392,11 @@ async function composerAddUrl() {
 async function composerAddFiles() {
   const progressEl = $("add-files-progress");
   let ui = null;
-  setStatus("Waiting for file selection…");
+  const stagedDocs = await chooseAndStage({ accept: ACCEPT_DOCS });
+  if (stagedDocs === null) return;
+  setStatus(isLocalBrowser() ? "Waiting for file selection…" : "Reading files…");
   try {
-    await streamSSE("/api/extract-files", {}, {
+    await streamSSE("/api/extract-files", stagedDocs, {
       begin: (d) => {
         setStatus("");
         if (!d.total) return;
@@ -2281,6 +2526,7 @@ function composerAddRss() {
     notes: $("add-rss-notes").checked,
     whisper: $("add-rss-whisper").checked,
     refresh: $("add-rss-refresh").checked,
+    ...rssFilterOpts("add-rss"),
   };
   const prog = $("add-rss-progress");
   prog.classList.remove("hidden"); prog.textContent = "Reading the feed…";
@@ -2292,8 +2538,12 @@ function composerAddRss() {
   composerRssES = sourceStream("/api/rss/fetch-feed", opts, {
     started: (id) => { composerRssRunId = id; },
     feed: (d) => {
+      // Three numbers, three meanings: the whole feed, what the filter accepted, what the
+      // limit then took. Only the ones that differ are shown.
+      const narrowed = rssMatchText(d);
       prog.textContent = `${d.title || "Feed"} — ${d.total} episode(s)` +
-                         (d.total_available > d.total ? ` of ${d.total_available}` : "");
+                         (narrowed ? ` · ${narrowed}`
+                                   : d.total_available > d.total ? ` of ${d.total_available}` : "");
       if (d.total > 25) toast(`${d.total} episodes — that's a lot of context`, 6000);
     },
     warning: (d) => { toast(d.message, 8000); },
@@ -2396,10 +2646,13 @@ let composerMediaRunId = null;
  *  stream opens — so this uses streamSSE, not sourceStream (which is EventSource/GET). */
 async function composerAddMediaFiles() {
   const prog = $("add-media-progress");
-  prog.classList.remove("hidden"); prog.textContent = "Waiting for file selection…";
+  const stagedMedia = await chooseAndStage({ accept: ACCEPT_MEDIA });
+  if (stagedMedia === null) return;
+  prog.classList.remove("hidden");
+  prog.textContent = isLocalBrowser() ? "Waiting for file selection…" : "Transcribing…";
   const btn = $("btn-add-media"); btn.disabled = true;
   try {
-    await streamSSE("/api/transcribe/files", {}, {
+    await streamSSE("/api/transcribe/files", stagedMedia, {
       start: (d) => { composerMediaRunId = d.run_id || null; },
       begin: (d) => {
         prog.textContent = d.total ? `Transcribing ${d.total} file(s)…` : "Nothing selected.";
@@ -2568,6 +2821,7 @@ function syncSettingsFromUI() {
   c.num_ctx = parseInt($("ctx-select").value) || c.num_ctx;
   c.isolated = $("chk-isolate").checked;
   c.hide_thinking = $("chk-hide-thinking").checked;
+  c.voice_read_reasoning = $("btn-voice-reason").classList.contains("active");
   c.web_search = $("chk-websearch").checked;
   c.library_strict = $("chk-strict").checked;
   c.crawl_pages = parseInt($("crawl-pages").value) || S.minCrawledPages || 7;
@@ -2583,6 +2837,526 @@ function syncSettingsFromUI() {
   c.memory_core_id = $("memory-core-select").value || c.memory_core_id || "";
 }
 
+// ------------------------------- voice chat --------------------------
+function avatarUrl() {
+  return String(S.config.avatar_url || "http://127.0.0.1:8765").replace(/\/+$/, "");
+}
+
+async function avatarFetch(path, opts) {
+  const method = (opts && opts.method) || "GET";
+  let body = opts && opts.body;
+  if (typeof body === "string") {
+    try { body = JSON.parse(body); } catch (e) { body = {}; }
+  }
+  return api("/api/avatar/rpc", { method: "POST", body: { path, method, body: body || null } });
+}
+
+function speakableText(text) {
+  return String(text || "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`[^`]+`/g, "")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/\[\d+\]/g, " ")
+    .replace(/https?:\/\/\S+/gi, " ")
+    .replace(/\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b/g, " ")
+    .replace(/^\s*\d+[.)]\s+/gm, "")
+    .replace(/^\s*[-*+]\s+/gm, "")
+    .replace(/[_#]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function pullSentences(text) {
+  const complete = [];
+  const re = /[.!?]["')\]]*(?=\s+|$)|\n{2,}/g;
+  let last = 0, m;
+  while ((m = re.exec(text))) {
+    const piece = text.slice(last, m.index + m[0].length);
+    if (/(?:Mr|Mrs|Ms|Mx|Dr|Prof|Sr|Jr|St|vs)\.\s*$/i.test(piece.trim()) && piece.trim().length < 8) {
+      continue;
+    }
+    const trimmed = piece.trim();
+    if (trimmed) complete.push(trimmed);
+    last = m.index + m[0].length;
+  }
+  return { complete, rest: text.slice(last) };
+}
+
+function avatarSpeak(text) {
+  const clean = speakableText(text);
+  if (!clean || S.voice.skipSpeak || !S.voice.on) return;
+  S.voice.speakChain = S.voice.speakChain.then(async () => {
+    if (S.voice.skipSpeak || !S.voice.on) return;
+    await avatarFetch("/speak", { method: "POST", body: { text: clean } });
+    S.voice.speaking = true;
+    refreshStopVisibility();
+  }).catch((e) => { toast("Voice: " + e.message); });
+}
+
+function createSentenceSpeaker() {
+  // F5 pipelines *inside* one /speak job. Sending one short sentence at a time
+  // leaves a gap while the next job generates, and short pieces make F5 emit
+  // junk (often a blurt of digits) before the real words.
+  const START_SENTENCES = 2;
+  const BATCH_SENTENCES = 5;
+  let buf = "";
+  let pending = [];
+  let started = false;
+  let dead = false;
+  function sendBatch(parts) {
+    const joined = parts.filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+    if (joined) avatarSpeak(joined);
+  }
+  function pump(force) {
+    if (dead || S.voice.skipSpeak) { pending = []; buf = ""; return; }
+    if (!started) {
+      if (!force && pending.length < START_SENTENCES) return;
+      started = true;
+      sendBatch(pending.splice(0, force ? pending.length : START_SENTENCES));
+    }
+    if (force) {
+      if (pending.length) sendBatch(pending.splice(0, pending.length));
+      return;
+    }
+    while (pending.length >= BATCH_SENTENCES) {
+      sendBatch(pending.splice(0, BATCH_SENTENCES));
+    }
+  }
+  return {
+    feed(text) {
+      if (dead || S.voice.skipSpeak) return;
+      buf += text || "";
+      const { complete, rest } = pullSentences(buf);
+      buf = rest;
+      pending.push.apply(pending, complete);
+      pump(false);
+    },
+    endSection() {
+      if (buf.trim()) pending.push(buf.trim());
+      buf = "";
+      pump(true);
+      started = false;
+    },
+    end() {
+      if (buf.trim()) pending.push(buf.trim());
+      buf = "";
+      pump(true);
+      dead = true;
+    },
+  };
+}
+
+function setVoiceControlsLocked(locked) {
+  [
+    "btn-voice-reason", "set-avatar-gate", "set-avatar-silence",
+    "avatar-start-app", "avatar-start-voice", "set-avatar-dir", "set-avatar-url",
+    "btn-avatar-browse-dir", "btn-avatar-save",
+  ].forEach((id) => {
+    const el = $(id);
+    if (el) el.disabled = !!locked;
+  });
+}
+
+function setVoiceHelperLoading(on, why) {
+  S.voice.helperLoading = !!on;
+  setVoiceControlsLocked(on);
+  const btn = $("btn-voice");
+  if (!btn) return;
+  btn.disabled = !!on;
+  btn.classList.toggle("loading", !!on);
+  if (on) {
+    btn.textContent = "⏳ Loading voice helper";
+    btn.title = why || "Waiting for TTS and transcription models to load…";
+    btn.classList.remove("active", "listening", "speaking");
+  } else if (!S.voice.on) {
+    btn.textContent = "🎤 Voice";
+    btn.title = S.voice.modelsReady
+      ? "Start voice chat — helper is ready. Listening begins when you press this."
+      : "Voice chat — talk, or hold the Avatar PTT hotkey. Silence sends.";
+  } else {
+    btn.textContent = "🎤 Voice";
+  }
+}
+
+function updateVoiceButton(listen, info) {
+  const btn = $("btn-voice");
+  if (!btn) return;
+  if (S.voice.helperLoading) return;
+  btn.textContent = "🎤 Voice";
+  const state = typeof listen === "string" ? listen : (listen && listen.state) || "idle";
+  btn.classList.toggle("active", S.voice.on);
+  btn.classList.toggle("listening", S.voice.on && (state === "listening" || state === "speech" || state === "silence"));
+  btn.classList.toggle("speaking", S.voice.on && S.voice.speaking);
+  const meter = $("voice-meter");
+  if (meter) meter.classList.toggle("hidden", !S.voice.on);
+  if (!S.voice.on) btn.title = "Voice chat — talk, or hold the Avatar PTT hotkey. Silence sends.";
+  else if (state === "transcribing") btn.title = "Transcribing…";
+  else if (info && info.ptt) btn.title = "PTT — release the hotkey to send";
+  else if (state === "speech" || state === "silence") btn.title = "Listening… silence will send";
+  else if (S.voice.speaking) btn.title = "Speaking — talk or PTT to interrupt, or Stop to drop this reply";
+  else btn.title = "Voice chat on — listening";
+}
+
+function updateVoiceMeter(listen) {
+  const fills = [$("voice-meter-fill"), $("set-avatar-meter-fill"), $("voice-hud-meter-fill")];
+  const meters = [$("voice-meter"), $("set-avatar-meter"), $("voice-hud-meter")];
+  const level = listen && typeof listen.level_db === "number" ? listen.level_db : -90;
+  const gate = listen && typeof listen.gate_db === "number" ? listen.gate_db : -45;
+  const pct = Math.max(0, Math.min(100, ((level + 60) / 42) * 100));
+  fills.forEach((el) => { if (el) el.style.width = pct + "%"; });
+  meters.forEach((el) => { if (el) el.classList.toggle("open", level >= gate); });
+  const text = $("set-avatar-meter-text");
+  if (text) {
+    const live = listen && listen.state && listen.state !== "idle";
+    text.textContent = live
+      ? ("Mic: " + level.toFixed(0) + " dB  ·  gate " + gate.toFixed(0) + " dB"
+         + (listen.ptt ? "  ·  PTT" : ""))
+      : "Mic: — (turn Voice on to see a live level)";
+  }
+}
+
+function updateVoiceHud(st) {
+  const hud = $("voice-hud");
+  if (!hud) return;
+  hud.classList.toggle("hidden", !S.voice.on);
+  if (!S.voice.on) return;
+  const listen = (st && st.listen) || {};
+  const badge = $("voice-hud-badge");
+  const detail = $("voice-hud-detail");
+  const levelEl = $("voice-hud-level");
+  const speaking = !!(st && st.speaking);
+  const snippet = (st && (st.current_snippet || st.current_text)) || "";
+  let kind = "listening";
+  let label = "LISTENING";
+  let text = "Speak, or hold the Avatar PTT hotkey (Mouse Back by default).";
+  if (listen.error) {
+    kind = "error"; label = "ERROR"; text = listen.error;
+  } else if (!listen.state || listen.state === "idle") {
+    kind = "error"; label = "NOT LISTENING";
+    text = "The helper is up but listen is idle. Press Voice off and on again. "
+         + (listen.model_loading ? "Speech model is still loading." : "");
+  } else if (listen.ptt) {
+    kind = "ptt"; label = "PTT — HOLDING";
+    text = "Keep holding. Release the hotkey to transcribe and send.";
+  } else if (listen.state === "transcribing") {
+    kind = "transcribing"; label = "TRANSCRIBING";
+    text = "Turning speech into text…";
+  } else if (listen.state === "ready" && (listen.transcript || listen.last_transcript)) {
+    kind = "ready"; label = "HEARD YOU";
+    text = "“" + (listen.transcript || listen.last_transcript) + "”";
+  } else if (listen.state === "speech") {
+    kind = "speech"; label = "HEARING YOU";
+    const need = (typeof listen.silence_seconds === "number" ? listen.silence_seconds : silenceSeconds());
+    text = "Keep talking. " + need + " seconds of silence will send.";
+  } else if (listen.state === "silence") {
+    kind = "silence"; label = "WAITING FOR SILENCE";
+    const ms = listen.silence_ms || 0;
+    const need = (typeof listen.silence_seconds === "number" ? listen.silence_seconds : silenceSeconds());
+    text = "Quiet for " + (ms / 1000).toFixed(1) + "s — send at " + need
+         + "s, or hold PTT and release to send now.";
+  } else if (speaking) {
+    kind = "speaking"; label = "SPEAKING";
+    text = snippet ? ("Reading: “" + snippet + "”") : "Reading the reply aloud.";
+  } else if (S.generating) {
+    kind = "listening"; label = "WAITING FOR REPLY";
+    text = "Model is writing. Speech starts after two sentences.";
+  } else {
+    const last = listen.last_transcript || "";
+    text = last
+      ? ("Listening. Last heard: “" + last + "”")
+      : "Listening for speech. Hold PTT to talk past the noise gate.";
+  }
+  if (speaking && kind !== "ptt" && kind !== "transcribing" && kind !== "speech") {
+    kind = "speaking";
+    label = "SPEAKING";
+    text = snippet ? ("Reading: “" + snippet + "”") : "Reading the reply aloud.";
+  }
+  badge.className = "voice-hud-badge " + kind;
+  badge.textContent = label;
+  detail.textContent = text;
+  if (levelEl) {
+    if (typeof listen.level_db === "number") {
+      levelEl.textContent = "Mic " + listen.level_db.toFixed(0) + " dB  ·  gate "
+        + (typeof listen.gate_db === "number" ? listen.gate_db.toFixed(0) : "—") + " dB";
+    } else {
+      levelEl.textContent = "";
+    }
+  }
+}
+
+async function pushNoiseGate(value) {
+  const gate = Math.max(0, Math.min(100, Number(value) || 0));
+  try {
+    await avatarFetch("/settings", { method: "POST", body: { noise_gate: gate } });
+  } catch (e) { /* helper may not be up yet */ }
+}
+
+function silenceSeconds() {
+  const n = parseInt(S.config.avatar_silence_seconds, 10);
+  return Number.isFinite(n) ? Math.max(1, Math.min(30, n)) : 6;
+}
+
+async function pushSilenceSeconds(value) {
+  const seconds = Math.max(1, Math.min(30, parseInt(value, 10) || 6));
+  try {
+    await avatarFetch("/settings", { method: "POST", body: { silence_seconds: seconds } });
+  } catch (e) { /* helper may not be up yet */ }
+}
+
+async function ensureAvatarHelper() {
+  const r = await api("/api/avatar/ensure", { method: "POST" });
+  if (r && r.url) S.config.avatar_url = r.url;
+  if (!r || !r.ok) throw new Error((r && r.error) || "Could not start the Avatar helper.");
+  return r;
+}
+
+function statusSaysModelsReady(st) {
+  if (!st) return false;
+  if (st.models_ready) return true;
+  const f5 = st.f5 || {};
+  const stt = !!(st.stt_ready
+    || (st.listen && st.listen.model_ready)
+    || (st.dictation && st.dictation.model_ready));
+  const engine = st.engine || st.tts_engine || (f5.model || f5.ready ? "f5" : "");
+  const tts = engine !== "f5" || !!(st.tts_ready || f5.ready);
+  return stt && tts;
+}
+
+function describeHelperLoad(st) {
+  if (!st) return "Waiting for the helper…";
+  const f5 = st.f5 || {};
+  const ttsOk = !!(st.tts_ready || f5.ready || (st.tts_engine && st.tts_engine !== "f5"));
+  const sttOk = !!(st.stt_ready || (st.dictation && st.dictation.model_ready) || (st.listen && st.listen.model_ready));
+  const bits = [];
+  bits.push(ttsOk ? "TTS ready" : (st.tts_loading || f5.loading ? "loading TTS" : "waiting for TTS"));
+  bits.push(sttOk ? "transcription ready" : (st.stt_loading || (st.dictation && st.dictation.model_loading) ? "loading transcription" : "waiting for transcription"));
+  return bits.join(" · ");
+}
+
+async function fetchHelperLoadState() {
+  let lastErr = "";
+  for (const path of ["/ready", "/status", "/health"]) {
+    try {
+      return await avatarFetch(path);
+    } catch (e) {
+      lastErr = e.message || String(e);
+    }
+  }
+  throw new Error(lastErr || "Cannot reach the Avatar helper.");
+}
+
+async function waitForHelperModels(timeoutMs) {
+  const deadline = Date.now() + (timeoutMs || 300000);
+  let lastErr = "";
+  while (Date.now() < deadline) {
+    try {
+      const st = await api("/api/avatar/voice-status");
+      if (st && st.ready) {
+        S.voice.modelsReady = true;
+        if ($("avatar-helper-state")) {
+          $("avatar-helper-state").textContent = st.detail || "Voice helper ready.";
+        }
+        return st;
+      }
+      if (st && (st.stt_error || st.tts_error) && st.stt !== "loading" && st.tts !== "loading") {
+        const failed = [st.stt_error, st.tts_error].filter(Boolean).join(" · ");
+        if (failed) throw new Error(failed);
+      }
+      lastErr = (st && st.detail) || "Waiting for the helper to publish ready…";
+      const btn = $("btn-voice");
+      if (btn && S.voice.helperLoading) {
+        btn.title = lastErr;
+        btn.textContent = "⏳ Loading voice helper";
+      }
+      if ($("avatar-helper-state")) $("avatar-helper-state").textContent = lastErr;
+    } catch (e) {
+      lastErr = e.message || String(e);
+      if ($("avatar-helper-state")) $("avatar-helper-state").textContent = lastErr;
+      if (/numpy|CUDA|Select an F5/i.test(lastErr)) throw e;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 800));
+  }
+  throw new Error("Voice helper models did not finish loading" + (lastErr ? " (" + lastErr + ")" : "") + ".");
+}
+
+async function onVoiceButtonClick() {
+  if (S.voice.helperLoading) return;
+  if (S.voice.on) {
+    await setVoiceChat(false);
+    return;
+  }
+  // Auto-start only loads models. The session (mic + replies) starts here.
+  if (!S.voice.modelsReady) {
+    setVoiceHelperLoading(true);
+    try {
+      await ensureAvatarHelper();
+      await waitForHelperModels();
+    } catch (e) {
+      setVoiceHelperLoading(false);
+      toast(e.message, 8000);
+      if ($("avatar-helper-state")) $("avatar-helper-state").textContent = e.message;
+      return;
+    }
+    setVoiceHelperLoading(false);
+  }
+  await setVoiceChat(true);
+}
+
+async function setVoiceChat(on) {
+  if (on === S.voice.on) return;
+  if (on) {
+    S.voice.on = true;
+    S.voice.skipSpeak = false;
+    S.voice.handlingTurn = false;
+    updateVoiceButton("listening");
+    updateVoiceHud({ listen: { state: "listening" }, speaking: false });
+    try {
+      await pushNoiseGate($("set-avatar-gate") ? $("set-avatar-gate").value : S.config.avatar_noise_gate);
+      await pushSilenceSeconds($("set-avatar-silence") ? $("set-avatar-silence").value : S.config.avatar_silence_seconds);
+      await avatarFetch("/listen/start", { method: "POST", body: {
+        silence_seconds: silenceSeconds(),
+        noise_gate: parseInt($("set-avatar-gate") ? $("set-avatar-gate").value : S.config.avatar_noise_gate, 10) || 0,
+      } });
+    } catch (e) {
+      S.voice.on = false;
+      updateVoiceButton("idle");
+      updateVoiceHud(null);
+      toast(e.message, 8000);
+      return;
+    }
+    startVoicePoll();
+    setStatus("Voice chat on — talk, or hold the PTT hotkey");
+  } else {
+    S.voice.on = false;
+    stopVoicePoll();
+    S.voice.skipSpeak = true;
+    S.voice.speaking = false;
+    avatarFetch("/listen/cancel", { method: "POST", body: {} }).catch(() => {});
+    avatarFetch("/stop", { method: "POST", body: {} }).catch(() => {});
+    updateVoiceButton("idle");
+    updateVoiceHud(null);
+    refreshStopVisibility();
+    setStatus("");
+  }
+}
+
+function startVoicePoll() {
+  stopVoicePoll();
+  S.voice.pollTimer = setInterval(() => { voicePoll().catch(() => {}); }, 250);
+}
+
+function stopVoicePoll() {
+  if (S.voice.pollTimer) {
+    clearInterval(S.voice.pollTimer);
+    S.voice.pollTimer = null;
+  }
+}
+
+async function voicePoll() {
+  if (!S.voice.on) return;
+  let st;
+  try {
+    st = await avatarFetch("/status");
+  } catch (e) {
+    updateVoiceHud({ listen: { state: "idle", error: e.message } });
+    setStatus("Voice: " + e.message);
+    return;
+  }
+  const listen = st.listen || {};
+  S.voice.listenState = listen.state || "idle";
+  const ttsOn = !!st.speaking;
+  if (S.voice.speaking !== ttsOn) {
+    S.voice.speaking = ttsOn;
+    refreshStopVisibility();
+  }
+  updateVoiceButton(listen.state, listen);
+  updateVoiceMeter(listen);
+  updateVoiceHud(st);
+  if (listen.ptt) setStatus("Voice PTT — release to send");
+  else if (listen.state === "speech") setStatus("Voice — hearing you");
+  else if (listen.state === "silence") setStatus("Voice — waiting for silence…");
+  else if (listen.state === "transcribing") setStatus("Voice — transcribing…");
+  else if (S.voice.on && !S.generating && !S.voice.speaking) setStatus("Voice chat on — listening");
+
+  if (listen.barge_in && (S.generating || S.voice.speaking) && !S.voice.skipSpeak) {
+    await stopGeneration();
+  }
+
+  if (listen.state === "ready" && listen.transcript && !S.voice.handlingTurn && !S.generating) {
+    const text = String(listen.transcript || "").trim();
+    S.voice.handlingTurn = true;
+    try {
+      await avatarFetch("/listen/ack", { method: "POST", body: {} });
+      if (/[A-Za-z]/.test(text)) {
+        S.voice.skipSpeak = false;
+        await sendMessage(text);
+      }
+    } catch (e) {
+      toast("Voice: " + e.message);
+    } finally {
+      S.voice.handlingTurn = false;
+    }
+  }
+}
+
+function renderAvatarSettings() {
+  if (!$("set-avatar-dir")) return;
+  $("set-avatar-dir").value = S.config.avatar_dir || "";
+  $("set-avatar-url").value = S.config.avatar_url || "http://127.0.0.1:8765";
+  const mode = S.config.avatar_start_mode || "voice_button";
+  $("avatar-start-app").checked = mode === "app_start";
+  $("avatar-start-voice").checked = mode !== "app_start";
+  const gate = S.config.avatar_noise_gate != null ? S.config.avatar_noise_gate : 30;
+  $("set-avatar-gate").value = gate;
+  $("set-avatar-gate-label").textContent = String(gate);
+  $("set-avatar-silence").value = silenceSeconds();
+  const open = $("link-avatar-settings");
+  if (open) open.href = ($("set-avatar-url").value.trim() || "http://127.0.0.1:8765").replace(/\/+$/, "");
+}
+
+async function saveAvatarSettings() {
+  const body = {
+    avatar_dir: $("set-avatar-dir").value.trim(),
+    avatar_url: $("set-avatar-url").value.trim() || "http://127.0.0.1:8765",
+    avatar_start_mode: $("avatar-start-app").checked ? "app_start" : "voice_button",
+    avatar_noise_gate: parseInt($("set-avatar-gate").value, 10) || 0,
+    avatar_silence_seconds: parseInt($("set-avatar-silence").value, 10) || 6,
+  };
+  const r = await api("/api/settings", { method: "POST", body });
+  S.config = { ...S.config, ...r.config };
+  renderAvatarSettings();
+  await pushNoiseGate(body.avatar_noise_gate);
+  await pushSilenceSeconds(body.avatar_silence_seconds);
+  toast("Voice settings saved");
+}
+
+async function maybeAutostartAvatar() {
+  const mode = S.config.avatar_start_mode || "voice_button";
+  if (mode !== "app_start") return;
+  setVoiceHelperLoading(true, "Starting voice helper…");
+  try {
+    const r = await ensureAvatarHelper();
+    if ($("avatar-helper-state")) {
+      $("avatar-helper-state").textContent = r.started
+        ? "Helper started. Loading models…"
+        : "Helper already running. Loading models…";
+    }
+    await waitForHelperModels();
+    S.voice.modelsReady = true;
+    if ($("avatar-helper-state")) {
+      $("avatar-helper-state").textContent = "Voice helper ready. Press Voice in the chat to start listening.";
+    }
+    setVoiceHelperLoading(false);
+    setStatus("Voice helper ready — press Voice to start listening");
+  } catch (e) {
+    setVoiceHelperLoading(false);
+    if ($("avatar-helper-state")) $("avatar-helper-state").textContent = e.message;
+  }
+}
+
 /**
  * Handle Send: assemble the user turn, push it into the chat, and dispatch to either
  * the persona pipeline or ordinary generation.
@@ -2590,10 +3364,13 @@ function syncSettingsFromUI() {
  * Any staged data blocks are prepended to the typed text as XML, so the model sees
  * the data before the instruction. Creates a private chat on the fly if none is open,
  * and auto-titles a new chat from the first message. No-ops while a run is active.
+ * ``presetText`` is used by voice chat so a transcript can send without touching
+ * the composer.
  */
-async function sendMessage() {
+async function sendMessage(presetText) {
   if (S.generating || S.batchRunning) return;
-  const text = $("input-box").value.trim();
+  const fromVoice = typeof presetText === "string";
+  const text = fromVoice ? presetText.trim() : $("input-box").value.trim();
   const dataXml = buildDataXml();
   // An image on its own is a complete message ("what is this?" is implied), so the
   // send guard has to look past the text.
@@ -2620,7 +3397,7 @@ async function sendMessage() {
     S.chat.title = short;
     $("chat-title").textContent = short;
   }
-  $("input-box").value = "";
+  if (!fromVoice) $("input-box").value = "";
   clearDataItems();
 
   // Web search query (per-message).
@@ -2837,6 +3614,11 @@ async function streamPersonaRun(path, body, wrap, isRerun, bubbleArg, opts = {})
     bubble._body.textContent = "…";
   }
   let finalText = "";
+  const speaker = S.voice.on ? createSentenceSpeaker() : null;
+  if (speaker) {
+    S.voice.skipSpeak = false;
+    S.voice.speaker = speaker;
+  }
   // Seed from the surviving cards so a late frame for an upstream step still lands.
   const cards = {};
   stepsEl.querySelectorAll(".step-card").forEach((c) => { cards[Number(c.dataset.index)] = c; });
@@ -2865,6 +3647,7 @@ async function streamPersonaRun(path, body, wrap, isRerun, bubbleArg, opts = {})
     token: (d) => {
       const follow = isNearBottom($("messages"));
       finalText += d.text; bubble._body.textContent = finalText;
+      if (speaker) speaker.feed(d.text);
       if (follow) scrollBottom();
     },
     run_paused: (d) => {
@@ -2883,6 +3666,8 @@ async function streamPersonaRun(path, body, wrap, isRerun, bubbleArg, opts = {})
     },
     done: () => {},
   });
+  if (speaker) speaker.end();
+  S.voice.speaker = null;
   bubble.classList.remove("streaming");
   setGeneratingUI(false); setStatus("");
   if (!finalText || !persist) return;
@@ -3210,7 +3995,9 @@ async function renderPersonaKb() {
   } catch (e) { host.innerHTML = "<div class='muted'>Load failed.</div>"; }
 }
 async function addPersonaKbFiles() {
-  toast("Choose documents in the dialog…");
+  const stagedKb = await chooseAndStage({ accept: ACCEPT_DOCS });
+  if (stagedKb === null) return;
+  if (isLocalBrowser()) toast("Choose documents in the dialog…");
   const pid = S.editingPersona.id;
   // The server mints the run id (unique per invocation) and hands it back in `begin`;
   // Cancel has to use that one or it stops nothing.
@@ -3220,7 +4007,7 @@ async function addPersonaKbFiles() {
   try {
     // Each document here is parsed AND embedded, so this is the slow path that most
     // needs a progress bar.
-    await streamSSE(`/api/personas/${pid}/knowledge/add-files`, {}, {
+    await streamSSE(`/api/personas/${pid}/knowledge/add-files`, stagedKb, {
       begin: (d) => {
         runId = d.run_id || runId;
         if (!d.total) return;
@@ -3253,6 +4040,7 @@ async function addPersonaKbRss() {
     url,
     limit: Math.max(0, Math.min(500, parseInt($("pe-rss-limit").value, 10) || 0)),
     whisper: $("pe-rss-whisper").checked,
+    ...rssFilterOpts("pe-rss"),
   };
   const prog = $("pe-rss-progress");
   prog.classList.remove("hidden"); prog.textContent = "Reading the feed…";
@@ -3344,6 +4132,7 @@ async function draftMemoriesFromRss() {
     limit: Math.max(1, Math.min(50, parseInt($("pe-mem-rss-limit").value, 10) || 3)),
     server_url: currentServerUrl(),
     model: getSelectedModel(),
+    ...rssFilterOpts("pe-mem-rss"),
   };
   const prog = $("pe-mem-rss-progress");
   prog.classList.remove("hidden"); prog.textContent = "Reading the feed…";
@@ -3353,6 +4142,9 @@ async function draftMemoriesFromRss() {
     await streamSSE(`/api/personas/${pid}/draft-memories-from-rss`, body, {
       start: (d) => { _peMemRssRunId = d.run_id || ""; },
       feed: (d) => { prog.textContent = `${d.title || "Feed"} — drafting ${d.total}…`; },
+      // The only panel that was missing this. A filter matching nothing completes with
+      // "No drafts were produced" and the warning saying WHY had nowhere to land.
+      warning: (d) => { toast(d.message, 8000); },
       progress: (d) => { prog.textContent = rssProgressText(d); },
       draft: (d) => {
         _peMemDrafts.push(d.draft);
@@ -3467,7 +4259,9 @@ function bindPersonaEditorEvents() {
 // Import is implemented in Phase 10; stub keeps the button harmless until then.
 async function importPersonaUI() {
   try {
-    const r = await api("/api/personas/import", { method: "POST", body: {} });
+    const staged = await chooseAndStage({ accept: ".xml,.zip", multiple: false });
+    if (staged === null) return;
+    const r = await api("/api/personas/import", { method: "POST", body: staged });
     if (r.error) { toast(r.error); return; }
     toast("Imported: " + (r.persona ? r.persona.profile.name : "ok"));
     await renderPersonaTab();
@@ -3478,6 +4272,11 @@ async function importPersonaUI() {
 async function runGeneration(searchQuery, opts = {}) {
   setGeneratingUI(true);
   S.runId = uid();
+  const speaker = S.voice.on ? createSentenceSpeaker() : null;
+  if (speaker) {
+    S.voice.skipSpeak = false;
+    S.voice.speaker = speaker;
+  }
   // The chat sent to the backend (for its context + settings). Defaults to the
   // active chat. A queue run passes an isolated single-turn snapshot here so each
   // prompt is answered independently, while all rendering/persistence below stays
@@ -3487,6 +4286,7 @@ async function runGeneration(searchQuery, opts = {}) {
   // generation is just one unlabeled pass.
   let bubble = null, reasonBubble = null, sourceBubble = null;
   let curContent = "", curReason = "", curLabel = "", curIntermediate = false;
+  let reasonSpoken = false;
   let curImages = [];
   // The retrieved chunks arrive once, during pass 0, and describe every pass — so unlike
   // the per-pass state above they are NOT cleared by finalizePass.
@@ -3520,6 +4320,7 @@ async function runGeneration(searchQuery, opts = {}) {
     pass_start: (d) => {
       const follow = isNearBottom($("messages"));
       finalizePass();  // save the previous pass, if any
+      if (speaker) { speaker.endSection(); reasonSpoken = false; }
       curLabel = d.label || ""; curIntermediate = !!d.intermediate;
       curImages = [];
       bubble = makeBubble("assistant", "", { streaming: true, label: curLabel, intermediate: curIntermediate });
@@ -3543,6 +4344,10 @@ async function runGeneration(searchQuery, opts = {}) {
         $("messages").insertBefore(reasonBubble.el, bubble);
       }
       curReason += d.content; reasonBubble.body.textContent = curReason;
+      if (speaker && $("btn-voice-reason").classList.contains("active")) {
+        speaker.feed(d.content);
+        reasonSpoken = true;
+      }
       if (follow) scrollBottom();
     },
     // What RAG retrieved for this turn — shown under the reasoning, collapsed, so the
@@ -3564,6 +4369,10 @@ async function runGeneration(searchQuery, opts = {}) {
       const follow = isNearBottom($("messages"));
       if (curContent === "") bubble._body.textContent = "";
       curContent += d.content; bubble._body.textContent = curContent;
+      if (speaker) {
+        if (reasonSpoken) { speaker.endSection(); reasonSpoken = false; }
+        speaker.feed(d.content);
+      }
       if (follow) scrollBottom();
     },
     pass_end: (d) => {
@@ -3583,6 +4392,8 @@ async function runGeneration(searchQuery, opts = {}) {
   });
 
   finalizePass();  // safety: save any pass that didn't get a pass_end (e.g. stop)
+  if (speaker) speaker.end();
+  S.voice.speaker = null;
   setGeneratingUI(false);
   setStatus("");
   if (!errored) await persistChat(true);
@@ -3593,6 +4404,13 @@ async function runGeneration(searchQuery, opts = {}) {
 async function stopGeneration() {
   S.queueStop = true;   // also halt a sequential queue loop after the current item
   if (S.runId) await api("/api/stop", { method: "POST", body: { run_id: S.runId }});
+  S.voice.skipSpeak = true;
+  S.voice.speaker = null;
+  if (S.voice.on) {
+    avatarFetch("/stop", { method: "POST", body: {} }).catch(() => {});
+    S.voice.speaking = false;
+    refreshStopVisibility();
+  }
 }
 
 // ------------------------------- batch -------------------------------
@@ -3607,6 +4425,7 @@ async function batchProcess() {
   setStatus("Waiting for folder selection…");
   let folder = "";
   try {
+    if (folderPickingUnavailable()) return;
     const r = await api("/api/pick-folder", { method: "POST", body: { title: "Choose a folder of prompt files (.txt / .md)" }});
     folder = r.path;
   } catch (e) { setStatus(""); toast("Folder picker failed: " + e.message); return; }
@@ -4319,13 +5138,17 @@ function pbUse() {
 }
 async function pbExport(ids) {
   const body = { kind: PB.kind, ...ids, default_name: (ids.name || (PB.kind + "_prompts")) };
+  body.download = !isLocalBrowser();
   const r = await api("/api/prompts/export-xml", { method: "POST", body });
+  if (takeDownload(r)) { toast("Exported"); return; }
   if (r && r.ok) toast("Exported to " + r.path);
   else if (r && r.cancelled) { /* user cancelled */ }
   else toast("Export failed" + (r && r.error ? ": " + r.error : ""));
 }
 async function pbImport() {
-  const r = await api("/api/prompts/import-xml", { method: "POST", body: {} });
+  const staged = await chooseAndStage({ accept: ACCEPT_XML, multiple: false });
+  if (staged === null) return;
+  const r = await api("/api/prompts/import-xml", { method: "POST", body: staged });
   if (r && r.prompts) { S.prompts = r.prompts; renderPb(); }
   if (r && r.imported) toast(`Imported ${r.imported} file(s)`);
   if (r && r.errors && r.errors.length) toast("Some files failed: " + r.errors.join("; "));
@@ -4914,7 +5737,9 @@ async function exportMemoryCore() {
   const core = activeCore();
   if (!core) { toast("Nothing to export yet."); return; }
   try {
-    const r = await api("/api/memory/cores/export", { method: "POST", body: { ids: [core.id] } });
+    const r = await api("/api/memory/cores/export",
+                        { method: "POST", body: { ids: [core.id], download: !isLocalBrowser() } });
+    if (takeDownload(r)) { toast("Exported"); return; }
     if (r.cancelled) return;
     toast(r.ok ? `Exported to ${r.path}` : "Export failed: " + (r.error || "unknown"));
   } catch (e) { toast("Export failed: " + e.message); }
@@ -4922,7 +5747,9 @@ async function exportMemoryCore() {
 
 async function importMemoryCore() {
   try {
-    const r = await api("/api/memory/cores/import", { method: "POST", body: {} });
+    const staged = await chooseAndStage({ accept: ACCEPT_JSON, multiple: false });
+    if (staged === null) return;
+    const r = await api("/api/memory/cores/import", { method: "POST", body: staged });
     if (r.cancelled) return;
     if (!r.ok) { toast("Import failed: " + (r.error || "unknown")); return; }
     S.memoryCores = r.cores;
@@ -5044,9 +5871,253 @@ function renderSettings() {
   $("set-whisper-vad").checked = S.config.whisper_vad !== false;
   renderServerRows();
   renderParallelServers();
+  refreshNetworkCard();
   refreshYouTubeCacheStats();
   refreshRssCacheStats();
   refreshWhisperStatus();
+  renderAvatarSettings();
+}
+
+// ------------------------------- Network Access ----------------------
+// Bind address and port come from /api/network rather than /api/state. They live in a
+// plaintext file outside the encrypted per-profile settings, because main.py has to
+// read them before anyone has logged in to decrypt anything — and detecting this
+// machine's addresses resolves a hostname, which is too slow to sit on the page-load
+// path that /api/state serves.
+let S_net = null;
+
+const isLocalBrowser = () =>
+  ["localhost", "127.0.0.1", "::1", "[::1]"].includes(location.hostname);
+
+async function refreshNetworkCard(force = false) {
+  try {
+    S_net = await api("/api/network" + (force ? "?refresh=1" : ""));
+  } catch (e) {
+    $("net-status").textContent = "Could not read the network settings: " + e.message;
+    return;
+  }
+  $("set-lan-enabled").checked = !!S_net.saved.lan_enabled;
+  const portInput = $("set-net-port");
+  portInput.value = S_net.saved.port;
+  // From the server, so the field cannot disagree with what the route enforces.
+  portInput.min = S_net.limits.min;
+  portInput.max = S_net.limits.max;
+
+  const rt = S_net.runtime;
+  let status;
+  if (!rt) {
+    status = "The server was not started by main.py, so there is nothing live to " +
+             "compare against. Saved settings apply the next time you run it.";
+  } else if (rt.lan_enabled) {
+    status = `Right now: shared on your network, port ${rt.port}.`;
+  } else {
+    status = `Right now: this computer only, port ${rt.port}.`;
+  }
+  if (rt && rt.fell_back && rt.port !== rt.requested_port) {
+    status += ` (Port ${rt.requested_port} was unavailable when the app started.)`;
+  }
+  $("net-status").textContent = status;
+
+  const creds = $("net-creds-warning");
+  const defaults = !!S_net.using_default_creds;
+  creds.classList.toggle("hidden", !defaults);
+  creds.innerHTML =
+    "<b>Your login is still admin / admin.</b> Anyone who can reach this app over the " +
+    "network can sign in with it, read your chats, and read and write files on this " +
+    "computer. Change it before you share this.";
+  $("net-creds-actions").classList.toggle("hidden", !defaults);
+  if (!defaults) $("net-pw-form").classList.add("hidden");
+  // Only while the form is closed — this refresh also runs on an ordinary settings
+  // render, and must not overwrite a username someone is halfway through typing.
+  if ($("net-pw-form").classList.contains("hidden")) {
+    $("net-pw-user").value = S_net.username || "admin";
+  }
+
+  $("net-firewall-cmd").textContent = S_net.firewall_command;
+  renderNetAddresses();
+  markNetworkDirty();
+}
+
+/** The addresses another machine would type. Every candidate is listed rather than
+ *  guessed at: a VPN or a WSL/Docker adapter looks exactly like a real LAN address
+ *  from the outside, and picking wrong is worse than explaining. */
+function renderNetAddresses() {
+  const box = $("net-addresses");
+  box.innerHTML = "";
+  const on = $("set-lan-enabled").checked;
+  if (!S_net || !on) return;
+  const port = parseInt($("set-net-port").value) || S_net.saved.port;
+  if (!S_net.addresses.length) {
+    box.innerHTML = '<div class="muted">No network address found — this computer ' +
+                    "may not be connected to a network right now.</div>";
+    return;
+  }
+  const head = document.createElement("div");
+  head.className = "muted";
+  head.textContent = S_net.addresses.length > 1
+    ? "Type one of these on the other computer. The one marked “best” is usually right; " +
+      "172.x entries are often WSL or Docker and will not work."
+    : "Type this on the other computer:";
+  box.appendChild(head);
+  S_net.addresses.forEach((a) => {
+    const url = `http://${a.ip}:${port}`;
+    const row = document.createElement("div");
+    row.className = "net-addr";
+    const code = document.createElement("code");
+    code.textContent = url;
+    row.appendChild(code);
+    if (a.default_route) {
+      const b = document.createElement("span");
+      b.className = "badge";
+      b.textContent = "best";
+      row.appendChild(b);
+    }
+    if (a.kind === "cgnat") {
+      const m = document.createElement("span");
+      m.className = "muted";
+      m.textContent = "VPN — only reachable over that VPN";
+      row.appendChild(m);
+    }
+    const copy = document.createElement("button");
+    copy.className = "small";
+    copy.textContent = "Copy";
+    copy.onclick = () => { navigator.clipboard.writeText(url); toast("Address copied"); };
+    row.appendChild(copy);
+    box.appendChild(row);
+  });
+}
+
+/** Reflect unsaved edits: what still needs a restart, and what the user is agreeing to
+ *  by ticking the box. Runs on every keystroke, so it must not call the server. */
+function markNetworkDirty() {
+  if (!S_net) return;
+  const on = $("set-lan-enabled").checked;
+  const port = parseInt($("set-net-port").value) || 0;
+  const rt = S_net.runtime;
+
+  $("net-share-warning").classList.toggle("hidden", !on);
+
+  const pw = $("net-port-warning");
+  // A port in the ephemeral range can be claimed by an outgoing connection before the
+  // app starts, which surfaces as an occasional, baffling failure to bind.
+  const lim = S_net.limits;
+  const ephemeral = port >= lim.ephemeral_from && port <= lim.max;
+  pw.classList.toggle("hidden", !ephemeral);
+  if (ephemeral) {
+    pw.textContent = `Port ${port} is in the range Windows hands out to outgoing ` +
+      "connections, so it may occasionally be taken when you start the app. " +
+      `Something between ${lim.min} and ${lim.ephemeral_from - 1} is a safer choice.`;
+  }
+
+  const note = $("net-restart-note");
+  const forced = rt && (rt.port_forced || rt.lan_forced);
+  const changed = rt && ((port !== rt.port && !rt.port_forced) ||
+                         (on !== rt.lan_enabled && !rt.lan_forced));
+  note.classList.toggle("hidden", !changed && !forced);
+  if (forced) {
+    // A --port / --lan flag wins for this run, so promising a restart would be a lie.
+    note.textContent = "A command-line flag is overriding this for the current run. " +
+      "What you save here applies the next time you start the app without that flag.";
+  } else if (changed) {
+    note.textContent = S_net.restart_supported
+      ? "These changes only take effect once the server restarts — use Save & restart server."
+      : "These changes take effect the next time you start the app.";
+  }
+  renderNetAddresses();
+}
+
+/** Change the login from here, because the warning above is otherwise a dead end: the
+ *  only other ways are the login-page nag (which this user has already dismissed to get
+ *  this far) and `python main.py --reset-password` at a terminal. */
+async function changeLoginPassword() {
+  const np = $("net-pw-new").value;
+  if (!np) { toast("Enter a new password"); return; }
+  if (np !== $("net-pw-confirm").value) { toast("The two passwords do not match"); return; }
+  try {
+    await api("/api/auth/change", {
+      method: "POST",
+      body: {
+        current_password: $("net-pw-current").value,
+        new_username: $("net-pw-user").value.trim() || "admin",
+        new_password: np,
+      },
+    });
+  } catch (e) {
+    toast(e.message, 6000);
+    return;
+  }
+  ["net-pw-current", "net-pw-new", "net-pw-confirm"].forEach((id) => ($(id).value = ""));
+  $("net-pw-form").classList.add("hidden");
+  // The same data key is re-wrapped under the new password rather than the data being
+  // re-encrypted, so the session survives.
+  toast("Password changed — you are still signed in.", 6000);
+  refreshNetworkCard();
+}
+
+async function saveNetwork(restart) {
+  const port = parseInt($("set-net-port").value);
+  const buttons = ["btn-save-network", "btn-restart-network"];
+  const lan = $("set-lan-enabled").checked;
+  // Turning sharing off from a remote browser cuts the branch you are sitting on.
+  if (!lan && !isLocalBrowser() &&
+      !confirm("You are connected from another computer. Turning network sharing off " +
+               "will disconnect you as soon as the server restarts. Continue?")) {
+    return;
+  }
+  const enable = () => buttons.forEach((id) => ($(id).disabled = false));
+  buttons.forEach((id) => ($(id).disabled = true));
+  let r;
+  try {
+    r = await api("/api/network", {
+      method: "POST",
+      body: { lan_enabled: lan, port, restart: !!restart },
+    });
+  } catch (e) {
+    enable();
+    toast(e.message, 6000);
+    return;
+  }
+  const wasPort = S_net && S_net.runtime ? S_net.runtime.port : null;
+  S_net = r;
+  // Stay disabled only while a restart really is under way — the page is about to follow
+  // the server to its new address and a second click would be meaningless.
+  if (!r.restarting) enable();
+  if (!r.restarting) {
+    toast(r.restart_required ? "Saved — restart the app to apply it"
+                             : "Network settings saved");
+    refreshNetworkCard();
+    return;
+  }
+  // next_port, not saved.port: a --port flag on the command line pins the port for the
+  // whole run, and following the saved one would send the page to a dead address.
+  if (wasPort !== null && r.next_port !== wasPort) {
+    followRestart(r.next_port);
+  } else {
+    toast("Restarting the server…", 6000);
+    setTimeout(() => refreshNetworkCard(true), 2500);
+  }
+}
+
+/** Follow the server to its new port. A different port is a different origin, so the
+ *  probe has to be a no-cors fetch — an opaque response that merely resolves is proof
+ *  the new listener is answering. location.hostname, not the server address, so a
+ *  browser on another machine follows itself rather than being sent to the host. */
+async function followRestart(port) {
+  const url = `${location.protocol}//${location.hostname}:${port}/`;
+  toast(`Restarting on port ${port} — this page will follow…`, 9000);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  await sleep(1200);
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    try {
+      await fetch(url + "login", { mode: "no-cors", cache: "no-store" });
+      location.href = url;
+      return;
+    } catch (e) {
+      await sleep(600);
+    }
+  }
+  toast(`The server has not come back yet. Open ${url} once it has.`, 15000);
 }
 
 /** Size the on-disk YouTube cache for the Settings card. Cheap — the route stats file
@@ -5782,7 +6853,9 @@ async function addWriteIn() {
 async function addTextFiles() {
   if (!S.activeLibrary) { toast("Select or create a library first"); return; }
   await flushLibrarySave();
-  setStatus("Waiting for file selection…");
+  const stagedLib = await chooseAndStage({ accept: ACCEPT_DOCS });
+  if (stagedLib === null) return;
+  setStatus(isLocalBrowser() ? "Waiting for file selection…" : "Reading files…");
   const progressEl = $("lib-compile-progress");
   const libId = S.activeLibrary.id;
   // The server mints the run id (unique per invocation, so two runs on one library
@@ -5794,7 +6867,7 @@ async function addTextFiles() {
   // instead of blocking on one opaque request.
   let ui = null;
   try {
-    await streamSSE(`/api/libraries/${libId}/add-text-files`, {}, {
+    await streamSSE(`/api/libraries/${libId}/add-text-files`, stagedLib, {
       start: (d) => { runId = d.run_id || runId; },
       begin: (d) => {
         setStatus("");
@@ -5839,6 +6912,7 @@ function showLibPanel(which) {
   if (which === "rss") {
     $("lib-rss-input").value = "";
     $("lib-rss-limit").value = String(S.config.rss_max_episodes ?? 25);
+    resetRssFilters("lib-rss");
     const prog = $("lib-rss-progress"); prog.classList.add("hidden"); prog.textContent = "";
     refreshWhisperStatus();
     $("lib-rss-input").focus();
@@ -6017,6 +7091,52 @@ function sourceStream(path, opts, handlers) {
   });
   return es;
 }
+
+/* ---- RSS category/keyword filters, shared by every panel that imports a feed ----
+ *
+ * Four panels carry the same controls under a `<prefix>-` id convention, the way the
+ * whisper checkboxes are gathered by id in updateWhisperOffers. The batch tab is not in
+ * this list: its filter is PER SOURCE, so it lives in batchSourceFields and rides along
+ * in the project's source dict. */
+const RSS_FILTER_PANELS = ["add-rss", "lib-rss", "pe-rss", "pe-mem-rss"];
+
+/** The filter fields of one panel, as the opts/body keys the server reads.
+ *
+ *  Strings, not arrays, so both transports carry the same thing: sourceStream stringifies
+ *  with String(v) — which would turn an array into "a,b" only by accident — while the
+ *  persona panels send a JSON body. parse_filters accepts either, and treats an empty
+ *  string as "no filter", which is what an untouched box sends. */
+function rssFilterOpts(prefix) {
+  const val = (suffix) => ($(`${prefix}-${suffix}`)?.value || "").trim();
+  return {
+    categories: val("categories"),
+    keywords: val("keywords"),
+    exclude: val("exclude"),
+    match: $(`${prefix}-match`)?.value || "any",
+  };
+}
+
+/** Clear one panel's filter boxes.
+ *
+ *  Called from showComposerPanel and showLibPanel, which blank their URL box every time
+ *  they open: there a filter left over from a previous feed would silently narrow the
+ *  next, unrelated import with nothing on screen to explain it. The two persona panels
+ *  deliberately don't call this — they keep their URL too, so whatever is still in the
+ *  boxes is what the user can see and is about to send. */
+function resetRssFilters(prefix) {
+  ["categories", "keywords", "exclude"].forEach((k) => {
+    const el = $(`${prefix}-${k}`); if (el) el.value = "";
+  });
+  const match = $(`${prefix}-match`); if (match) match.value = "any";
+}
+
+/** "12 matched of 226" — only when a filter actually narrowed something, so an unfiltered
+ *  import reads exactly as it did before. */
+function rssMatchText(d) {
+  if (!d || !d.matched || d.matched >= (d.total_available || 0)) return "";
+  return `${d.matched} matched of ${d.total_available}`;
+}
+
 let libYtES = null;
 let libYtRunId = null;
 
@@ -6130,6 +7250,7 @@ async function addRssFeed() {
     notes: $("lib-rss-notes").checked,
     whisper: $("lib-rss-whisper").checked,
     refresh: $("lib-rss-refresh").checked,
+    ...rssFilterOpts("lib-rss"),
   };
   const prog = $("lib-rss-progress");
   prog.classList.remove("hidden"); prog.textContent = "Reading the feed…";
@@ -6138,7 +7259,9 @@ async function addRssFeed() {
   libRssES = sourceStream(`/api/libraries/${libId}/add-rss`, opts, {
     started: (id) => { libRssRunId = id; },
     feed: (d) => {
+      const narrowed = rssMatchText(d);
       prog.textContent = `${d.title || "Feed"} — ${d.total} episode(s)` +
+                         (narrowed ? ` · ${narrowed}` : "") +
                          (d.from_cache ? " (feed unchanged)" : "");
     },
     warning: (d) => { toast(d.message, 8000); },
@@ -6180,10 +7303,13 @@ async function addLibMediaFiles() {
   await flushLibrarySave();
   const libId = S.activeLibrary.id;
   const prog = $("lib-media-progress");
-  prog.classList.remove("hidden"); prog.textContent = "Waiting for file selection…";
+  const stagedMedia = await chooseAndStage({ accept: ACCEPT_MEDIA });
+  if (stagedMedia === null) return;
+  prog.classList.remove("hidden");
+  prog.textContent = isLocalBrowser() ? "Waiting for file selection…" : "Transcribing…";
   const btn = $("btn-lib-add-media"); btn.disabled = true;
   try {
-    await streamSSE(`/api/libraries/${libId}/add-media-files`, {}, {
+    await streamSSE(`/api/libraries/${libId}/add-media-files`, stagedMedia, {
       begin: (d) => {
         prog.textContent = d.total ? `Transcribing ${d.total} file(s)…` : "Nothing selected.";
       },
@@ -6290,7 +7416,9 @@ async function loadLibraryXML() {
   await flushLibrarySave();   // S.libraries is about to be replaced wholesale
   setStatus("Waiting for XML selection…");
   try {
-    const r = await api("/api/libraries/import-xml", { method: "POST" });
+    const staged = await chooseAndStage({ accept: ACCEPT_XML, multiple: false });
+    if (staged === null) return;
+    const r = await api("/api/libraries/import-xml", { method: "POST", body: staged });
     S.libraries = r.libraries; renderLibraryList();
     if (r.imported.length) { selectLibrary(r.imported[0].id); $("lib-list").value = r.imported[0].id; toast(`Imported ${r.imported.length} library(ies)`); }
     if (r.errors.length) toast("Some XML failed: " + r.errors.join("; "));
@@ -6302,7 +7430,9 @@ async function saveLibraryXML() {
   await saveLibrary(true);
   setStatus("Waiting for save location…");
   try {
-    const r = await api(`/api/libraries/${S.activeLibrary.id}/export-xml`, { method: "POST", body: { library: S.activeLibrary }});
+    const r = await api(`/api/libraries/${S.activeLibrary.id}/export-xml`,
+      { method: "POST", body: { library: S.activeLibrary, download: !isLocalBrowser() }});
+    if (takeDownload(r)) { toast("Exported"); return; }
     if (r.ok) toast("Saved: " + r.path);
     else if (!r.cancelled) toast("Save failed: " + (r.error || "unknown"));
   } catch (e) { toast("Save XML failed: " + e.message); }
@@ -6983,6 +8113,17 @@ function bindEvents() {
   $("btn-scan").onclick = scanRange;
   $("btn-add-scanned").onclick = addScanned;
   $("btn-save-general").onclick = saveGeneral;
+  $("btn-save-network").onclick = () => saveNetwork(false);
+  $("btn-restart-network").onclick = () => saveNetwork(true);
+  $("btn-net-redetect").onclick = () => refreshNetworkCard(true);
+  $("btn-net-show-pw").onclick = () => $("net-pw-form").classList.toggle("hidden");
+  $("btn-net-change-pw").onclick = changeLoginPassword;
+  $("btn-net-copy-firewall").onclick = () => {
+    navigator.clipboard.writeText($("net-firewall-cmd").textContent || "");
+    toast("Command copied — paste it into an administrator PowerShell");
+  };
+  $("set-lan-enabled").onchange = markNetworkDirty;
+  $("set-net-port").oninput = markNetworkDirty;
   $("btn-yt-cache-clear").onclick = clearYouTubeCache;
   $("btn-whisper-reset").onclick = resetWhisperModel;
   $("btn-rss-cache-clear").onclick = () => clearRssCache("episodes");
@@ -7063,6 +8204,70 @@ function bindEvents() {
   $("chk-restrict").onchange = saveWebsearchConfig;
 
   $("btn-send").onclick = sendMessage;
+  $("btn-voice").onclick = () => onVoiceButtonClick();
+  $("btn-voice-reason").onclick = () => {
+    $("btn-voice-reason").classList.toggle("active");
+    if (S.chat) {
+      S.chat.voice_read_reasoning = $("btn-voice-reason").classList.contains("active");
+      persistChat();
+    }
+  };
+  $("btn-avatar-save").onclick = saveAvatarSettings;
+  $("btn-avatar-restart").onclick = async () => {
+    const btn = $("btn-avatar-restart");
+    const state = $("avatar-helper-state");
+    btn.disabled = true;
+    if (state) state.textContent = "Restarting helper…";
+    try {
+      const r = await api("/api/avatar/restart", { method: "POST" });
+      if (state) {
+        state.textContent = r.started ? "Helper restarted." : (r.running ? "Helper is running." : "Helper did not start.");
+      }
+      toast("Avatar helper restarted");
+    } catch (e) {
+      if (state) state.textContent = e.message;
+      toast(e.message, 8000);
+    } finally {
+      btn.disabled = false;
+    }
+  };
+  $("set-avatar-url").oninput = () => {
+    const open = $("link-avatar-settings");
+    if (open) open.href = ($("set-avatar-url").value.trim() || "http://127.0.0.1:8765").replace(/\/+$/, "");
+  };
+  $("link-avatar-settings").onclick = () => {
+    const url = ($("set-avatar-url").value.trim() || "http://127.0.0.1:8765").replace(/\/+$/, "");
+    $("link-avatar-settings").href = url;
+    ensureAvatarHelper().catch((err) => toast(err.message, 8000));
+  };
+  $("set-avatar-gate").oninput = () => {
+    $("set-avatar-gate-label").textContent = $("set-avatar-gate").value;
+  };
+  $("set-avatar-gate").onchange = async () => {
+    const gate = parseInt($("set-avatar-gate").value, 10) || 0;
+    S.config.avatar_noise_gate = gate;
+    try {
+      const r = await api("/api/settings", { method: "POST", body: { avatar_noise_gate: gate } });
+      S.config = { ...S.config, ...r.config };
+    } catch (e) { /* keep the local value */ }
+    await pushNoiseGate(gate);
+  };
+  $("set-avatar-silence").onchange = async () => {
+    const seconds = Math.max(1, Math.min(30, parseInt($("set-avatar-silence").value, 10) || 6));
+    $("set-avatar-silence").value = seconds;
+    S.config.avatar_silence_seconds = seconds;
+    try {
+      const r = await api("/api/settings", { method: "POST", body: { avatar_silence_seconds: seconds } });
+      S.config = { ...S.config, ...r.config };
+    } catch (e) { /* keep the local value */ }
+    await pushSilenceSeconds(seconds);
+  };
+  $("btn-avatar-browse-dir").onclick = async () => {
+    try {
+      const r = await api("/api/pick-folder", { method: "POST", body: { title: "Avatar Read Server folder" } });
+      if (r.path) $("set-avatar-dir").value = r.path;
+    } catch (e) { toast(e.message); }
+  };
   $("btn-rewrite").onclick = rewritePrompt;
   $("btn-rewrite-undo").onclick = undoRewrite;
   $("chk-persona").onchange = onPersonaToggle;
@@ -7113,9 +8318,12 @@ function bindEvents() {
   $("btn-save-parallel").onclick = saveParallelConfig;
   $("btn-parallel-common").onclick = useCommonModel;
   $("input-box").addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+    // Not on a touch keyboard: Return there is how you type a newline, and Shift+Enter
+    // does not exist. Send is a button away.
+    if (e.key === "Enter" && !e.shiftKey && !isTouch()) { e.preventDefault(); sendMessage(); }
   });
   setupMessagesResizer();
+  setupMobile();
   wireThreadSettings();
 
   // Evaluate tab.
@@ -7189,6 +8397,8 @@ function bindEvents() {
     // Esc backs out of whatever dialog is on top. Only #modal-prompt used to handle
     // this, and only while its input had focus; every other dialog was Esc-proof.
     if (e.key === "Escape" && modalIsOpen()) { e.preventDefault(); dismissModal(); return; }
+    // Then the slide-over panels, which sit below any dialog in the same visual stack.
+    if (e.key === "Escape") { closeDrawers(); }
     // Enter activates a dialog's primary button. Deliberately only `.primary` — the
     // one-button-away destructive actions (delete profile, clear history) are `.danger`
     // and should stay a deliberate click. Textareas keep Enter for newlines.
@@ -7594,6 +8804,9 @@ async function importEvalFile(kind) {
   }
   setStatus("Choose a file…");
   try {
+    const stagedEval = await chooseAndStage({ accept: kind === "csv" ? ".csv,text/csv" : ".txt,text/plain",
+                                              multiple: false });
+    if (stagedEval === null) return;
     const r = await api("/api/evals/import", { method: "POST",
       body: { kind, delimiter, is_regex: isRegex } });
     // Nothing is mutated before this point: creating the target column earlier would
@@ -8089,7 +9302,12 @@ function buildBreakdownTable(models, scoreCrit) {
     tb.appendChild(tr);
   });
   table.appendChild(tb);
-  return table;
+  // Wrapped so a project with several criteria scrolls the table instead of stretching
+  // the card it sits in. buildRowTable does the same via .eval-rows-table.
+  const wrap = document.createElement("div");
+  wrap.className = "eval-table-wrap";
+  wrap.appendChild(table);
+  return wrap;
 }
 
 function buildRowTable(m, criteria) {
@@ -8242,12 +9460,33 @@ function batchSourceFields(src, idx) {
       </div>`;
   }
   if (k === "rss") {
+    // The filter is per source, not per project: two feeds in one batch routinely want
+    // different categories. Stored as plain strings, which is what parse_filters reads and
+    // what batchSyncFromUI's default branch already harvests — no list handling needed.
     return `<div class="control-row">
         <input type="text" class="bsrc-field" data-key="url" style="flex:1 1 22em"
                placeholder="https://feeds.example.com/show.xml" value="${escapeHtml(src.url || "")}" />
         <label>Max episodes: <input type="number" class="bsrc-field" data-key="limit" min="0" max="500"
                style="width:6em" value="${src.limit || 0}"
-               title="Newest first, in feed order. 0 = every item the feed lists. Cached episodes cost nothing, so raising this is how you pick up what's new." /></label>
+               title="Newest first, in feed order — counted AFTER the filter below, so this is the newest N matching episodes. 0 = every item the feed lists. Cached episodes cost nothing, so raising this is how you pick up what's new." /></label>
+      </div>
+      <div class="control-row rss-filter-row">
+        <span class="muted rss-filter-label">Only include:</span>
+        <input type="text" class="bsrc-field" data-key="categories" style="flex:1 1 12em"
+               placeholder="Categories (comma separated)" value="${escapeHtml(src.categories || "")}"
+               title="Matches a WHOLE category or tag on the episode — “Arts”, not “art”. Case and punctuation are ignored. Filtering here means the episodes you skip are never downloaded or transcribed." />
+        <input type="text" class="bsrc-field" data-key="keywords" style="flex:1 1 12em"
+               placeholder="Keywords (anywhere in the text)" value="${escapeHtml(src.keywords || "")}"
+               title="Matches anywhere in the title, categories, author or show notes. Never the transcript — reading that would cost the download and GPU time this filter exists to save." />
+        <input type="text" class="bsrc-field" data-key="exclude" style="flex:1 1 8em"
+               placeholder="Exclude" value="${escapeHtml(src.exclude || "")}"
+               title="Skips any episode whose text matches. Beats the two boxes to the left, and works on its own." />
+        <label class="rss-filter-label" title="Any: one listed term is enough. All: every listed category and every listed keyword must be present.">Match:
+          <select class="bsrc-field" data-key="match">
+            <option value="any"${(src.match || "any") === "any" ? " selected" : ""}>any</option>
+            <option value="all"${src.match === "all" ? " selected" : ""}>all</option>
+          </select>
+        </label>
       </div>`;
   }
   if (k === "search") {
@@ -8326,6 +9565,7 @@ function renderBatchSources() {
         const title = kind === "images" ? "Choose a folder of images to process"
                     : kind === "media" ? "Choose a folder of audio/video to transcribe"
                     : "Choose a folder of documents to process";
+        if (folderPickingUnavailable()) return;
         const r = await api("/api/pick-folder", { method: "POST", body: { title } });
         if (r.path) { S.batch.project.sources[idx].path = r.path; renderBatchSources(); }
       } catch (e) { toast("Folder picker failed: " + e.message); }
@@ -8396,7 +9636,9 @@ async function batchAddRefImages() {
   btn.disabled = true;
   setStatus("Waiting for image selection…");
   try {
-    const r = await api("/api/batch/reference-images", { method: "POST", body: {} });
+    const staged = await chooseAndStage({ accept: ACCEPT_IMAGES });
+    if (staged === null) return;
+    const r = await api("/api/batch/reference-images", { method: "POST", body: staged });
     const p = S.batch.project;
     p.reference_images = [...(p.reference_images || []), ...(r.images || [])];
     renderBatchRefImages();
@@ -8836,6 +10078,7 @@ function bindBatchEvents() {
 
   $("btn-batch-outdir").onclick = async () => {
     batchSyncFromUI();
+    if (folderPickingUnavailable()) return;
     try {
       const r = await api("/api/pick-folder", {
         method: "POST", body: { title: "Choose where to save the batch output" } });

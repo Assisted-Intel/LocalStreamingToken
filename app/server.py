@@ -14,10 +14,12 @@ import ipaddress
 import json
 import queue
 import shutil
+import socket
 import threading
+import time
 import traceback
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,14 +27,15 @@ from types import SimpleNamespace
 from urllib.parse import unquote, urlparse
 
 import requests
-from flask import (Flask, request, jsonify, Response, send_from_directory,
+from flask import (Flask, request, jsonify, Response, send_file, send_from_directory,
                    stream_with_context, session, redirect)
 
-from . import (batch as batch_mod, compile as compile_mod, context_tracker, core, crypto,
+from . import (avatar as avatar_mod, batch as batch_mod, compile as compile_mod,
+               context_tracker, core, crypto,
                evals, images as images_mod, ingest, logic, memory, migrate, native_dialog,
-               parallel, persona as persona_mod, persona_io, persona_store,
+               netconfig, parallel, persona as persona_mod, persona_io, persona_store,
                pipeline as pipeline_mod, profiles, providers, rag, rewrite, rss,
-               rss_cache, transcribe, youtube, youtube_cache)
+               rss_cache, transcribe, transfer, youtube, youtube_cache)
 from .database import staging as db_staging
 from .database.routes import register_db_routes
 from .database.vault import Vault
@@ -147,6 +150,15 @@ def create_app():
     # Image uploads are the only request body that isn't small JSON. A ceiling turns
     # "someone dragged a 2 GB scan in" from an out-of-memory server into a 413.
     app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
+    # The session cookie is the whole authentication story, and Settings -> Network
+    # Access can put this server on the LAN. SameSite stops another site's page from
+    # driving the API with the user's cookie attached — worth having, because every
+    # route parses its body with get_json(force=True), so an unusual Content-Type is
+    # not the barrier it is in apps that reject non-JSON. SECURE stays off: there is
+    # no TLS here, and setting it would break the app entirely.
+    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+    app.config["SESSION_COOKIE_HTTPONLY"] = True
+    transfer.reset_staging()   # in-transit uploads/downloads; see app/transfer.py
     # Profiles: run first-run migration, then point core's data/settings paths at the
     # persisted active profiles BEFORE building the Store/Vault that read those paths.
     pm = profiles.ProfileManager()
@@ -329,6 +341,87 @@ def create_app():
         m = model.lower()
         return looks_like_reasoning_model(model) or any(h in m for h in _CLOUD_REASONING)
 
+    # ----------------------------- File transfer ----------------------------
+    # Native OS dialogs open on the machine running the server. That is right when the
+    # browser is on that machine and useless when it is not — from a phone the button
+    # simply hangs until the 300s tkinter timeout. These three shims let every existing
+    # picker route keep its shape while working either way; see app/transfer.py.
+
+    def _from_this_machine():
+        """True when the request came from the server's own machine.
+
+        The gate on ever opening a tkinter window: a remote click must never pop a dialog
+        on somebody else's desktop, whatever the client asked for.
+        """
+        return (request.remote_addr or "") in ("127.0.0.1", "::1", "localhost")
+
+    def _request_json():
+        """The JSON body, or {} — these routes are POSTed with and without one."""
+        try:
+            return request.get_json(silent=True) or {}
+        except Exception:
+            return {}
+
+    def _pick_files(**kw):
+        """Files the browser already uploaded, else a native picker.
+
+        Returns [] rather than opening a window for a remote caller, so a stale client
+        cannot strand a request behind a dialog nobody can see.
+        """
+        staged = transfer.accept_paths(_request_json().get("paths"))
+        if staged:
+            return staged
+        if not _from_this_machine():
+            return []
+        return native_dialog.pick_files(**kw)
+
+    # Set by _save_file when the result is destined for the browser rather than for a
+    # path on this machine; _download_link then hands the token back with the response.
+    _pending_download = {}
+
+    def _save_file(default_name="", **kw):
+        """A destination to write to: either one the user picked in a Save dialog, or a
+        staging file the browser will download."""
+        if _request_json().get("download") or not _from_this_machine():
+            token, path = transfer.offer(default_name or "download")
+            _pending_download[id(request)] = token
+            return str(path)
+        return native_dialog.save_file(default_name=default_name, **kw)
+
+    def _download_link(dest=None):
+        """``{"download": "/api/download/<token>"}`` when _save_file staged the file for
+        the browser, else ``{}``. Spread into an export route's JSON response.
+
+        ``dest`` is the path actually written: several routes append an extension after
+        _save_file hands them a destination, and the token has to follow.
+        """
+        token = _pending_download.pop(id(request), None)
+        if not token:
+            return {}
+        if dest:
+            transfer.rebind(token, dest)
+        return {"download": f"/api/download/{token}"}
+
+    @app.route("/api/uploads", methods=["POST"])
+    def api_uploads():
+        """Take files from the browser and return the paths they landed on.
+
+        The client posts here first, then calls the feature route with those paths in its
+        body — which is exactly the shape those routes already expect from a picker.
+        """
+        files = request.files.getlist("files")
+        if not files:
+            return jsonify({"error": "No files were uploaded."}), 400
+        return jsonify({"paths": transfer.stage_uploads(files)})
+
+    @app.route("/api/download/<token>")
+    def api_download(token):
+        got = transfer.take(token)
+        if not got:
+            return jsonify({"error": "That download has already been used or expired."}), 404
+        path, name = got
+        return send_file(str(path), as_attachment=True, download_name=name)
+
     # ----------------------------- Static files -----------------------------
     def _no_cache(resp):
         # This is a local single-user app; never let the browser serve a stale
@@ -375,6 +468,30 @@ def create_app():
         return jsonify({"error": f"That file is too large (limit {mb} MB)."}), 413
 
     @app.before_request
+    def _check_origin():
+        """Refuse a state-changing request that came from another site's page.
+
+        Runs before the auth gate and is deliberately NOT exempt for /api/login — an
+        unauthenticated login POST is exactly what a cross-site page would try. The test
+        is Origin-against-Host rather than an allowlist of hostnames: a same-origin
+        request matches by construction, whatever name the user reached the server by
+        (an IP, the machine name, a VPN name), so this cannot lock the owner out of
+        their own app the way a name allowlist would.
+
+        This matters because every route parses its body with ``get_json(force=True)``,
+        which skips the Content-Type check that would otherwise make a cross-site POST
+        hard to forge — and Settings -> Network Access can put this server on the LAN.
+        """
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return None
+        origin = request.headers.get("Origin")
+        if not origin or origin == "null":
+            return None                     # non-browser client (curl, a script) — fine
+        if urlparse(origin).netloc != (request.host or ""):
+            return jsonify({"error": "Cross-origin request refused."}), 403
+        return None
+
+    @app.before_request
     def _require_login():
         path = request.path or "/"
         if (path == "/login" or path == "/favicon.ico" or path.startswith("/static/")
@@ -390,17 +507,47 @@ def create_app():
     def login_page():
         return _no_cache(send_from_directory(STATIC_DIR, "login.html"))
 
+    # Brute-force brake. There is one shared password, and Settings -> Network Access
+    # can put the login page in front of everyone on the LAN; without this the only
+    # thing slowing a guessing script down is scrypt's ~100 ms per attempt. Per client
+    # address, in memory, so it resets when the app restarts.
+    LOGIN_MAX_FAILS, LOGIN_WINDOW = 10, 60.0
+    login_fails = {}
+
+    def _login_recent_fails(addr):
+        """Failures from ``addr`` inside the window. Drops the entry once it empties, so
+        the table cannot grow one row per address that ever reached the login page."""
+        fails = login_fails.get(addr)
+        if not fails:
+            return ()
+        cutoff = time.monotonic() - LOGIN_WINDOW
+        while fails and fails[0] < cutoff:
+            fails.popleft()
+        if not fails:
+            login_fails.pop(addr, None)
+        return fails
+
+    def _login_rejected(addr):
+        _login_recent_fails(addr)               # prune before adding
+        login_fails.setdefault(addr, deque()).append(time.monotonic())
+        return jsonify({"error": "Invalid username or password."}), 401
+
     @app.route("/api/login", methods=["POST"])
     def api_login():
         data = request.get_json(force=True) or {}
         username = (data.get("username") or "").strip()
         password = data.get("password") or ""
+        addr = request.remote_addr or "?"
+        if len(_login_recent_fails(addr)) >= LOGIN_MAX_FAILS:
+            return jsonify({"error": "Too many failed sign-ins from this computer. "
+                                     "Wait a minute and try again."}), 429
         if not crypto.verify_username(core.APP_KEYFILE, username):
-            return jsonify({"error": "Invalid username or password."}), 401
+            return _login_rejected(addr)
         try:
             dek = crypto.unlock(core.APP_KEYFILE, password)
         except crypto.AuthError:
-            return jsonify({"error": "Invalid username or password."}), 401
+            return _login_rejected(addr)
+        login_fails.pop(addr, None)
         crypto.set_active_key(dek)
         session["authed"] = True
         try:
@@ -441,6 +588,67 @@ def create_app():
     @app.route("/api/auth/dismiss-warning", methods=["POST"])
     def api_auth_dismiss():
         return jsonify({"ok": True, "auth": crypto.dismiss_default_warning(core.APP_KEYFILE)})
+
+    # ----------------------------- Network access ---------------------------
+    # Where the server binds and on which port. Deliberately NOT part of /api/settings:
+    # that route writes into the per-profile settings.json, which is encrypted at rest
+    # and unreadable until someone logs in — and the socket is bound long before that.
+    # See app/netconfig.py.
+
+    def _network_state(refresh=False):
+        cfg = netconfig.load()
+        auth = crypto.status(core.APP_KEYFILE)
+        return {
+            "saved": {"lan_enabled": cfg["lan_enabled"], "port": cfg["port"]},
+            # None when the app was not started through main.py (tests, or an embedded
+            # create_app) — the UI then has nothing live to compare the saved values to.
+            "runtime": netconfig.runtime(),
+            "addresses": netconfig.lan_addresses(refresh=refresh),
+            "hostname": socket.gethostname(),
+            "restart_required": netconfig.restart_required(cfg),
+            # Where the page should look for the app after a restart. Not always the
+            # saved port: a --port flag pins it for the whole run.
+            "next_port": netconfig.next_port(cfg),
+            "restart_supported": netconfig.restart_supported(),
+            "using_default_creds": bool(auth.get("using_default_creds")),
+            "username": auth.get("username", "admin"),
+            "limits": netconfig.limits(),
+            "firewall_command": netconfig.firewall_command(cfg["port"]),
+        }
+
+    @app.route("/api/network", methods=["GET"])
+    def api_network_get():
+        # ?refresh=1 re-detects the machine's addresses. Not done on every call: it
+        # resolves a hostname, which can block for seconds behind a dead DNS server.
+        return jsonify(_network_state(refresh=request.args.get("refresh") == "1"))
+
+    @app.route("/api/network", methods=["POST"])
+    def api_network_post():
+        """Body: {lan_enabled, port, restart}. Saving does not rebind — main.py owns the
+        socket — so ``restart`` asks its supervise loop to do it."""
+        data = request.get_json(force=True) or {}
+        patch = {k: data[k] for k in ("lan_enabled", "port") if k in data}
+        clean, errors = netconfig.validate(patch)
+        if errors:
+            return jsonify({"error": " ".join(errors)}), 400
+        cfg = netconfig.load()
+        target_host = netconfig.bind_host({**cfg, **clean})
+        target_port = clean.get("port", cfg["port"])
+        rt = netconfig.runtime()
+        # Refuse a port that already has something on it rather than saving a setting
+        # that will fail at the next launch. Skipped when the target is what we are
+        # already listening on, since that occupant is us.
+        if not (rt and (rt["host"], rt["port"]) == (target_host, target_port)):
+            if netconfig.port_in_use(target_host, target_port):
+                return jsonify({"error": f"Port {target_port} is already in use by "
+                                         "another program. Pick a different one."}), 409
+        try:
+            netconfig.save(clean)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        state = _network_state()
+        state["restarting"] = bool(data.get("restart")) and netconfig.request_restart()
+        return jsonify(state)
 
     # ----------------------------- App state --------------------------------
     @app.route("/api/state")
@@ -709,7 +917,9 @@ def create_app():
                    "whisper_batch_size", "whisper_language", "whisper_vad",
                    "whisper_beam_size", "whisper_cpu_threads",
                    "rss_notes_min_chars", "rss_fetch_pages", "rss_max_episodes",
-                   "chat_settings_collapsed")
+                   "chat_settings_collapsed",
+                   "avatar_dir", "avatar_url", "avatar_start_mode",
+                   "avatar_noise_gate", "avatar_silence_seconds")
         patch = {k: data[k] for k in allowed if k in data}
         if "provider_context_windows" in patch:
             raw = patch["provider_context_windows"]
@@ -777,6 +987,27 @@ def create_app():
                 patch["memory_weight_influence"] = max(0.0, min(1.0, float(patch["memory_weight_influence"])))
             except Exception:
                 patch.pop("memory_weight_influence")
+        if "avatar_start_mode" in patch:
+            mode = str(patch.get("avatar_start_mode") or "").strip().lower()
+            if mode in ("app_start", "voice_button"):
+                patch["avatar_start_mode"] = mode
+            else:
+                patch.pop("avatar_start_mode")
+        if "avatar_url" in patch:
+            url = str(patch.get("avatar_url") or "").strip().rstrip("/")
+            patch["avatar_url"] = url or "http://127.0.0.1:8765"
+        if "avatar_dir" in patch:
+            patch["avatar_dir"] = str(patch.get("avatar_dir") or "").strip()
+        if "avatar_noise_gate" in patch:
+            try:
+                patch["avatar_noise_gate"] = max(0, min(100, int(patch["avatar_noise_gate"])))
+            except Exception:
+                patch.pop("avatar_noise_gate")
+        if "avatar_silence_seconds" in patch:
+            try:
+                patch["avatar_silence_seconds"] = max(1, min(30, int(patch["avatar_silence_seconds"])))
+            except Exception:
+                patch.pop("avatar_silence_seconds")
         if "rag_thread_window" in patch:
             # At least 1: windowing away the final user turn would leave nothing to
             # answer. Above ~200 the window stops meaning anything.
@@ -813,6 +1044,56 @@ def create_app():
             # "upgrade ctranslate2, then save" re-enables the GPU without a restart.
             transcribe.reset_model()
         return jsonify({"config": store.masked_config()})
+
+    @app.route("/api/avatar/ensure", methods=["POST"])
+    def api_avatar_ensure():
+        """Bring the Avatar Read Server up if it is not already answering /health."""
+        result = avatar_mod.ensure_started(store.config)
+        code = 200 if result.get("ok") else 400
+        return jsonify(result), code
+
+    @app.route("/api/avatar/restart", methods=["POST"])
+    def api_avatar_restart():
+        """Stop the helper (if any) and start it again from the saved folder."""
+        result = avatar_mod.restart(store.config)
+        code = 200 if result.get("ok") else 400
+        return jsonify(result), code
+
+    @app.route("/api/avatar/voice-status", methods=["GET"])
+    def api_avatar_voice_status():
+        """The helper writes voice-status.json when TTS and STT finish loading."""
+        result = avatar_mod.read_voice_status(store.config)
+        return jsonify(result)
+
+    @app.route("/api/avatar/status", methods=["GET"])
+    def api_avatar_status():
+        url = avatar_mod.helper_url(store.config)
+        running = avatar_mod.health(url)
+        return jsonify({
+            "ok": True,
+            "running": running,
+            "url": url,
+            "start_mode": store.config.get("avatar_start_mode") or "voice_button",
+        })
+
+    @app.route("/api/avatar/rpc", methods=["POST"])
+    def api_avatar_rpc():
+        """Browser talks only to this app; we forward to the helper on this machine."""
+        data = request.get_json(silent=True) or {}
+        path = data.get("path") or ""
+        method = data.get("method") or "GET"
+        body = data.get("body")
+        try:
+            result = avatar_mod.rpc(store.config, path, method, body)
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        except RuntimeError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 502
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 502
+        if isinstance(result, dict) and result.get("ok") is False:
+            return jsonify(result), 400
+        return jsonify(result if isinstance(result, dict) else {"ok": True, "data": result})
 
     # ----------------------------- Prompt rewrite ---------------------------
     @app.route("/api/rewrite-prompt", methods=["POST"])
@@ -953,7 +1234,7 @@ def create_app():
     # -------------------- Chat export / import (native dialogs) -------------
     def _write_chat_export(envelope, default_name):
         """Open a native Save dialog and write the export envelope as JSON."""
-        dest = native_dialog.save_file(title="Export chats as JSON",
+        dest = _save_file(title="Export chats as JSON",
                                        default_name=default_name, filetypes_key="json")
         if not dest:
             return jsonify({"ok": False, "cancelled": True})
@@ -963,7 +1244,7 @@ def create_app():
             Path(dest).write_text(json.dumps(envelope, indent=2), encoding="utf-8")
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
-        return jsonify({"ok": True, "path": dest,
+        return jsonify({"ok": True, "path": dest, **_download_link(dest),
                         "count": len(envelope.get("chats", [])),
                         # An export is deliberately plaintext so it opens anywhere.
                         # When it carries pictures, that is worth saying out loud.
@@ -994,7 +1275,7 @@ def create_app():
     def api_chats_import():
         """Open a native picker for a chat-export JSON file and import it into a
         new sidebar tab named after the file (renameable later)."""
-        paths = native_dialog.pick_files(title="Import chats (JSON)", filetypes_key="json")
+        paths = _pick_files(title="Import chats (JSON)", filetypes_key="json")
         if not paths:
             return jsonify({"ok": False, "cancelled": True})
         path = Path(paths[0])
@@ -2099,7 +2380,7 @@ def create_app():
             persona = psvc.load(pid)
         except persona_mod.PersonaError as e:
             return jsonify({"error": str(e)}), 404
-        paths = native_dialog.pick_files(
+        paths = _pick_files(
             title="Add documents to persona knowledge", filetypes_key="documents")
         # Unique per invocation: a fixed "addfiles-persona-<pid>" meant two concurrent
         # runs for one persona shared a stop event, so cancelling one cancelled both.
@@ -2145,8 +2426,9 @@ def create_app():
 
     @app.route("/api/personas/<pid>/knowledge/add-rss", methods=["POST"])
     def api_persona_kb_add_rss(pid):
-        """SSE. Body: {url, limit, whisper, notes, refresh}. Import a feed's episodes
-        into the persona's knowledge base, one document each.
+        """SSE. Body: {url, limit, whisper, notes, refresh, categories, keywords,
+        exclude, match}. Import a feed's episodes into the persona's knowledge base, one
+        document each.
 
         ``add_text`` rather than ``ingest_file``: it writes the text into ``sources/``
         AND embeds it in one call, which is what makes an episode survive a persona
@@ -2168,6 +2450,7 @@ def create_app():
         want_whisper = bool(data.get("whisper"))
         include_notes = data.get("notes", True) is not False
         refresh = bool(data.get("refresh"))
+        filters = rss.parse_filters(data)
 
         embed_url = store.config.get("rag_embed_server_url") or DEFAULT_LOCAL_URL
         embed_fn, embed_model = _persona_embed(persona)
@@ -2210,13 +2493,13 @@ def create_app():
 
         return _compile_sse(
             _rss_feed_work(url, limit, want_whisper, include_notes, refresh,
-                           on_episode=on_episode, on_done=on_done),
+                           filters=filters, on_episode=on_episode, on_done=on_done),
             run_id)
 
     @app.route("/api/personas/<pid>/draft-memories-from-rss", methods=["POST"])
     def api_persona_draft_memories_from_rss(pid):
-        """SSE. Body: {url, limit, whisper, server_url, model}. One drafted memory per
-        episode, streamed as `draft` frames.
+        """SSE. Body: {url, limit, whisper, server_url, model, categories, keywords,
+        exclude, match}. One drafted memory per episode, streamed as `draft` frames.
 
         Drafts are RETURNED, never saved. ``save_memory`` embeds, and auto-saving a
         couple of hundred machine-written "recollections" would irreversibly poison the
@@ -2237,6 +2520,7 @@ def create_app():
             limit = 0
         server_url = data.get("server_url") or ""
         model = data.get("model") or ""
+        filters = rss.parse_filters(data)
         drafts = []
 
         def on_episode(emit, _feed, result):
@@ -2252,7 +2536,11 @@ def create_app():
             emit("complete", {**payload, "drafts": drafts})
 
         return _compile_sse(
-            _rss_feed_work(url, limit, bool(data.get("whisper")), True, False,
+            # include_notes=True, refresh=False — spelled out because this is the only one
+            # of the five calls that is positional that far, and so the one a future
+            # parameter insert would silently mangle.
+            _rss_feed_work(url, limit, bool(data.get("whisper")),
+                           include_notes=True, refresh=False, filters=filters,
                            on_episode=on_episode, on_done=on_done),
             f"rssmem-persona-{pid}-{uuid.uuid4().hex[:8]}")
 
@@ -2301,7 +2589,7 @@ def create_app():
     def api_persona_import():
         """Native picker for a persona .xml or .zip bundle; validate + import (bundles
         re-ingest sources and re-embed memories locally)."""
-        paths = native_dialog.pick_files(title="Import persona (XML or .zip)")
+        paths = _pick_files(title="Import persona (XML or .zip)")
         if not paths:
             return jsonify({"error": "no file selected"})
         path = paths[0]
@@ -2757,7 +3045,7 @@ def create_app():
         cores = envelope.get("cores") or []
         default_name = ("all_memory_cores.json" if ids is None or len(cores) != 1
                         else (cores[0].get("name") or "memory_core").strip().replace(" ", "_") + ".json")
-        dest = native_dialog.save_file(title="Export memory cores as JSON",
+        dest = _save_file(title="Export memory cores as JSON",
                                        default_name=default_name, filetypes_key="json")
         if not dest:
             return jsonify({"ok": False, "cancelled": True})
@@ -2767,13 +3055,14 @@ def create_app():
             Path(dest).write_text(json.dumps(envelope, indent=2), encoding="utf-8")
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
-        return jsonify({"ok": True, "path": dest, "count": len(cores)})
+        return jsonify({"ok": True, "path": dest, "count": len(cores),
+                        **_download_link(dest)})
 
     @app.route("/api/memory/cores/import", methods=["POST"])
     def api_memory_import():
         """Import cores from a JSON export. Fresh ids throughout, so importing never
         overwrites a core the user already has."""
-        paths = native_dialog.pick_files(title="Import memory cores (JSON)",
+        paths = _pick_files(title="Import memory cores (JSON)",
                                          filetypes_key="json")
         if not paths:
             return jsonify({"ok": False, "cancelled": True})
@@ -2921,7 +3210,7 @@ def create_app():
     def api_prompts_import_xml():
         """Open a native picker for one or more prompt XML files and merge each into its
         declared tree (auto-renaming clashing prompts so nothing is overwritten)."""
-        paths = native_dialog.pick_files(title="Import prompt XML", filetypes_key="xml")
+        paths = _pick_files(title="Import prompt XML", filetypes_key="xml")
         imported = 0
         errors = []
         for p in paths:
@@ -2944,7 +3233,7 @@ def create_app():
         if not groups:
             return jsonify({"ok": False, "error": "nothing selected to export"}), 400
         default_name = (data.get("default_name") or "prompts").strip().replace(" ", "_") + ".xml"
-        dest = native_dialog.save_file(title="Save prompts as XML",
+        dest = _save_file(title="Save prompts as XML",
                                        default_name=default_name, filetypes_key="xml")
         if not dest:
             return jsonify({"ok": False, "cancelled": True})
@@ -2954,7 +3243,7 @@ def create_app():
             Path(dest).write_bytes(prompts_to_xml_bytes(kind, groups))
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
-        return jsonify({"ok": True, "path": dest})
+        return jsonify({"ok": True, "path": dest, **_download_link(dest)})
 
     # --------------------------- Web search config --------------------------
     @app.route("/api/websearch/config", methods=["POST"])
@@ -3029,7 +3318,7 @@ def create_app():
             return jsonify({"error": "not found"}), 404
         # The native picker must stay on the request thread (tkinter), before the
         # stream starts.
-        paths = native_dialog.pick_files(
+        paths = _pick_files(
             title="Add document(s) to library", filetypes_key="documents")
         errors = []
         wanted = []
@@ -3155,7 +3444,7 @@ def create_app():
     @app.route("/api/libraries/import-xml", methods=["POST"])
     def api_library_import_xml():
         """Open a native picker for one or more XML files and import each."""
-        paths = native_dialog.pick_files(title="Load library XML", filetypes_key="xml")
+        paths = _pick_files(title="Load library XML", filetypes_key="xml")
         imported = []
         errors = []
         for p in paths:
@@ -3177,7 +3466,7 @@ def create_app():
         if not lib:
             return jsonify({"error": "not found"}), 404
         default_name = (lib.get("name") or "library").strip().replace(" ", "_") + ".xml"
-        dest = native_dialog.save_file(title="Save library as XML",
+        dest = _save_file(title="Save library as XML",
                                        default_name=default_name, filetypes_key="xml")
         if not dest:
             return jsonify({"ok": False, "cancelled": True})
@@ -3187,7 +3476,7 @@ def create_app():
             Path(dest).write_bytes(library_to_xml_bytes(lib))
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
-        return jsonify({"ok": True, "path": dest})
+        return jsonify({"ok": True, "path": dest, **_download_link(dest)})
 
     # ----------------------------- YouTube ----------------------------------
     def _youtube_params():
@@ -3442,7 +3731,7 @@ def create_app():
     # ------------------------------ RSS / Podcast ---------------------------
     def _rss_params():
         """Shared query params for the RSS routes.
-        Returns (url, limit, want_whisper, include_notes, refresh)."""
+        Returns (url, limit, want_whisper, include_notes, refresh, filters)."""
         url = (request.args.get("url") or "").strip()
         try:
             limit = max(0, int(request.args.get("limit") or 0))
@@ -3453,10 +3742,13 @@ def create_app():
         want_whisper = (request.args.get("whisper") or "0") in ("1", "true", "yes")
         include_notes = (request.args.get("notes") or "1") not in ("0", "false", "")
         refresh = (request.args.get("refresh") or "0") in ("1", "true", "yes")
-        return url, limit, want_whisper, include_notes, refresh
+        # request.args is a mapping with .get, which is all parse_filters wants. An
+        # untouched filter box arrives as `categories=`, and reads as "off".
+        filters = rss.parse_filters(request.args)
+        return url, limit, want_whisper, include_notes, refresh, filters
 
     def _rss_feed_work(url, limit, want_whisper, include_notes, refresh, guid="",
-                       on_episode=None, on_done=None):
+                       filters=None, on_episode=None, on_done=None):
         """SSE worker for a feed: read it once, then fetch each episode and emit it as
         its OWN frame, so the composer stages a chip as each lands and Cancel stops the
         rest. One dead episode contributes an `episode_error` and the run continues.
@@ -3464,6 +3756,13 @@ def create_app():
         ``guid`` narrows the run to a single episode — the same worker serves both, the
         way _youtube_fetch_work and _youtube_playlist_work would if a playlist could
         address one video.
+
+        ``filters`` (rss.parse_filters) narrows the LISTING, and is deliberately dropped
+        when ``guid`` is set: the caller has already named the one episode it wants, and
+        because the guid match below runs after fetch_feed, a non-matching filter would
+        answer "that episode isn't in the feed's current window. Raise the episode limit"
+        — advice that cannot possibly work. Handled here rather than by not forwarding
+        filters at the route, so a route added later can't reintroduce it.
 
         ``on_episode(emit, feed, result)`` and ``on_done(emit, payload)`` are the seams
         each caller fills in: append to a library, write a persona document, or draft a
@@ -3473,10 +3772,13 @@ def create_app():
             def stopped():
                 return bool(stop_event and stop_event.is_set())
 
+            listing_filters = {} if guid else (filters or {})
             emit("begin", {"url": url, "limit": limit, "whisper": want_whisper,
-                           "notes": include_notes, "refresh": refresh})
+                           "notes": include_notes, "refresh": refresh,
+                           "filters": listing_filters})
             feed = rss.fetch_feed(
-                url, limit=limit, refresh=refresh, should_stop=stopped,
+                url, limit=limit, filters=listing_filters, refresh=refresh,
+                should_stop=stopped,
                 on_progress=lambda phase, **fields: emit("progress",
                                                          {"phase": phase, **fields}))
             items = feed["items"]
@@ -3489,6 +3791,7 @@ def create_app():
             total = len(items)
             emit("feed", {"title": feed["title"], "total": total,
                           "total_available": feed["total_available"],
+                          "matched": feed["matched"], "filters": listing_filters,
                           "from_cache": feed["from_cache"], "url": feed["url"]})
             for warning in feed["warnings"]:
                 emit("warning", {"message": warning})
@@ -3541,14 +3844,16 @@ def create_app():
 
     @app.route("/api/rss/feed", methods=["GET"])
     def api_rss_feed():
-        """Params: url, limit, refresh. The episode LISTING only — one conditional GET
-        and no per-episode work, so plain JSON rather than SSE. Lets the UI show what a
-        feed holds before committing to fetching any of it."""
-        url, limit, _w, _n, refresh = _rss_params()
+        """Params: url, limit, refresh + the filter params. The episode LISTING only — one
+        conditional GET and no per-episode work, so plain JSON rather than SSE. Lets the UI
+        show what a feed holds before committing to fetching any of it, which includes
+        answering "what categories can I even filter this feed on?" — hence `categories` on
+        every item, and the show's own in the feed-level keys."""
+        url, limit, _w, _n, refresh, filters = _rss_params()
         if not url:
             return jsonify({"error": "no url"}), 400
         try:
-            feed = rss.fetch_feed(url, limit=limit, refresh=refresh)
+            feed = rss.fetch_feed(url, limit=limit, filters=filters, refresh=refresh)
         except rss.RSSError as e:
             return jsonify({"error": str(e)}), 400
         except Exception as e:
@@ -3557,28 +3862,32 @@ def create_app():
         # only wants a manifest.
         slim = [{"guid": i["guid"], "title": i["title"], "link": i["link"],
                  "published": i["published"], "duration": i["duration"],
-                 "episode": i["episode"], "has_media": bool(i["enclosure_url"]),
+                 "episode": i["episode"], "categories": i.get("categories") or [],
+                 "has_media": bool(i["enclosure_url"]),
                  "has_transcript": bool(i["transcripts"])} for i in feed["items"]]
         return jsonify({**{k: v for k, v in feed.items() if k != "items"},
                         "items": slim})
 
     @app.route("/api/rss/fetch-feed", methods=["GET"])
     def api_rss_fetch_feed():
-        """SSE. Params: url, limit (0 = every item), whisper, notes, refresh.
+        """SSE. Params: url, limit (0 = every item), whisper, notes, refresh, and the
+        filter set — categories, keywords, exclude, match.
 
         Emits one `episode` frame per item so the composer stages one attachment each,
         rather than a single blob the user can't take apart."""
-        url, limit, want_whisper, include_notes, refresh = _rss_params()
+        url, limit, want_whisper, include_notes, refresh, filters = _rss_params()
         if not url:
             return jsonify({"error": "no url"}), 400
         return _compile_sse(
-            _rss_feed_work(url, limit, want_whisper, include_notes, refresh),
+            _rss_feed_work(url, limit, want_whisper, include_notes, refresh,
+                           filters=filters),
             f"rss-feed-{uuid.uuid4().hex[:8]}")
 
     @app.route("/api/rss/fetch", methods=["GET"])
     def api_rss_fetch():
-        """SSE. Same params plus `guid` — one episode, returned un-stored."""
-        url, limit, want_whisper, include_notes, refresh = _rss_params()
+        """SSE. Same params plus `guid` — one episode, returned un-stored. Any filter
+        params are ignored; see _rss_feed_work."""
+        url, limit, want_whisper, include_notes, refresh, _f = _rss_params()
         guid = (request.args.get("guid") or "").strip()
         if not url:
             return jsonify({"error": "no url"}), 400
@@ -3601,7 +3910,7 @@ def create_app():
         lib = store.get_library(lib_id)
         if not lib:
             return jsonify({"error": "not found"}), 404
-        url, limit, want_whisper, include_notes, refresh = _rss_params()
+        url, limit, want_whisper, include_notes, refresh, filters = _rss_params()
         if not url:
             return jsonify({"error": "no url"}), 400
 
@@ -3628,7 +3937,7 @@ def create_app():
 
         return _compile_sse(
             _rss_feed_work(url, limit, want_whisper, include_notes, refresh,
-                           on_episode=on_episode, on_done=on_done),
+                           filters=filters, on_episode=on_episode, on_done=on_done),
             f"rss-library-{lib_id}-{uuid.uuid4().hex[:8]}")
 
     @app.route("/api/rss/cache", methods=["GET"])
@@ -3718,7 +4027,7 @@ def create_app():
 
     def _pick_media(title):
         """Native multi-file picker filtered to media, split into (wanted, errors)."""
-        paths = native_dialog.pick_files(title=title, filetypes_key="media")
+        paths = _pick_files(title=title, filetypes_key="media")
         wanted, errors = [], []
         for p in paths:
             path = Path(p)
@@ -3810,7 +4119,7 @@ def create_app():
     def api_extract_files():
         """SSE. Native multi-file picker + parallel document parsing, returning the
         extracted text rather than writing it anywhere."""
-        paths = native_dialog.pick_files(
+        paths = _pick_files(
             title="Attach document(s) to this chat", filetypes_key="documents")
         errors = []
         wanted = []
@@ -3876,6 +4185,12 @@ def create_app():
     @app.route("/api/pick-folder", methods=["POST"])
     def api_pick_folder():
         data = request.get_json(silent=True) or {}
+        if not _from_this_machine():
+            # A browser cannot hand over a folder, and opening the picker here would put
+            # a window on the host's desktop that the person clicking cannot see.
+            return jsonify({"error": "Choosing a folder only works on the computer "
+                                     "running the app. Browse to it there, or use a "
+                                     "file picker instead."}), 400
         path = native_dialog.pick_folder(title=data.get("title", "Choose a folder"))
         return jsonify({"path": path})
 
@@ -3934,7 +4249,7 @@ def create_app():
             max_dim = max(0, min(8192, int(body.get("max_dim") or 0)))
         except (TypeError, ValueError):
             max_dim = 0
-        paths = native_dialog.pick_files(
+        paths = _pick_files(
             title="Attach image(s) to this chat", filetypes_key="images")
         errors = []
         wanted = []
@@ -3994,7 +4309,7 @@ def create_app():
         ext = images_mod.ext_for(media_type)
         if not default_name.lower().endswith(ext):
             default_name = Path(default_name).stem + ext
-        dest = native_dialog.save_file(title="Save image as", default_name=default_name)
+        dest = _save_file(title="Save image as", default_name=default_name)
         if not dest:
             return jsonify({"ok": False, "cancelled": True})
         if not Path(dest).suffix:
@@ -4003,7 +4318,7 @@ def create_app():
             path = images_mod.write_out(image_id, dest)
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
-        return jsonify({"ok": True, "path": str(path)})
+        return jsonify({"ok": True, "path": str(path), **_download_link(path)})
 
     # ----------------------------- Batch ------------------------------------
     @app.route("/api/batch/start", methods=["POST"])
@@ -4382,7 +4697,7 @@ def create_app():
     def api_batch_reference_images():
         """Native picker for a project's reference images (sent with every item).
         Synchronous rather than SSE: this is a handful of files, not a folder walk."""
-        paths = native_dialog.pick_files(
+        paths = _pick_files(
             title="Choose reference image(s) for every item", filetypes_key="images")
         records, errors = [], []
         for p in paths:
@@ -4551,7 +4866,7 @@ def create_app():
         data = request.get_json(force=True) or {}
         kind = (data.get("kind") or "csv").lower()
         title = "Choose a CSV file" if kind == "csv" else "Choose a text file"
-        paths = native_dialog.pick_files(title=title)
+        paths = _pick_files(title=title)
         if not paths:
             return jsonify({"ok": False, "cancelled": True})
         path = Path(paths[0])

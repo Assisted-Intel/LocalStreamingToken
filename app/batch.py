@@ -208,6 +208,20 @@ def _truncate(text, limit):
     return text
 
 
+def _filter_summary(filters) -> str:
+    """An RSS filter as one readable clause, for the error that reports it emptied a
+    source. Quoting it back is the difference between "0 items" and a fixable mistake."""
+    bits = []
+    for label, key in (("categories", "categories"), ("keywords", "keywords"),
+                       ("excluding", "exclude")):
+        values = filters.get(key) or []
+        if values:
+            bits.append(f"{label}: {', '.join(values)}")
+    if filters.get("match") == "all" and len(bits) > 0:
+        bits.append("matching all")
+    return "; ".join(bits) or "no terms"
+
+
 def _iter_folder(src, readable=None):
     """Files under a folder source, filtered to the extensions we can actually read.
     ``recursive`` walks subdirectories; the per-source ``exts`` list narrows further.
@@ -311,9 +325,15 @@ def resolve_sources(project, emit=None, should_stop=None, settings=None):
         elif kind == "rss":
             emit("progress", {"phase": "feed", "name": src.get("url") or "",
                               "done": 0, "total": 0})
+            # Per SOURCE, not per project: two feeds in one batch routinely want
+            # different categories, while rss_notes/whisper/refresh are properties of the
+            # run. The keys are absent on an older project, and parse_filters reads that
+            # as "no filter".
+            filters = rss.parse_filters(src)
             try:
                 feed = rss.fetch_feed(src.get("url") or "",
                                       limit=int(src.get("limit") or 0),
+                                      filters=filters,
                                       refresh=bool(project.get("rss_refresh")),
                                       should_stop=should_stop)
             except Exception as e:
@@ -322,6 +342,12 @@ def resolve_sources(project, emit=None, should_stop=None, settings=None):
             errors.extend(feed.get("warnings") or [])
             episodes = feed["items"]
             total = len(episodes)
+            if filters and not total:
+                # fetch_feed's warning already says why nothing matched, but a run whose
+                # only source filtered to nothing otherwise ends as "0 items" with the
+                # filter never mentioned in the same breath as the feed it emptied.
+                errors.append(f"{src.get('url') or 'Feed'}: no episodes matched the "
+                              f"filter ({_filter_summary(filters)}).")
             for n, ep in enumerate(episodes, 1):
                 if stopped():
                     break

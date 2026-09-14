@@ -157,6 +157,11 @@ DATA_PROFILES_DIR = DATA_DIR / "profiles"
 SETTINGS_PROFILES_DIR = SETTINGS_DIR / "profiles"
 DATA_REGISTRY_FILE = DATA_DIR / "profiles.json"          # {active, profiles:[{id,name}]}
 SETTINGS_REGISTRY_FILE = SETTINGS_DIR / "profiles.json"
+# Bind address + port for the HTTP server (see app/netconfig.py). App-wide like the
+# keyfile, NOT per-profile: a socket is bound once per process, long before anyone has
+# logged in or chosen a profile. Stored PLAINTEXT for the same reason the registries
+# above are — main.py must read it before the encryption key exists.
+NETWORK_FILE = SETTINGS_DIR / "network.json"
 INCOGNITO_DIR = DATA_PROFILES_DIR / ".incognito"         # scratch dir for the private session
 
 # Basenames of the per-profile data files (relative to a data-profile folder).

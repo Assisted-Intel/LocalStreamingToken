@@ -57,6 +57,7 @@ def create_chat_dict(title="New Chat", server_url=None, model=None, pre_prompt="
         "isolated": False,
         "reasoning": False,        # legacy; kept for back-compat (no longer the display control)
         "hide_thinking": False,    # when True, reasoning is still generated but not shown/saved
+        "voice_read_reasoning": False,  # speak the reasoning stream during voice chat
         "web_search": False,
         "crawl_pages": MIN_CRAWLED_PAGES,
         "library_ids": [],

@@ -244,6 +244,90 @@ def test_library_run_id_names_the_library(client, feed3):
     assert run.startswith(f"rss-library-{lib['id']}-")
 
 
+# ------------------------------ category / keyword filters ------------------------------
+
+@pytest.fixture
+def mixed(rss_net):
+    """Five episodes alternating News / Sport, each with a working SRT."""
+    cats = ["News", "Sport", "News", "Sport", "News"]
+    rss_net["routes"][URL] = feed_xml(
+        [podcast_item(i, categories=[cats[i - 1]]) for i in range(1, 6)],
+        categories=[("News", "Politics")])
+    for i in range(1, 6):
+        rss_net["routes"][f"ep{i}.srt"] = SRT_BODY.encode()
+    return rss_net
+
+
+def test_the_listing_route_filters_and_reports_what_matched(client, mixed):
+    body = client.get(f"/api/rss/feed?{Q}&categories=News").get_json()
+    assert [i["title"] for i in body["items"]] == ["Episode 1", "Episode 3", "Episode 5"]
+    assert body["matched"] == 3
+    assert body["total_available"] == 5
+
+
+def test_the_slim_manifest_carries_the_categories_to_filter_on(client, mixed):
+    body = client.get(f"/api/rss/feed?{Q}").get_json()
+    assert body["items"][0]["categories"] == ["News"]
+    # The show's own, so the UI can offer them even when no episode is tagged.
+    assert body["categories"] == ["News", "Politics"]
+
+
+def test_fetch_feed_forwards_the_filter_from_the_query_string(client, mixed):
+    frames = sse_frames(client.get(f"/api/rss/fetch-feed?{Q}&categories=Sport"))
+    assert [e["title"] for e in all_of(frames, "episode")] == ["Episode 2", "Episode 4"]
+
+
+def test_the_begin_frame_echoes_the_filter_it_was_given(client, mixed):
+    """The only record of what a run was actually asked to narrow on — a mistyped key
+    would otherwise be an invisible no-op."""
+    frames = sse_frames(client.get(f"/api/rss/fetch-feed?{Q}&categories=News&match=all"))
+    assert first(frames, "begin")["filters"] == {
+        "categories": ["News"], "keywords": [], "exclude": [], "match": "all"}
+    assert first(frames, "feed")["matched"] == 3
+
+
+def test_empty_filter_boxes_narrow_nothing(client, mixed):
+    """sourceStream sends `categories=` for an untouched input, on every single import."""
+    frames = sse_frames(client.get(f"/api/rss/fetch-feed?{Q}&categories=&keywords=&exclude="))
+    assert len(all_of(frames, "episode")) == 5
+    assert first(frames, "begin")["filters"] == {}
+
+
+def test_the_filter_runs_before_the_limit_through_the_route(client, mixed):
+    frames = sse_frames(client.get(f"/api/rss/fetch-feed?{Q}&categories=News&limit=2"))
+    assert [e["title"] for e in all_of(frames, "episode")] == ["Episode 1", "Episode 3"]
+
+
+def test_a_zero_match_run_explains_itself_and_is_not_an_error(client, mixed):
+    frames = sse_frames(client.get(f"/api/rss/fetch-feed?{Q}&categories=Cooking"))
+    assert all_of(frames, "episode") == []
+    assert all_of(frames, "episode_error") == []
+    assert "matched none of the 5 item(s)" in first(frames, "warning")["message"]
+    assert first(frames, "complete")["total"] == 0
+
+
+def test_a_filter_never_blocks_a_named_episode(client, mixed):
+    """/api/rss/fetch narrows by guid AFTER the listing, so honouring a filter here would
+    answer "raise the episode limit" about an episode that is right there."""
+    frames = sse_frames(client.get(
+        f"/api/rss/fetch?{Q}&guid=https://show.test/ep2&categories=Cooking"))
+    eps = all_of(frames, "episode")
+    assert len(eps) == 1 and eps[0]["title"] == "Episode 2"
+
+
+def test_library_add_rss_imports_only_the_matching_episodes(client, mixed):
+    lib = client.post("/api/libraries", json={"name": "Shows"}).get_json()["library"]
+    frames = sse_frames(
+        client.get(f"/api/libraries/{lib['id']}/add-rss?{Q}&categories=Sport"))
+    items = first(frames, "complete")["library"]["items"]
+    assert [i["label"] for i in items] == ["Episode 2", "Episode 4"]
+
+
+def test_a_keyword_filter_works_on_the_title(client, mixed):
+    frames = sse_frames(client.get(f"/api/rss/fetch-feed?{Q}&keywords=Episode 4"))
+    assert [e["title"] for e in all_of(frames, "episode")] == ["Episode 4"]
+
+
 # ------------------------------ the cache routes ------------------------------
 
 def test_cache_stats_round_trip(client, feed3):

@@ -673,6 +673,46 @@ def test_draft_memories_needs_a_url(client):
                        json={}).status_code == 400
 
 
+# --------------------------- RSS filters from a JSON body ---------------------------
+
+@pytest.fixture
+def rss_feed_tagged(client, rss_net, monkeypatch):
+    """The same two-episode feed, tagged News / Sport. A JSON body carries the filter
+    here, where the library and composer routes carry it on the query string."""
+    from conftest import SRT_BODY, feed_xml, podcast_item
+    stub_embeddings(monkeypatch)
+    rss_net["routes"][FEED_URL] = feed_xml(
+        [podcast_item(1, categories=["News"]), podcast_item(2, categories=["Sport"])])
+    for i in (1, 2):
+        rss_net["routes"][f"ep{i}.srt"] = SRT_BODY.encode()
+    return rss_net
+
+
+def test_add_rss_honours_a_category_filter(client, rss_feed_tagged):
+    pid = _persona(client)
+    frames = sse_frames(client.post(f"/api/personas/{pid}/knowledge/add-rss",
+                                    json={"url": FEED_URL, "categories": "Sport"}))
+    assert len(all_of(frames, "document")) == 1
+    assert first(frames, "begin")["filters"]["categories"] == ["Sport"]
+
+
+def test_draft_memories_honours_a_keyword_filter(client, rss_feed_tagged):
+    pid = _persona(client)
+    frames = sse_frames(client.post(f"/api/personas/{pid}/draft-memories-from-rss",
+                                    json={"url": FEED_URL, "keywords": "Episode 2"}))
+    drafts = all_of(frames, "draft")
+    assert len(drafts) == 1 and drafts[0]["draft"]["title"] == "Episode 2"
+
+
+def test_a_zero_match_persona_import_writes_nothing_and_warns(client, rss_feed_tagged):
+    pid = _persona(client)
+    frames = sse_frames(client.post(f"/api/personas/{pid}/knowledge/add-rss",
+                                    json={"url": FEED_URL, "categories": "Cooking"}))
+    assert all_of(frames, "document") == []
+    assert "matched none of the 2 item(s)" in first(frames, "warning")["message"]
+    assert not list((persona_mod.personas_dir() / pid / "sources").glob("*.txt"))
+
+
 # --------------------------- the chat route, end to end ---------------------------
 
 @pytest.fixture

@@ -114,6 +114,12 @@ DEFAULT_SETTINGS = {
                                          # the item's <link> page is fetched instead
     "rss_fetch_pages": True,             # allow that escalation at all
     "rss_max_episodes": 25,              # pre-fills the "Max episodes" field
+    # Voice chat talks to the Avatar Read Server (separate process: Parakeet + F5).
+    "avatar_dir": "",                    # folder containing that project's app.py
+    "avatar_url": "http://127.0.0.1:8765",
+    "avatar_start_mode": "voice_button", # "app_start" | "voice_button"
+    "avatar_noise_gate": 30,             # 0 = hear everything, 100 = only loud speech
+    "avatar_silence_seconds": 6,         # end-of-turn silence before a voice prompt is sent
 }
 
 DEFAULT_PRESETS = [

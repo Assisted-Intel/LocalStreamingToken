@@ -86,6 +86,8 @@ def _run_dialog(mode, title=None, default_name=None, filetypes_key=None):
             return image_types
         if filetypes_key == "media":
             return media_types
+        if filetypes_key == "exe":
+            return [("Programs", "*.exe"), ("All files", "*.*")]
         return text_types
 
     result = ""

@@ -31,6 +31,42 @@ def test_the_chat_settings_collapse_state_persists(client):
                        ).get_json()["config"]["chat_settings_collapsed"] is False
 
 
+def test_avatar_helper_settings_round_trip(client):
+    cfg = client.post("/api/settings", json={
+        "avatar_dir": r"B:\helper",
+        "avatar_url": "http://127.0.0.1:8765/",
+        "avatar_start_mode": "app_start",
+    }).get_json()["config"]
+    assert cfg["avatar_dir"] == r"B:\helper"
+    assert cfg["avatar_url"] == "http://127.0.0.1:8765"
+    assert cfg["avatar_start_mode"] == "app_start"
+
+
+def test_avatar_silence_seconds_round_trip_and_clamp(client):
+    assert client.post("/api/settings", json={"avatar_silence_seconds": 2}
+                       ).get_json()["config"]["avatar_silence_seconds"] == 2
+    assert client.post("/api/settings", json={"avatar_silence_seconds": 99}
+                       ).get_json()["config"]["avatar_silence_seconds"] == 30
+    assert client.post("/api/settings", json={"avatar_silence_seconds": 0}
+                       ).get_json()["config"]["avatar_silence_seconds"] == 1
+
+
+def test_avatar_noise_gate_is_clamped(client):
+    assert client.post("/api/settings", json={"avatar_noise_gate": 40}
+                       ).get_json()["config"]["avatar_noise_gate"] == 40
+    assert client.post("/api/settings", json={"avatar_noise_gate": 999}
+                       ).get_json()["config"]["avatar_noise_gate"] == 100
+    assert client.post("/api/settings", json={"avatar_noise_gate": -3}
+                       ).get_json()["config"]["avatar_noise_gate"] == 0
+
+
+def test_an_unknown_avatar_start_mode_is_ignored(client):
+    client.post("/api/settings", json={"avatar_start_mode": "voice_button"})
+    cfg = client.post("/api/settings", json={"avatar_start_mode": "whenever"}
+                      ).get_json()["config"]
+    assert cfg["avatar_start_mode"] == "voice_button"
+
+
 def test_a_non_boolean_collapse_state_is_coerced(client):
     """The value reaches the client as a class toggle; a stray string would read as
     truthy in Python and as its own truthiness in JS. Store a real bool."""

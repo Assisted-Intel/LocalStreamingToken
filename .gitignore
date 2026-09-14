@@ -1,12 +1,20 @@
 # Local Streaming Token — keep secrets and personal data out of the repo.
 
-# Settings hold API keys and provider credentials — never publish them.
+# Settings hold API keys, provider credentials, bind host/port, and the login
+# keyfile — never publish them. A clone must start with a blank install: the
+# only committed file under settings/ is the example template.
 # Use settings/* (not settings/) so the example file can be re-included: git
 # cannot un-ignore a file whose parent directory itself is ignored.
 settings/*
 !settings/settings.example.json
-# The encryption keyfile (password-wrapped data key + Flask secret) — never publish it.
-# (Already covered by settings/* above; listed explicitly for clarity.)
+# Named explicitly so a later edit that thins the wildcard still cannot publish
+# them. network.json is plaintext (bind host/port, written before login);
+# profiles.json is the settings-profile registry; profiles/ holds the encrypted
+# per-profile settings.json files; app_key.enc is the password-wrapped data key
+# plus the Flask secret.
+settings/network.json
+settings/profiles.json
+settings/profiles/
 settings/app_key.enc
 
 # Any encrypted artifact, wherever it lives. This is a safety net: the keyfile and

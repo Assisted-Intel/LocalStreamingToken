@@ -195,6 +195,265 @@ def test_a_missing_feedparser_is_an_actionable_message(rss_net, monkeypatch):
     assert "pip install feedparser" in str(e.value)
 
 
+# ------------------------------ categories ------------------------------
+
+def test_every_category_flavour_lands_in_one_flat_list(rss_net):
+    """The whole filter design rests on feedparser folding four different elements into
+    ``entry.tags``. If it ever stops, this is the test that says so."""
+    feed = _load(rss_net, [podcast_item(1, categories=["True Crime", "Interviews"],
+                                       domain_category="Taxonomy Code",
+                                       itunes_category="Crime",
+                                       keywords="murder, cold case")])
+    assert feed["items"][0]["categories"] == [
+        "True Crime", "Interviews", "Taxonomy Code", "Crime", "murder", "cold case"]
+
+
+def test_show_level_categories_are_read_including_the_nested_subcategory(rss_net):
+    rss_net["routes"][URL] = feed_xml([podcast_item(1)],
+                                      categories=[("News", "Politics"), "Society & Culture"])
+    feed = rss.fetch_feed(URL)
+    assert feed["categories"] == ["News", "Politics", "Society & Culture"]
+
+
+def test_categories_are_deduped_case_insensitively_keeping_the_first_spelling(rss_net):
+    feed = _load(rss_net, [podcast_item(1, categories=["True Crime", "TRUE CRIME"],
+                                        keywords="true crime")])
+    assert feed["items"][0]["categories"] == ["True Crime"]
+
+
+def test_the_category_list_is_capped(rss_net):
+    """An SEO feed shipping 200 keywords per item would otherwise bloat every cached
+    listing, which is re-encrypted and rewritten whenever the feed changes."""
+    feed = _load(rss_net, [podcast_item(1, keywords=",".join(f"kw{i}" for i in range(200)))])
+    assert len(feed["items"][0]["categories"]) == rss._MAX_CATEGORIES
+
+
+def test_an_item_with_no_categories_gets_a_list_not_a_missing_key(rss_net):
+    """This dict is the cached listing shape; a filter reading a missing key would
+    silently match nothing."""
+    assert _load(rss_net, [podcast_item(1)])["items"][0]["categories"] == []
+
+
+# ------------------------------ parse_filters ------------------------------
+
+def test_parse_filters_accepts_a_comma_string_and_a_list():
+    assert rss.parse_filters({"categories": "News, True Crime"})["categories"] == \
+        ["News", "True Crime"]
+    assert rss.parse_filters({"keywords": ["a", "b"]})["keywords"] == ["a", "b"]
+
+
+@pytest.mark.parametrize("src", [
+    None, {}, {"categories": ""}, {"categories": "  ", "keywords": ""},
+    {"categories": "", "keywords": "  ", "exclude": "", "match": "all"},
+])
+def test_an_empty_filter_is_off(src):
+    """sourceStream sends `categories=` for an untouched box — an empty string must not
+    narrow anything, or every unfiltered import would break."""
+    assert rss.parse_filters(src) == {}
+
+
+def test_exclude_alone_is_a_real_filter():
+    assert rss.parse_filters({"exclude": "ads"})["exclude"] == ["ads"]
+
+
+def test_an_unknown_match_mode_falls_back_to_any():
+    """These round-trip through a hand-editable batch project; a typo must not fail a
+    run."""
+    assert rss.parse_filters({"categories": "x", "match": "wat"})["match"] == "any"
+    assert rss.parse_filters({"categories": "x", "match": "ALL"})["match"] == "all"
+
+
+# ------------------------------ filter_items ------------------------------
+
+def _items(*specs):
+    return [{"title": t, "categories": list(c), "author": a, "body_html": b}
+            for t, c, a, b in specs]
+
+
+def _filter(items, **kw):
+    kept, stats = rss.filter_items(items, rss.parse_filters(kw))
+    return [i["title"] for i in kept], stats
+
+
+ITEMS = _items(
+    ("Arts and crafts", ["Arts"], "Ann", "<p class='audio-player'>Hello there</p>"),
+    ("Murder most foul", ["True Crime", "Society & Culture"], "Bob", ""),
+    ("Sponsored ad read", ["True Crime"], "Cat", ""),
+    ("Untagged post", [], "Dee", ""),
+)
+
+
+def test_a_category_matches_the_whole_term_not_a_substring():
+    """"art" must not select "Arts" — nor, in the wild, "Martial Arts" or "Heart Health".
+    Substring matching belongs in `keywords`, and does happen there."""
+    assert _filter(ITEMS, categories="art")[0] == []
+    assert _filter(ITEMS, categories="Arts")[0] == ["Arts and crafts"]
+
+
+def test_category_matching_absorbs_punctuation_and_casing():
+    assert _filter(ITEMS, categories="society and culture")[0] == ["Murder most foul"]
+
+
+def test_a_keyword_matches_the_title_the_categories_or_the_author():
+    assert _filter(ITEMS, keywords="crafts")[0] == ["Arts and crafts"]
+    assert _filter(ITEMS, keywords="true crime")[0] == ["Murder most foul",
+                                                        "Sponsored ad read"]
+    assert _filter(ITEMS, keywords="dee")[0] == ["Untagged post"]
+
+
+def test_a_keyword_searches_show_notes_as_text_not_as_markup():
+    """Without the tag stripper, "audio" matches class="audio-player" and "img" matches
+    every episode with an image — a filter that looks wrong rather than broken."""
+    assert _filter(ITEMS, keywords="audio")[0] == []
+    assert _filter(ITEMS, keywords="hello there")[0] == ["Arts and crafts"]
+
+
+def test_exclude_vetoes_an_otherwise_matching_item():
+    assert _filter(ITEMS, categories="True Crime", exclude="sponsored")[0] == \
+        ["Murder most foul"]
+
+
+def test_exclude_works_with_no_include_terms_at_all():
+    assert _filter(ITEMS, exclude="murder")[0] == ["Arts and crafts", "Sponsored ad read",
+                                                   "Untagged post"]
+
+
+def test_match_all_wants_every_term_and_any_wants_one():
+    both = "True Crime, Society & Culture"
+    assert _filter(ITEMS, categories=both, match="all")[0] == ["Murder most foul"]
+    assert _filter(ITEMS, categories=both, match="any")[0] == ["Murder most foul",
+                                                               "Sponsored ad read"]
+
+
+def test_an_empty_filter_never_touches_the_show_notes(monkeypatch):
+    """The unfiltered path must not run the tag stripper over 226 items' notes."""
+    monkeypatch.setattr(core, "_html_to_text",
+                        lambda *a, **k: pytest.fail("stripped notes with no filter"))
+    kept, _ = rss.filter_items(ITEMS, {})
+    assert len(kept) == 4
+
+
+def test_the_filter_never_reads_the_transcript(rss_net):
+    """A transcript costs a download, or minutes of GPU — exactly what the filter exists
+    to avoid spending. So a word that appears ONLY in the transcript cannot match, and no
+    transcript may be fetched to find that out."""
+    rss_net["routes"]["ep1.srt"] = SRT_BODY.encode()
+    rss_net["routes"][URL] = feed_xml([podcast_item(1, categories=["News"])])
+    feed = rss.fetch_feed(URL, filters=rss.parse_filters({"keywords": "Gitmo Nation"}))
+    assert feed["items"] == []
+    assert not [u for u in rss_net["get"] if u.endswith(".srt")]
+
+
+# ------------------------------ filters through fetch_feed ------------------------------
+
+def _mixed_feed():
+    return feed_xml([podcast_item(1, categories=["News"]),
+                     podcast_item(2, categories=["Sport"]),
+                     podcast_item(3, categories=["News"]),
+                     podcast_item(4, categories=["Sport"]),
+                     podcast_item(5, categories=["News"])])
+
+
+def test_the_filter_runs_before_the_limit(rss_net):
+    """The load-bearing ordering. Slice-then-filter would return Episode 1 alone here,
+    and no limit could ever reach Episodes 3 and 5."""
+    rss_net["routes"][URL] = _mixed_feed()
+    feed = rss.fetch_feed(URL, limit=2, filters={"categories": ["News"], "keywords": [],
+                                                 "exclude": [], "match": "any"})
+    assert [i["title"] for i in feed["items"]] == ["Episode 1", "Episode 3"]
+
+
+def test_the_three_counts_mean_three_different_things(rss_net):
+    rss_net["routes"][URL] = _mixed_feed()
+    feed = rss.fetch_feed(URL, limit=2, filters=rss.parse_filters({"categories": "News"}))
+    assert feed["total_available"] == 5      # the whole feed
+    assert feed["matched"] == 3              # what the filter accepted
+    assert feed["item_count"] == 2           # what the limit then took
+
+
+def test_an_unfiltered_read_reports_no_narrowing(rss_net):
+    rss_net["routes"][URL] = _mixed_feed()
+    feed = rss.fetch_feed(URL)
+    assert feed["matched"] == feed["total_available"] == 5
+    assert feed["filters"] == {}
+
+
+def test_a_filter_matching_nothing_warns(rss_net):
+    rss_net["routes"][URL] = _mixed_feed()
+    feed = rss.fetch_feed(URL, filters=rss.parse_filters({"categories": "Cooking"}))
+    assert feed["items"] == []
+    assert any("matched none of the 5 item(s)" in w for w in feed["warnings"])
+
+
+def test_the_zero_match_warning_names_the_show_categories(rss_net):
+    """The commonest confusion by far: a podcast categorises the SHOW, the user types the
+    category they can plainly see, and gets nothing. Say why, and say what does work."""
+    rss_net["routes"][URL] = feed_xml([podcast_item(1), podcast_item(2)],
+                                      categories=[("News", "Politics")])
+    feed = rss.fetch_feed(URL, filters=rss.parse_filters({"categories": "News"}))
+    warning = " ".join(feed["warnings"])
+    assert "show level (News, Politics)" in warning
+    assert "keyword filter" in warning
+
+
+def test_the_zero_match_warning_offers_the_categories_that_do_exist(rss_net):
+    """When the items ARE tagged and the term simply isn't one of them, naming the real
+    ones turns a dead end into a one-word correction."""
+    rss_net["routes"][URL] = _mixed_feed()
+    feed = rss.fetch_feed(URL, filters=rss.parse_filters({"categories": "new"}))
+    warning = " ".join(feed["warnings"])
+    assert "categories these items do publish are: News, Sport" in warning
+    # And it says why "new" missed "News", which is the mistake it was most likely made by.
+    assert "match in full" in warning
+
+
+def test_the_offered_categories_lead_with_the_ones_that_partition_the_feed(rss_net):
+    """A facet shared by many episodes is worth typing; per-episode <itunes:keywords>
+    noise is not, even though both are equally matchable."""
+    rss_net["routes"][URL] = feed_xml([
+        podcast_item(i, categories=["News"], keywords=f"filler{i}") for i in range(1, 5)])
+    feed = rss.fetch_feed(URL, filters=rss.parse_filters({"categories": "absent"}))
+    offered = " ".join(feed["warnings"]).split("publish are: ")[1]
+    assert offered.startswith("News, ")
+
+
+def test_a_keyword_only_miss_does_not_lecture_about_categories(rss_net):
+    rss_net["routes"][URL] = _mixed_feed()
+    feed = rss.fetch_feed(URL, filters=rss.parse_filters({"keywords": "nothing here"}))
+    assert "categories these items do publish" not in " ".join(feed["warnings"])
+
+
+def test_a_feed_with_no_categories_anywhere_says_so(rss_net):
+    rss_net["routes"][URL] = feed_xml([podcast_item(1)])
+    feed = rss.fetch_feed(URL, filters=rss.parse_filters({"categories": "News"}))
+    assert any("publish any categories at all" in w for w in feed["warnings"])
+
+
+def test_filtering_does_not_narrow_what_gets_cached(rss_net):
+    """The filter is a view, not a fetch parameter. Filtering ``entry["items"]`` in place
+    would poison every later read of this feed with one run's filter."""
+    rss_net["routes"][URL] = _mixed_feed()
+    rss.fetch_feed(URL, filters=rss.parse_filters({"categories": "News"}))
+    again = rss.fetch_feed(URL)
+    assert again["from_cache"] is True
+    assert again["item_count"] == 5
+
+
+def test_a_listing_cached_before_categories_existed_is_reparsed(rss_net, monkeypatch):
+    """Without the FEED_ENTRY_VERSION bump a v1 listing has no `categories` key, so every
+    filter would match nothing and "tick Refresh" would be the only cure."""
+    current = rss_cache.FEED_ENTRY_VERSION
+    monkeypatch.setattr(rss_cache, "FEED_ENTRY_VERSION", 1)
+    rss_net["routes"][URL] = _mixed_feed()
+    rss.fetch_feed(URL)
+    assert rss_cache.get_feed(rss.feed_id(URL)) is not None
+    # Not monkeypatch.undo(): the rss_net fixture shares this monkeypatch instance, so an
+    # undo would unstub _http_get and send the next line at the real network.
+    monkeypatch.setattr(rss_cache, "FEED_ENTRY_VERSION", current)
+    feed = rss.fetch_feed(URL, filters=rss.parse_filters({"categories": "News"}))
+    assert [i["title"] for i in feed["items"]] == ["Episode 1", "Episode 3", "Episode 5"]
+
+
 # ------------------------------ transcript choice ------------------------------
 
 def _links(*specs):

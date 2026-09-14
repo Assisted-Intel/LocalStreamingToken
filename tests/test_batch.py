@@ -346,6 +346,66 @@ def test_resolve_rss_truncates_a_long_episode(rss_net):
     assert items[0]["chars"] < 600 and "truncated" in items[0]["content"]
 
 
+def _mixed_feed_routes(rss_net, url):
+    """Five episodes alternating News / Sport, each with a working SRT."""
+    from conftest import SRT_BODY, feed_xml, podcast_item
+    cats = ["News", "Sport", "News", "Sport", "News"]
+    rss_net["routes"][url] = feed_xml(
+        [podcast_item(i, categories=[cats[i - 1]]) for i in range(1, 6)])
+    for i in range(1, 6):
+        rss_net["routes"][f"ep{i}.srt"] = SRT_BODY.encode()
+
+
+def test_rss_filters_are_per_source_not_per_project(rss_net):
+    """Two feeds in one batch routinely want different categories, so the filter cannot
+    live alongside rss_notes/whisper/refresh on the project."""
+    url = "https://feeds.test/show.xml"
+    _mixed_feed_routes(rss_net, url)
+    proj = _project(sources=[{"kind": "rss", "url": url, "categories": "News"},
+                             {"kind": "rss", "url": url, "categories": "Sport"}])
+    items, errors = batch.resolve_sources(proj)
+    assert [i["title"] for i in items] == ["Episode 1", "Episode 3", "Episode 5",
+                                           "Episode 2", "Episode 4"]
+    assert errors == []
+
+
+def test_a_batch_rss_filter_runs_before_the_limit(rss_net):
+    url = "https://feeds.test/show.xml"
+    _mixed_feed_routes(rss_net, url)
+    proj = _project(sources=[{"kind": "rss", "url": url, "limit": 2,
+                              "categories": "News"}])
+    items, _ = batch.resolve_sources(proj)
+    assert [i["title"] for i in items] == ["Episode 1", "Episode 3"]
+
+
+def test_a_batch_rss_keyword_filter_narrows_the_source(rss_net):
+    url = "https://feeds.test/show.xml"
+    _mixed_feed_routes(rss_net, url)
+    proj = _project(sources=[{"kind": "rss", "url": url, "keywords": "Episode 4"}])
+    items, _ = batch.resolve_sources(proj)
+    assert [i["title"] for i in items] == ["Episode 4"]
+
+
+def test_a_source_emptied_by_its_filter_says_so_naming_the_terms(rss_net):
+    """Otherwise a filtered batch just resolves to nothing, and the filter is never
+    mentioned in the same breath as the feed it emptied."""
+    url = "https://feeds.test/show.xml"
+    _mixed_feed_routes(rss_net, url)
+    proj = _project(sources=[{"kind": "rss", "url": url, "categories": "Cooking"}])
+    items, errors = batch.resolve_sources(proj)
+    assert items == []
+    assert any("no episodes matched the filter" in e and "Cooking" in e for e in errors)
+
+
+def test_absent_filter_keys_on_an_older_project_narrow_nothing(rss_net):
+    url = "https://feeds.test/show.xml"
+    _mixed_feed_routes(rss_net, url)
+    proj = _project(sources=[{"kind": "rss", "url": url}])
+    items, errors = batch.resolve_sources(proj)
+    assert len(items) == 5
+    assert errors == []
+
+
 def test_preview_then_run_fetches_each_episode_once(rss_net):
     """The whole point of the cache in a batch context: Preview resolves through the
     same path, so the Run that follows reads from disk."""
@@ -643,6 +703,18 @@ def test_batch_project_crud(client):
 
     assert client.delete(f"/api/batch/projects/{pid}").get_json()["ok"] is True
     assert client.get(f"/api/batch/projects/{pid}").status_code == 404
+
+
+def test_a_saved_project_round_trips_its_rss_filters(client):
+    """The filter keys are per-source and never appear in new_project(); they survive only
+    because the save route stores the project dict verbatim. Keep that honest."""
+    src = {"kind": "rss", "url": "https://feeds.test/show.xml", "limit": 5,
+           "categories": "News, Politics", "keywords": "election",
+           "exclude": "sponsored", "match": "all"}
+    pid = client.post("/api/batch/projects",
+                      json={"name": "Filtered", "sources": [src]}).get_json()["project"]["id"]
+    loaded = client.get(f"/api/batch/projects/{pid}").get_json()["project"]
+    assert loaded["sources"][0] == src
 
 
 def test_state_exposes_batch_defaults(client):
